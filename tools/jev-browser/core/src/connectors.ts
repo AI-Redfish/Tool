@@ -51,6 +51,10 @@ class PwLocatorAdapter implements LocatorPort {
     return this.loc.selectOption(value, opts).then(() => undefined);
   }
 
+  setInputFiles(files: string[], opts?: { timeout?: number }): Promise<void> {
+    return this.loc.setInputFiles(files, opts);
+  }
+
   isVisible(): Promise<boolean> {
     return this.loc.isVisible();
   }
@@ -168,6 +172,13 @@ class PwContextAdapter implements ContextPort {
     return this.ctx.pages().filter((p) => !p.isClosed()).map((p) => new PwPageAdapter(p));
   }
 
+  indexOfPage(page: PagePort): number {
+    // pages() 每次产生新包装实例，必须用底层 Playwright 对象同一性比较
+    const raw = page instanceof PwPageAdapter ? page.raw() : null;
+    if (!raw) return -1;
+    return this.ctx.pages().findIndex((p) => p === raw);
+  }
+
   async newPage(url?: string): Promise<PagePort> {
     // BrowserContext.newPage() 无 url 参数（与 Browser.newPage 不同）：建页后再导航
     const page = await this.ctx.newPage();
@@ -236,11 +247,10 @@ export function resolveAttachEndpoint(endpoint: string): string {
     } catch {
       throw err('CONFIG_INVALID', `CDP endpoint 不是合法 URL: ${endpoint}`);
     }
-    const host = u.hostname;
-    if (!LOOPBACK_RE.test(host)) {
-      throw err('CONFIG_INVALID', `CDP endpoint 只允许 loopback（防远程接管，DESIGN §4.1）: ${host}`);
+    if (!LOOPBACK_RE.test(u.hostname)) {
+      throw err('CONFIG_INVALID', `CDP endpoint 只允许 loopback（防远程接管，DESIGN §4.1）: ${u.hostname}`);
     }
-    return endpoint.replace(/^http/, 'http'); // 保持原样（Playwright 接受 http:// 调试端点）
+    return endpoint; // Playwright 接受 http(s) 调试端点
   }
   throw err('CONFIG_INVALID', `browser.attach.endpoint 只支持 "chrome" 或 loopback URL: ${endpoint}`);
 }

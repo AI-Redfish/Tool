@@ -36,7 +36,14 @@ export class ApiClient {
       signal: AbortSignal.timeout(this.opts.timeoutMs ?? 120_000),
     });
     const text = await res.text();
-    const data = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+    let data: Record<string, unknown> = {};
+    if (text) {
+      try {
+        data = JSON.parse(text) as Record<string, unknown>;
+      } catch {
+        throw err('INTERNAL', `API 返回非 JSON 响应 (${res.status}): ${text.slice(0, 120)}`, { retryable: res.status >= 500 });
+      }
+    }
     if (!res.ok) {
       const e = data as { error?: { code?: string; message?: string } };
       throw err((e.error?.code as never) ?? 'INTERNAL', e.error?.message ?? `API ${res.status}`, { retryable: res.status >= 500 });
@@ -99,6 +106,7 @@ export class ApiClient {
   async saveArtifact(taskId: string, artifactId: string, destPath: string): Promise<void> {
     const res = await this.fetchImpl(`${this.opts.baseUrl.replace(/\/+$/, '')}/v1/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(artifactId)}`, {
       headers: { authorization: `Bearer ${this.opts.token}` },
+      signal: AbortSignal.timeout(this.opts.timeoutMs ?? 120_000),
     });
     if (!res.ok) throw err('ARTIFACT_NOT_FOUND', `artifact 下载失败: ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());

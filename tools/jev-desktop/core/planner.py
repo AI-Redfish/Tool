@@ -85,7 +85,10 @@ class Planner:
         if resp.status_code != 200:
             raise err("PROVIDER_ERROR", f"规划服务 {resp.status_code}: {resp.text[:200]}",
                       retryable=resp.status_code in (429, 500, 502, 503, 504))
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise err("PROVIDER_ERROR", f"规划响应不是合法 JSON: {e}", retryable=True)
         usage = data.get("usage") or {}
         # OpenAI 风格 usage：prompt_tokens/completion_tokens
         norm = {"input_tokens": usage.get("prompt_tokens"), "output_tokens": usage.get("completion_tokens")}

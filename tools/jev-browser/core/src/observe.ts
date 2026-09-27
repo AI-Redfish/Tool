@@ -20,6 +20,8 @@ export interface ObservedElement {
 }
 
 export interface PageObservation {
+  /** 快照内稳定标识（DESIGN §6.2：候选 ID 仅在该快照有效）。 */
+  snapshotId: string;
   url: string;
   title: string;
   elements: ObservedElement[];
@@ -117,6 +119,7 @@ export async function observePage(
     title = '';
   }
   return {
+    snapshotId: `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
     url: page.url(),
     title,
     elements: raw.elements,

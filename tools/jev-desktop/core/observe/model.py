@@ -21,14 +21,18 @@ class SnapElement:
     hwnd: int
     pid: int
     fingerprint: str            # ControlType|Name|AutomationId|ClassName
+    toggle_state: int | None = None   # 0=未选 1=已选 2=半选（CheckBox/RadioButton）
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "ref": self.ref, "role": self.role, "name": self.name,
             "automationId": self.automation_id, "rect": list(self.rect),
             "value": self.value[:80], "interactive": self.interactive,
             "children": self.children_count, "offscreen": self.offscreen,
         }
+        if self.toggle_state is not None:
+            out["toggleState"] = self.toggle_state
+        return out
 
 
 @dataclass
@@ -68,12 +72,15 @@ class Snapshot:
     def refs_payload(self) -> dict:
         out: dict = {}
         for e in self.elements:
-            out[e.ref.split(":")[-1]] = {
+            entry = {
                 "kind": "uia", "role": e.role, "name": e.name, "automationId": e.automation_id,
                 "class": e.class_name, "rect": list(e.rect), "fingerprint": e.fingerprint,
                 "runtimeId": e.runtime_id, "hwnd": e.hwnd, "pid": e.pid,
                 "children": e.children_count,
             }
+            if e.toggle_state is not None:
+                entry["toggleState"] = e.toggle_state
+            out[e.ref.split(":")[-1]] = entry
         win = self.window.get("rect") or (0, 0, 0, 0)
         for b in self.blocks:
             out[b.ref.split(":")[-1]] = {
@@ -84,8 +91,22 @@ class Snapshot:
             }
         return out
 
+    def to_registry_dict(self) -> dict:
+        """会话文件存储格式（refs 为以 eN/bN 为键的映射）。"""
+        return {
+            "id": self.id,
+            "level": self.level,
+            "window": {
+                "hwnd": self.window.get("hwnd"), "pid": self.window.get("pid"),
+                "title": self.window.get("title"), "rect": list(self.window.get("rect") or []),
+                "process": self.window.get("process"),
+            },
+            "refs": self.refs_payload(),
+        }
+
     def to_dict(self, *, include_refs: bool = True) -> dict:
         out = {
+            "id": self.id,
             "snapshotId": self.id,
             "level": self.level,
             "window": {

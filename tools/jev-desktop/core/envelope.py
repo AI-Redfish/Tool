@@ -3,7 +3,7 @@
 import json
 import time
 
-from .errors import CancelledSignal, JevError
+from .errors import CancelledSignal, JevError, err
 
 SCHEMA_VERSION = 1
 

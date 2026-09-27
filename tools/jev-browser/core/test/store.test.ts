@@ -26,6 +26,7 @@ function taskRow(taskId: string): Parameters<TaskStore['insertTask']>[0] {
     metricsJson: '{}',
     errorJson: null,
     goalJson: null,
+    planJson: null,
     createdAt: 1,
     updatedAt: 1,
     deadlineAt: null,

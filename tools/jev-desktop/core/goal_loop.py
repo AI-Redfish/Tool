@@ -121,7 +121,7 @@ def goal_loop(ctx, *, goal: str, value: str | None, window, budget, expect=None,
             target = ResolvedTarget(kind="point", hwnd=hwnd, point=pt, center_point=pt,
                                     summary=f"文字块 \"{chosen[2].text[:30]}\"")
         try:
-            out = perform_action(ctx, act, target, value=act_value)
+            perform_action(ctx, act, target, value=act_value)
         except JevError as e:
             if e.code == "INVALID_PARAMS" and act in ("type", "set_value"):
                 raise err("INVALID_STEP", f"goal「{goal}」选择的动作 {act} 需要 value 参数；请在步骤里提供 value")

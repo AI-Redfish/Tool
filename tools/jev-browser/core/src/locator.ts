@@ -105,7 +105,3 @@ export async function verifyExpects(
   return { ok: failures.length === 0, failures };
 }
 
-/** 步骤级 expect 生成：导航/写操作必须提供后置条件（DESIGN §8.1 校验在 flow.ts）。 */
-export function hasPostCondition(expect: ExpectSpec[] | undefined): boolean {
-  return Array.isArray(expect) && expect.length > 0;
-}

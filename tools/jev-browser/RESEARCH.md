@@ -1,6 +1,7 @@
 # jev-browser 研究依据、假设与风险
 
 > 方案版本：v0.2；核对日期：2026-09-24。仅完成本地源码/文档阅读与公开资料核对，没有连接用户 Chrome、调用付费模型或执行浏览器实测。
+> **v0.1 实现轮注记**：四包工作区与执行引擎已实现，50 个离线测试通过；实现过程中已核实的库事实——`@typesafe-ai/sdk` 0.6.0 的 `TypeSafeClient.systemOne({state,model,questions}) → {model, answers, usage}` 与 noul/choice 返回形状与 S7/S8 一致；Playwright 1.63.0 的 `ConnectOverCDPOptions.noDefaults` 存在（文档原文见 types）；`BrowserContext.newPage()` 无 url 参数、`Locator.waitFor` 为单 options 对象。S12/S13 的在线复核仍待完成；P0 实测仍阻塞默认接管路径的正式承诺。
 > 配套文档：[设计](DESIGN.md)、[开发计划](DEVELOPMENT_PLAN.md)。
 
 ## 1. 本地规范依据

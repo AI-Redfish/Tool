@@ -1,10 +1,12 @@
+import time
+
 """UIA Pattern 语义动作（DESIGN §5）：不抢焦点，对用户干扰最小。
 
 仅操作已解析的 UIA Control（由 targeting 在 worker 线程内解析），
 全部函数只在 UiaWorker 线程内执行。找不到 Pattern 时由 Actor 决定坐标兜底。
 """
 
-from ..errors import err
+from ..errors import JevError, err
 
 
 def _pat(ctrl, uia, pattern_id):
@@ -36,7 +38,7 @@ def do_set_value(ctrl, uia, value: str) -> str:
     if p is None:
         return ""
     if not p.SetValue(str(value)):
-        raise err("INPUT_DENIED", f"ValuePattern.SetValue 失败（控件可能只读或被 UIPI 隔离）")
+        raise err("INPUT_DENIED", "ValuePattern.SetValue 失败（控件可能只读或被 UIPI 隔离）")
     return "uia_value"
 
 
@@ -48,6 +50,11 @@ def get_value(ctrl, uia) -> str:
         return p.Value or ""
     except Exception:
         return ""
+
+
+def toggle_state_of(ctrl, uia) -> int | None:
+    """读取 ToggleState（0=未选 1=已选 2=半选）；不支持时返回 None。"""
+    return _toggle_state(ctrl, uia)
 
 
 def _toggle_state(ctrl, uia) -> int | None:
@@ -84,16 +91,70 @@ def do_check(ctrl, uia, target_state: int) -> tuple[bool, int]:
     return True, state if state is not None else -1
 
 
-def do_select(ctrl, uia, value: str | None = None) -> str:
-    """SelectionItem.Select；value 非空时在下拉/列表子项中按名匹配后选择。"""
+def do_select(ctrl, uia, value: str | None = None, win_ctrl=None) -> str:
+    """SelectionItem.Select；value 非空时在下拉/列表子项中按名匹配后选择。
+
+    WinForms DropDownList 等收起时不暴露子项：先 Expand 再在整个顶层窗口范围找
+    （弹出项常挂在窗口其他位置），选中后 Collapse。无 value 时直接对目标 Select。
+    """
     target = ctrl
+    expanded = False
     if value:
-        target = _find_item_by_name(ctrl, uia, value)
+        try:
+            target = _find_item_by_name(ctrl, uia, value)
+        except JevError:
+            ec = _pat(ctrl, uia, uia.PatternId.ExpandCollapsePattern)
+            if ec is not None:
+                ec.Expand()
+                expanded = True
+                time.sleep(0.3)
+                scope = win_ctrl or _top_ancestor(ctrl, uia)
+                try:
+                    target = _find_item_by_name(scope, uia, value)
+                except JevError:
+                    target = None
+            else:
+                target = None
+        if target is None:
+            # WinForms 等不支持 ExpandCollapse/子项不暴露的下拉：
+            # 用 uiautomation 内建的 ComboBox.Select（点击展开→查找并点击列表项，社区验证充分）。
+            # 该路径使用真实点击，需要目标窗口在前台。
+            select_fn = getattr(ctrl, "Select", None)
+            if select_fn is not None:
+                ok = bool(select_fn(value))
+                return "uia_select_combo" if ok else ""
+            raise err("TARGET_NOT_FOUND", f"下拉/列表中找不到选项 \"{value}\"")
     p = _pat(target, uia, uia.PatternId.SelectionItemPattern)
     if p is None:
+        if expanded:
+            try:
+                _pat(ctrl, uia, uia.PatternId.ExpandCollapsePattern).Collapse()
+            except Exception:
+                pass
         return ""
     p.Select()
+    if expanded:
+        try:
+            _pat(ctrl, uia, uia.PatternId.ExpandCollapsePattern).Collapse()
+        except Exception:
+            pass
     return "uia_select"
+
+
+def _top_ancestor(ctrl, uia):
+    """向上找顶层窗口（NativeWindowHandle 非 0 或无父）。"""
+    cur = ctrl
+    for _ in range(12):
+        try:
+            if cur.NativeWindowHandle:
+                return cur
+            parent = cur.GetParentControl()
+        except Exception:
+            return cur
+        if parent is None:
+            return cur
+        cur = parent
+    return cur
 
 
 def _find_item_by_name(ctrl, uia, value: str):

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "browser": {
+    "mode": "attach",
+    "engine": "chrome",
+    "headless": false,
+    "attach": {
+      "endpoint": "chrome",
+      "noDefaults": true,
+      "timeoutMs": 60000
+    }
+  },
+  "safety": {
+    "allowedOrigins": ["https://example.com"],
+    "modelOrigins": ["https://example.com"],
+    "preauthorizedActions": ["navigate", "scroll", "wait", "screenshot", "fill", "press", "select", "click"]
+  },
+  "planner": {
+    "enabled": false
+  }
+}

@@ -26,6 +26,8 @@ export interface LocatorPort {
   fill(value: string, opts?: { timeout?: number }): Promise<void>;
   press(key: string, opts?: { timeout?: number }): Promise<void>;
   selectOption(value: string, opts?: { timeout?: number }): Promise<void>;
+  /** 上传本地文件到 file input（DESIGN §10；路径安全检查由调用方完成）。 */
+  setInputFiles(files: string[], opts?: { timeout?: number }): Promise<void>;
   isVisible(): Promise<boolean>;
   innerText(opts?: { timeout?: number }): Promise<string>;
   waitFor(state: 'visible' | 'hidden' | 'attached', opts?: { timeout?: number }): Promise<void>;
@@ -50,6 +52,9 @@ export interface PagePort {
 
 export interface ContextPort {
   pages(): PagePort[];
+  /** 返回给定端口对象在页面列表中的下标；找不到返回 -1。
+   *  注意 pages() 可能每次返回新包装实例，必须用底层同一性比较（adapter 实现）。 */
+  indexOfPage(page: PagePort): number;
   newPage(url?: string): Promise<PagePort>;
   onPage(handler: (page: PagePort) => void): void;
 }

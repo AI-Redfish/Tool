@@ -78,6 +78,10 @@ export interface PerformContext {
   ledger: LedgerHook;
   actionRevision: number;
   actionTimeoutMs: number;
+  /** 上传授权目录（DESIGN §10；空 = 拒绝一切上传）。 */
+  allowedUploadDirs?: string[];
+  /** 单文件上传大小上限（已知长度时预检，DESIGN §10）。 */
+  maxUploadBytes?: number;
   /** 取消旗标：派发前检查；在途动作不中断（DESIGN §8.2 cancelling）。 */
   cancelFlag?: { cancelled: boolean };
   dialogs?: DialogManager;
@@ -98,8 +102,14 @@ export async function performAction(
   if (ctx.cancelFlag?.cancelled) {
     throw err('POLICY_BLOCKED', '任务已进入取消流程，动作未派发');
   }
-  if (step.action === 'navigate' && resolveValue(step, ctx.values) === undefined) {
+  // 值解析在 prepared 之前：无法解析（缺 valuesRef/未解析 secretRef）时动作不派发
+  const value = resolveValue(step, ctx.values, ctx.vars);
+  if (step.action === 'navigate' && value === undefined) {
     throw err('INVALID_INPUT', 'navigate 动作需要 value 或 valuesRef 指定目标 URL');
+  }
+  // 上传文件安全检查在 prepared 之前：未授权文件动作不派发、不落账（DESIGN §10）
+  if (step.action === 'upload') {
+    await checkUploadFile(step, ctx);
   }
   ctx.ledger.prepared(step, ctx.actionRevision);
   const timeout = ctx.actionTimeoutMs;
@@ -108,7 +118,6 @@ export async function performAction(
 
   try {
     ctx.ledger.inFlight(step, ctx.actionRevision);
-    const value = resolveValue(step, ctx.values);
 
     if (step.action === 'click' && wantsDownload) {
       // 先注册下载等待再触发（DESIGN §10 下载正确性）
@@ -158,6 +167,12 @@ export async function performAction(
         } else {
           await page.waitForTimeout(Math.min(Number(value ?? 1000), 5000));
         }
+        break;
+      }
+      case 'upload': {
+        const resolved = await checkUploadFile(step, ctx);
+        const loc = requireTarget(page, step).first();
+        await loc.setInputFiles([resolved], { timeout });
         break;
       }
       case 'screenshot': {
@@ -225,18 +240,81 @@ export async function performAction(
   }
 }
 
+/** 秘密文件默认拒绝（尽力而为的启发式，DESIGN §10）。 */
+const SECRET_FILE_RE = /(^|[\\/])(\.env|.*\.kdbx)$|secret|password|credential|\.pem$|\.key$/i;
+
+const UPLOAD_ABS_RE = /^[A-Za-z]:[\\/]|^\//;
+
+/**
+ * 上传文件安全检查（DESIGN §10 文件部分）：
+ *  - 必须显式提供绝对路径（调用者显式授权具体文件）；
+ *  - realpath 解析 symlink 后必须位于 allowedUploadDirs 之一（防 traversal/软链绕过）；
+ *  - 秘密文件名默认拒绝；大小在已知长度时预检。
+ * 未通过抛 POLICY_BLOCKED / INVALID_INPUT，动作不派发。
+ */
+export async function checkUploadFile(
+  step: ActionStep,
+  ctx: Pick<PerformContext, 'allowedUploadDirs' | 'maxUploadBytes'>,
+): Promise<string> {
+  const raw = step.filePath;
+  if (!raw || !UPLOAD_ABS_RE.test(raw)) {
+    throw err('INVALID_INPUT', `upload 需要绝对路径 filePath: ${String(raw ?? '')}`);
+  }
+  const dirs = ctx.allowedUploadDirs ?? [];
+  if (dirs.length === 0) {
+    throw err('POLICY_BLOCKED', '上传被拒绝：未配置 safety.allowedUploadDirs（默认拒绝一切上传，DESIGN §10）');
+  }
+  if (SECRET_FILE_RE.test(raw)) {
+    throw err('POLICY_BLOCKED', `上传被拒绝：疑似秘密文件（尽力而为的启发式）: ${path.basename(raw)}`);
+  }
+  let st: fs.Stats;
+  let real: string;
+  try {
+    st = fs.statSync(raw);
+    real = fs.realpathSync(raw);
+  } catch {
+    throw err('INVALID_INPUT', `upload 文件不存在或不可读: ${raw}`);
+  }
+  if (!st.isFile()) throw err('INVALID_INPUT', `upload 目标不是常规文件: ${raw}`);
+  const maxBytes = ctx.maxUploadBytes ?? 50 * 1024 * 1024;
+  if (st.size > maxBytes) {
+    throw err('POLICY_BLOCKED', `上传被拒绝：文件 ${st.size}B 超过上限 ${maxBytes}B（大小预检，DESIGN §10）`);
+  }
+  const realDirs = dirs.map((d) => {
+    try {
+      return fs.realpathSync(d);
+    } catch {
+      return path.resolve(d);
+    }
+  });
+  const inside = realDirs.some((d) => real === d || real.startsWith(d.endsWith(path.sep) ? d : d + path.sep));
+  if (!inside) {
+    throw err('POLICY_BLOCKED', `上传被拒绝：文件 realpath 不在 allowedUploadDirs 内（防 traversal/symlink 绕过）: ${path.basename(real)}`);
+  }
+  return real;
+}
+
 function requireTarget(page: PagePort, step: ActionStep) {
   if (!step.target) throw err('INVALID_INPUT', `动作 ${step.action} 需要 target`);
   return resolveLocator(page, step.target);
 }
 
-function resolveValue(step: ActionStep, values: Record<string, unknown>): string | number | undefined {
+function resolveValue(step: ActionStep, values: Record<string, unknown>, vars?: Record<string, unknown>): string | number | undefined {
   if (step.valuesRef !== undefined) {
-    const v = values[step.valuesRef];
-    if (v === undefined) throw err('INVALID_INPUT', `valuesRef "${step.valuesRef}" 不存在于 values`);
-    if (typeof v === 'object' && v !== null && 'secretRef' in v) {
-      throw err('INVALID_INPUT', `values["${step.valuesRef}"] 仍是未解析的 secretRef`);
+    let v: unknown = values[step.valuesRef];
+    if (v === undefined && vars && step.valuesRef in vars) {
+      // 回退到流程变量（如 forEach.itemVar / extract.saveAs）：页面数据可作为输入值，
+      // 但仍是数据不是指令（DESIGN §10），且不包含 values/secret
+      v = vars[step.valuesRef];
     }
+    if (v === undefined) throw err('INVALID_INPUT', `valuesRef "${step.valuesRef}" 不存在于 values 或流程变量`);
+    if (typeof v === 'object' && v !== null) {
+      if ('secretRef' in v) throw err('INVALID_INPUT', `values["${step.valuesRef}"] 仍是未解析的 secretRef`);
+      if (Array.isArray(v)) throw err('INVALID_INPUT', `valuesRef "${step.valuesRef}" 指向数组，动作输入需要标量`);
+    }
+    if (typeof v === 'boolean') return String(v);
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') return v;
     return String(v);
   }
   return step.value;

@@ -116,7 +116,8 @@ export type ActionName =
   | 'select'
   | 'scroll'
   | 'wait'
-  | 'screenshot';
+  | 'screenshot'
+  | 'upload';
 
 export interface ActionStep {
   id: string;
@@ -126,9 +127,14 @@ export interface ActionStep {
   /** 字面值；优先级低于 valuesRef。 */
   value?: string | number;
   /** 引用 values 中的 key（支持 secretRef 解析后的值，值不进入模型/日志）。 */
+  /** 引用 values 中的 key（支持 secretRef 解析后的值，值不进入模型/日志）；
+   *  values 缺失时回退到流程变量（forEach.itemVar / extract.saveAs）。 */
   valuesRef?: string;
   key?: string;
   expect: ExpectSpec[];
+  /** upload 专用：待上传本地文件的绝对路径；
+   *  必须位于 safety.allowedUploadDirs 之一（realpath 解析后前缀匹配，DESIGN §10）。 */
+  filePath?: string;
 }
 
 export interface AssertStep {
@@ -243,6 +249,10 @@ export interface StepResult {
   savedAs?: string;
   artifactId?: string;
   iterations?: number;
+  /** 步骤耗时（DESIGN §11 细粒度计时）。 */
+  durationMs?: number;
+  /** 脱敏证据（如执行后 URL、截图 artifactId）。 */
+  evidence?: Record<string, unknown>;
 }
 
 export interface ArtifactMeta {
@@ -257,6 +267,29 @@ export interface PendingApproval {
   action: ActionName;
   targetName?: string;
   reason: string;
+}
+
+/** 能力探测（DESIGN §11）：未知/未实测能力不得标为 supported。 */
+export type CapabilityId =
+  | 'attach'
+  | 'launch'
+  | 'page-observation'
+  | 'frame-access'
+  | 'upload'
+  | 'download'
+  | 'dialog'
+  | 'screenshot'
+  | 'detach-preserves-browser'
+  | 'artifact-save-after-disconnect'
+  | 'profile-lock'
+  | 'sandbox';
+
+export type CapabilityState = 'supported' | 'unsupported' | 'unverified';
+
+export interface CapabilityReport {
+  id: CapabilityId;
+  state: CapabilityState;
+  detail?: string;
 }
 
 export interface TaskEnvelope {
@@ -276,6 +309,13 @@ export interface TaskEnvelope {
     actions: number;
     jevRequests: number;
     plannerRequests: number;
+    /** 以下为可选细分（DESIGN §11）：连接耗时、token、模型实际版本、重规划次数。 */
+    connectMs?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    jevModel?: string;
+    plannerModel?: string;
+    replans?: number;
   };
   error?: { code: ErrorCode; message: string; retryable: boolean; details?: Record<string, unknown> };
   pendingApproval?: PendingApproval;

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test, beforeEach, afterEach } from 'node:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Runtime, validateExecuteSteps, resolveValues } from '../src/taskservice.js';
@@ -129,7 +129,7 @@ test('幂等：同键同体返回原任务；同键不同体冲突', async () =>
   assert.equal(e1.taskId, e2.taskId);
   await assert.rejects(
     rt.execute('p1', session.sessionId, { ...input, steps: flow([{ id: 'b', kind: 'assert', expect: [] }]) } as never, { idempotencyKey: 'k1' }),
-    /IDEMPOTENCY_CONFLICT/,
+    (e: unknown) => (e as { code?: string }).code === 'IDEMPOTENCY_CONFLICT',
   );
   await rt.close();
 });
@@ -160,7 +160,7 @@ test('高风险目标暂停 needs_confirmation；approve + resume 后完成', as
   // 无 grant 的 resume 被拒绝
   await assert.rejects(
     rt.resumeTask('p1', paused.taskId, { requestId: 'r1' }),
-    /NEEDS_CONFIRMATION/,
+    (e: unknown) => (e as { code?: string }).code === 'NEEDS_CONFIRMATION',
   );
   // 用执行 Agent 的身份伪造 approved: true 没有任何通道 —— 只能凭 grant
   const { signature } = signGrant(
@@ -173,13 +173,14 @@ test('高风险目标暂停 needs_confirmation；approve + resume 后完成', as
   const resumed = await rt.resumeTask('p1', paused.taskId, { requestId: 'r2' });
   const final = await rt.waitEnvelope(resumed.taskId);
   assert.equal(final.status, 'done');
-  // grant 一次性：再次暂停（新 revision）后旧 grant 不能复用
+  // 取消任务1释放 profile 预约；grant 一次性：新任务（新 actionRevision/新 taskId）不能复用旧 grant
+  await rt.cancelTask('p1', paused.taskId, { requestId: 'r3' });
   const env2 = await rt.execute('p1', session.sessionId, { sessionId: session.sessionId, steps: steps as never, values: {} });
   const paused2 = await rt.waitEnvelope(env2.taskId);
   assert.equal(paused2.status, 'paused');
   assert.throws(
     () => rt.approveTask('p1', paused2.taskId, signature),
-    /actionRevision 不匹配|GRANT_INVALID/,
+    (e: unknown) => (e as { code?: string }).code === 'GRANT_INVALID',
   );
   await rt.close();
 });
@@ -245,7 +246,7 @@ test('disconnect：有活动任务拒绝；暂停任务需显式 detach；断开
   // 断开后 resume：needs_confirmation 需 grant；重绑页面后继续
   await assert.rejects(
     rt.resumeTask('p1', paused.taskId, { requestId: 'r8' }),
-    /NEEDS_CONFIRMATION/,
+    (e: unknown) => (e as { code?: string }).code === 'NEEDS_CONFIRMATION',
   );
   const { signature } = signGrant(
     { grantId: 'g9', taskId: paused.taskId, actionRevision: paused.pendingApproval!.actionRevision, action: 'click', issuedAt: Date.now(), expiresAt: Date.now() + 60_000 },
@@ -272,8 +273,295 @@ test('run：planner 未配置快速失败；successCriteria 缺失拒绝', async
   });
   await assert.rejects(
     rt.run('p1', session.sessionId, { sessionId: session.sessionId, goal: 'g', successCriteria: 's', values: {} }),
-    /PLANNER_NOT_CONFIGURED/,
+    (e: unknown) => (e as { code?: string }).code === 'PLANNER_NOT_CONFIGURED',
   );
+  await assert.rejects(
+    rt.run('p1', session.sessionId, { sessionId: session.sessionId, goal: 'g', successCriteria: ' ', values: {} }),
+    (e: unknown) => (e as { code?: string }).code === 'INVALID_INPUT',
+  );
+  await rt.close();
+});
+
+test('run：规划器产出步骤 → 执行 → Jev 任务级验收 → done', async () => {
+  const page = new FakePage({ url: 'https://example.com/list', bodyText: 'result-page' });
+  const judge = new FakeJudge({ decisions: [], checkP: 0.9 });
+  const planned: FlowStep[] = [
+    { id: 'p1', kind: 'action', action: 'navigate', value: 'https://example.com/search', expect: [{ kind: 'url_contains', value: 'search' }] },
+    { id: 'p2', kind: 'assert', expect: [{ kind: 'text_present', value: 'result-page' }] },
+  ];
+  const planner = {
+    plan: async () => JSON.parse(JSON.stringify(planned)) as FlowStep[],
+    usage: () => ({ requests: 1, inputTokens: 50, outputTokens: 20 }),
+  };
+  const rt = makeRuntime(testConfig(), [page], judge, planner as never);
+  const session = await rt.createSession('p1', {
+    target: { kind: 'existing' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: ['https://example.com'],
+  });
+  const env = await rt.run('p1', session.sessionId, {
+    sessionId: session.sessionId,
+    goal: '搜索并打开结果页',
+    successCriteria: '结果页已打开且包含 result-page',
+    values: {},
+  });
+  const final = await rt.waitEnvelope(env.taskId);
+  assert.equal(final.status, 'done');
+  assert.equal(final.goalVerification?.by, 'semantic');
+  assert.equal(final.metrics.plannerRequests, 1); // 只规划一次
+  assert.equal(judge.checkCalls.length, 1); // 任务级验收恰好一次
+  assert.ok(judge.checkCalls[0]!.includes('result-page'));
+  // 规划产物独立落库（plan_json），验收结果在 goalJson，互不覆盖
+  assert.ok(store.getTask(final.taskId)!.planJson!.includes('"p1"'));
+  assert.ok(store.getTask(final.taskId)!.goalJson!.includes('semantic'));
+  await rt.close();
+});
+
+test('run：Jev 验收证据不足 → likely_done 暂停，不计 done', async () => {
+  const page = new FakePage({ url: 'https://example.com/list', bodyText: 'x' });
+  const judge = new FakeJudge({ decisions: [], checkP: 0.4 });
+  const planner = { plan: async () => [{ id: 'a', kind: 'assert', expect: [] }] as FlowStep[] };
+  const rt = makeRuntime(testConfig(), [page], judge, planner as never);
+  const session = await rt.createSession('p1', {
+    target: { kind: 'existing' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: ['https://example.com'],
+  });
+  const env = await rt.run('p1', session.sessionId, {
+    sessionId: session.sessionId,
+    goal: 'g',
+    successCriteria: '页面应显示完成标志',
+    values: {},
+  });
+  const final = await rt.waitEnvelope(env.taskId);
+  assert.equal(final.status, 'paused');
+  assert.equal(final.pauseReason, 'likely_done');
+  await rt.close();
+});
+
+test('候选页按授权域过滤；kind:new 的 pageId 基于真实下标', async () => {
+  const pages = [
+    new FakePage({ url: 'https://example.com/a' }),
+    new FakePage({ url: 'https://other.com/b' }), // 不在授权域内
+  ];
+  const rt = makeRuntime(testConfig(), pages);
+  // 多页且只授权 example.com：单页可自动绑定（唯一候选）
+  const s = await rt.createSession('p1', {
+    target: { kind: 'existing' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: [],
+  });
+  assert.equal(s.status, 'ready');
+  assert.equal(s.pageId, 'p0');
+  // 列表只包含授权域：other.com 被过滤
+  const listed = await rt.listPages('p1', s.sessionId);
+  assert.deepEqual(listed.map((c) => c.pageId), ['p0']);
+  // kind:new：新页追加到末尾（index 2），pageId 必须是真实下标（修复 indexOf 同一性 bug）
+  const s2 = await rt.createSession('p1', {
+    target: { kind: 'new', url: 'https://example.com/new' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: [],
+  });
+  assert.equal(s2.pageId, 'p2');
+  // target 非法输入被拒绝
+  await assert.rejects(
+    rt.createSession('p1', { target: { kind: 'new', url: 'ftp://x' } as never, allowedOrigins: ['https://example.com'], modelOrigins: [] }),
+    (e: unknown) => (e as { code?: string }).code === 'INVALID_INPUT',
+  );
+  await assert.rejects(
+    rt.createSession('p1', { target: { kind: 'existing', pageId: 'tab-9' } as never, allowedOrigins: ['https://example.com'], modelOrigins: [] }),
+    (e: unknown) => (e as { code?: string }).code === 'INVALID_INPUT',
+  );
+  await rt.close();
+});
+
+test('artifact 24h 保留期：终态任务的过期产物被清理（文件 + 元数据）', async () => {
+  const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
+  const rt = makeRuntime(testConfig(), [page]);
+  const session = await rt.createSession('p1', {
+    target: { kind: 'existing' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: [],
+  });
+  // 直接登记一个 25h 前的终态任务及其 artifact（模拟长期未清理的宿主）
+  const now = Date.now();
+  const oldTaskId = 'told1';
+  store.insertTask({
+    taskId: oldTaskId,
+    sessionId: session.sessionId,
+    principal: 'p1',
+    mode: 'execute',
+    status: 'done',
+    pauseReason: null,
+    revision: 1,
+    requestJson: '{}',
+    cursor: 0,
+    varsJson: '{}',
+    resultsJson: '[]',
+    metricsJson: '{}',
+    errorJson: null,
+    goalJson: null,
+    planJson: null,
+    createdAt: now - 25 * 3600_000,
+    updatedAt: now - 25 * 3600_000,
+    deadlineAt: null,
+  });
+  const oldFile = path.join(dir, 'artifacts', oldTaskId, 'old.bin');
+  mkdirSync(path.dirname(oldFile), { recursive: true });
+  writeFileSync(oldFile, 'stale');
+  store.putArtifact({ artifactId: 'aold', taskId: oldTaskId, filename: 'old.bin', size: 5, sha256: 'x', path: oldFile, createdAt: now - 25 * 3600_000 });
+
+  rt.recoverOnStartup();
+  assert.equal(existsSync(oldFile), false, '过期 artifact 文件应被删除');
+  assert.equal(store.getArtifact('aold'), undefined, '过期 artifact 元数据应被删除');
+  // 活跃/新产物不受影响：终态判定 + 保留期内 → 保留
+  await rt.close();
+});
+
+test('grant 重复 approve 幂等（同 token 二次登记不崩溃）', async () => {
+  process.env.JEV_BROWSER_APPROVAL_KEY = 'k2';
+  const page = new FakePage({ url: 'https://example.com/', bodyText: 'ok' });
+  const rt = makeRuntime(testConfig(), [page]);
+  const session = await rt.createSession('p1', {
+    target: { kind: 'existing' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: [],
+  });
+  const env = await rt.execute('p1', session.sessionId, {
+    sessionId: session.sessionId,
+    steps: flow([{ id: 'risk', kind: 'action', action: 'click', target: { by: 'role', role: 'button', name: '确认支付' }, expect: [{ kind: 'text_present', value: 'ok' }] }]),
+    values: {},
+  });
+  const paused = await rt.waitEnvelope(env.taskId);
+  assert.equal(paused.status, 'paused');
+  const { signature } = signGrant(
+    { grantId: 'gdup', taskId: paused.taskId, actionRevision: paused.pendingApproval!.actionRevision, action: 'click', issuedAt: Date.now(), expiresAt: Date.now() + 60_000 },
+    'k2',
+  );
+  rt.approveTask('p1', paused.taskId, signature);
+  rt.approveTask('p1', paused.taskId, signature); // 重复登记：INSERT OR IGNORE
+  const resumed = await rt.resumeTask('p1', paused.taskId, { requestId: 'rd1' });
+  const final = await rt.waitEnvelope(resumed.taskId);
+  assert.equal(final.status, 'done');
+  await rt.close();
+});
+
+test('capabilities：按配置推导，未实测能力标 unverified 而非 supported', async () => {
+  const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
+  const rt = makeRuntime(testConfig(), [page]);
+  const caps = rt.capabilities();
+  const byId = new Map(caps.map((c) => [c.id, c]));
+  assert.equal(byId.get('attach')?.state, 'supported');
+  assert.equal(byId.get('launch')?.state, 'unsupported');
+  assert.equal(byId.get('page-observation')?.state, 'supported');
+  assert.equal(byId.get('screenshot')?.state, 'supported');
+  // 未实测能力：unverified（DESIGN §11：未知能力不标 supported）
+  assert.equal(byId.get('dialog')?.state, 'unverified');
+  assert.equal(byId.get('frame-access')?.state, 'unverified');
+  assert.equal(byId.get('detach-preserves-browser')?.state, 'unverified');
+  // 未配置上传目录：unsupported（默认拒绝一切上传）
+  assert.equal(byId.get('upload')?.state, 'unsupported');
+  // attach 模式：sandbox 不受控
+  assert.equal(byId.get('sandbox')?.state, 'unsupported');
+  await rt.close();
+});
+
+test('run 恢复 + allowReplan：未完成后缀重规划受 maxReplans 预算', async () => {
+  const page = new FakePage({ url: 'https://example.com/start', bodyText: 'x' });
+  // 首轮 goal 循环：Jev 选不出动作（action none）→ ambiguous 暂停
+  const judge = new FakeJudge({ decisions: [{ action: 'none' }], checkP: 0.9 });
+  const plannedSuffix2: FlowStep[] = [{ id: 'r1', kind: 'assert', expect: [] }];
+  let replanCalls = 0;
+  const planner = {
+    plan: async () => [{ id: 'g1', kind: 'goal', goal: '完成目标', expect: [] }] as FlowStep[],
+    replan: async (input: { completedStepIds: string[] }) => {
+      replanCalls += 1;
+      assert.deepEqual(input.completedStepIds, []); // 尚无已完成步骤
+      return JSON.parse(JSON.stringify(plannedSuffix2)) as FlowStep[];
+    },
+    usage: () => ({ requests: 1 + replanCalls, inputTokens: 10, outputTokens: 5 }),
+  };
+  const cfg = testConfig();
+  cfg.runtime.maxReplans = 1;
+  const rt = makeRuntime(cfg, [page], judge, planner as never);
+  const session = await rt.createSession('p1', {
+    target: { kind: 'existing' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: ['https://example.com'],
+  });
+  const env = await rt.run('p1', session.sessionId, {
+    sessionId: session.sessionId,
+    goal: 'g',
+    successCriteria: '完成',
+    values: {},
+  });
+  const paused = await rt.waitEnvelope(env.taskId);
+  assert.equal(paused.status, 'paused');
+  assert.equal(paused.pauseReason, 'ambiguous');
+  // allowReplan 不能绕过 ambiguous 暂停的人工确认要求（安全语义）
+  await assert.rejects(
+    rt.resumeTask('p1', env.taskId, { requestId: 'w1', allowReplan: true }),
+    (e: unknown) => (e as { code?: string }).code === 'TASK_NOT_RESUMABLE',
+  );
+  // 重规划：后缀替换为 assert，验收通过 → done
+  const resumed = await rt.resumeTask('p1', env.taskId, { requestId: 'r1', allowReplan: true, rerunConfirmed: true });
+  const final = await rt.waitEnvelope(resumed.taskId);
+  assert.equal(final.status, 'done');
+  assert.equal(final.metrics.replans, 1);
+  assert.equal(replanCalls, 1);
+  assert.ok(store.getTask(env.taskId)!.planJson!.includes('"r1"')); // 后缀已替换
+  await rt.close();
+});
+
+test('snapshot：跨会话窃读被预约拦截；本会话暂停任务期间允许只读', async () => {
+  const page = new FakePage({ url: 'https://example.com/', bodyText: 'x', clickError: new Error('TimeoutError: 30000ms exceeded') });
+  const rt = makeRuntime(testConfig(), [page]);
+  const s1 = await rt.createSession('p1', {
+    target: { kind: 'existing' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: [],
+  });
+  // 用另一个会话绑定同一 profile 页面（同宿主多会话场景）
+  const s2 = await rt.createSession('p2', {
+    target: { kind: 'existing' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: [],
+  });
+  // s1 产生未知在途动作 → 隔离 + profile 预约（paused）
+  const env = await rt.execute('p1', s1.sessionId, {
+    sessionId: s1.sessionId,
+    steps: flow([{ id: 't', kind: 'action', action: 'click', target: { by: 'css', selector: '#x' }, expect: [{ kind: 'url_contains', value: 'never' }] }]),
+    values: {},
+  });
+  await rt.waitEnvelope(env.taskId);
+  // s2 的快照被预约拦截（防窃读）
+  await assert.rejects(
+    rt.snapshot('p2', s2.sessionId),
+    (e: unknown) => (e as { code?: string }).code === 'SESSION_BUSY',
+  );
+  // s1 自身（预约任务所属会话）允许只读
+  const obs = await rt.snapshot('p1', s1.sessionId);
+  assert.ok(obs);
+  await rt.close();
+});
+
+test('evidence：断言失败进入 envelope.evidence（DESIGN §8.2）', async () => {
+  const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
+  const rt = makeRuntime(testConfig(), [page]);
+  const session = await rt.createSession('p1', {
+    target: { kind: 'existing' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: [],
+  });
+  const env = await rt.execute('p1', session.sessionId, {
+    sessionId: session.sessionId,
+    steps: flow([{ id: 'bad', kind: 'assert', expect: [{ kind: 'text_present', value: 'absent-text' }] }]),
+    values: {},
+  });
+  const final = await rt.waitEnvelope(env.taskId);
+  assert.equal(final.status, 'failed');
+  assert.ok(final.evidence?.length);
+  assert.ok(JSON.stringify(final.evidence).includes('absent-text'));
   await rt.close();
 });
 
@@ -291,8 +579,8 @@ test('跨主体访问：任务与会话按 principal 隔离', async () => {
     values: {},
   });
   await rt.waitEnvelope(env.taskId);
-  assert.throws(() => rt.getTask('p2', env.taskId), /NOT_FOUND/);
-  assert.throws(() => rt.disconnect('p2', session.sessionId), /NOT_FOUND/);
+  assert.throws(() => rt.getTask('p2', env.taskId), (e: unknown) => (e as { code?: string }).code === 'NOT_FOUND');
+  await assert.rejects(rt.disconnect('p2', session.sessionId), (e: unknown) => (e as { code?: string }).code === 'NOT_FOUND');
   await rt.close();
 });
 
@@ -365,6 +653,7 @@ test('崩溃恢复：遗留 running → paused(interrupted)；需 rerunConfirmed
     metricsJson: '{}',
     errorJson: null,
     goalJson: null,
+    planJson: null,
     createdAt: now,
     updatedAt: now,
     deadlineAt: now + 600_000,

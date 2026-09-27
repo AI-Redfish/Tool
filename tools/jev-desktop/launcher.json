@@ -1,0 +1,6 @@
+{
+  "description": "jev-desktop：Windows 桌面软件控制（UIA 观察 + Jev 判断 + 规划 LLM），MCP + CLI 双入口",
+  "command": "python",
+  "args": ["mcp_server.py"],
+  "setup": [["pip", "install", "-r", "requirements.txt"]]
+}

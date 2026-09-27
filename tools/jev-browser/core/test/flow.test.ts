@@ -91,6 +91,22 @@ test('forEach 断点续跑：processed 计数跳过已完成迭代', async () =>
   assert.equal(vars['items.processed'], 3); // 从 1 续跑到 3，不重跑第 1 项
 });
 
+test('forEach 迭代项可经 valuesRef 引用（values 缺失时回退到流程变量）', async () => {
+  const locatorLog: string[] = [];
+  const page = new FakePage({ bodyText: 'seed', locatorLog });
+  const ctx = makeCtx(page);
+  ctx.vars['items'] = ['term-1', 'term-2'];
+  const r = await new FlowExecutor(page, ctx).run([
+    {
+      id: 'fe', kind: 'forEach', itemsVar: 'items', itemVar: 'item', maxItems: 10,
+      body: [{ id: 'f', kind: 'action', action: 'fill', target: { by: 'css', selector: '#q' }, valuesRef: 'item', expect: [] }],
+    },
+  ]);
+  assert.equal(r.stepResults.find((s) => s.id === 'fe')?.status, 'done');
+  const fills = locatorLog.filter((c) => c.startsWith('fill:'));
+  assert.deepEqual(fills, ['fill:term-1', 'fill:term-2']);
+});
+
 test('maxSteps / maxActions 预算耗尽 → BUDGET_EXCEEDED', async () => {
   const page = new FakePage({});
   {
@@ -101,7 +117,7 @@ test('maxSteps / maxActions 预算耗尽 → BUDGET_EXCEEDED', async () => {
         { id: 'b', kind: 'assert', expect: [] },
         { id: 'c', kind: 'assert', expect: [] },
       ]),
-      /BUDGET_EXCEEDED/,
+      (e: unknown) => (e as { code?: string }).code === 'BUDGET_EXCEEDED',
     );
   }
   {
@@ -111,7 +127,7 @@ test('maxSteps / maxActions 预算耗尽 → BUDGET_EXCEEDED', async () => {
         { id: 'a1', kind: 'action', action: 'wait', value: 1, expect: [] },
         { id: 'a2', kind: 'action', action: 'wait', value: 1, expect: [] },
       ]),
-      /BUDGET_EXCEEDED.*动作/,
+      (e: unknown) => (e as { code?: string }).code === 'BUDGET_EXCEEDED',
     );
   }
 });

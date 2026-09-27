@@ -13,8 +13,7 @@ from .errors import CancelledSignal, JevError, err
 from .envelope import Budget, check_cancel
 from .observe import take_snapshot
 from .observe import ocr as ocr_mod
-from .steps import substitute
-from .targeting import resolve_target, select_window_strict
+from .targeting import resolve_target
 
 
 class ExecuteEngine:
@@ -55,6 +54,7 @@ class ExecuteEngine:
                     return self._finish(results, variables, screenshots, failed=True, error=e)
                 continue
             dur = int((time.monotonic() - t0) * 1000)
+            ctx.metrics.steps += 1
             entry = {"id": step["id"], "kind": step["kind"], "act": step.get("act"),
                      "ok": ok, "durationMs": dur}
             for k in ("used", "detail", "ref", "path", "value", "note", "state", "length", "changed"):
@@ -81,13 +81,13 @@ class ExecuteEngine:
         ctx = self.ctx
         kind = step["kind"]
         if kind == "action":
-            return self._run_action(step, variables, window)
+            return self._run_action(step, variables, window, budget)
         if kind == "wait":
             return self._run_wait(step, variables, window, budget)
         if kind == "screenshot":
             from .observe import screenshot as shot
             rect = window.rect if window else None
-            path, size = shot.capture_to_file(ctx.worker, ctx.artifacts_dir, rect, prefix="step")
+            path, size = shot.capture_to_file(ctx.worker, ctx.artifacts_dir_cached, rect, prefix="step")
             screenshots.append(path)
             var = step.get("saveAs")
             if var:
@@ -104,7 +104,7 @@ class ExecuteEngine:
 
     # -- action ---------------------------------------------------------
 
-    def _run_action(self, step: dict, variables: dict, window) -> dict:
+    def _run_action(self, step: dict, variables: dict, window, budget: Budget) -> dict:
         ctx = self.ctx
         act = step["act"]
         spec = step.get("target") or {"kind": "none"}
@@ -119,7 +119,8 @@ class ExecuteEngine:
                                             "", target.rect or (0, 0, 0, 0), "", False, False)
             except Exception:
                 window2 = window
-        out = perform_action(ctx, act, target, value=value)
+        out = perform_action(ctx, act, target, value=value,
+                             scope_hwnd=window.hwnd if window else None)
         ctx.metrics.actions += 1
         # ref 失效后由 Actor/上层抛 JevError
         if step.get("expect"):
@@ -153,14 +154,17 @@ class ExecuteEngine:
 
         if mode == "time":
             ms = min(int(step.get("ms", 0)), timeout_ms)
-            ctx_int = 0.0
             end = time.monotonic() + ms / 1000
             while time.monotonic() < end:
                 check_cancel(ctx.cancel)
+                if budget.remaining_ms() <= 0:
+                    raise err("BUDGET_EXCEEDED", "wait 期间超出 runTimeoutMs 预算")
                 time.sleep(0.05)
             return {"ok": True, "waitedMs": ms}
         while time.monotonic() < deadline:
             check_cancel(ctx.cancel)
+            if budget.remaining_ms() <= 0:
+                raise err("BUDGET_EXCEEDED", "wait 期间超出 runTimeoutMs 预算")
             if pred():
                 return {"ok": True, "waitedMs": int((time.monotonic() - (deadline - timeout_ms / 1000)) * 1000)}
             time.sleep(0.15)
@@ -185,6 +189,9 @@ class ExecuteEngine:
                     data["text"] = target.element.Name or ""
                 if "value" in fields:
                     data["value"] = uia_actions.get_value(target.element, uia)
+                if "text" in fields and not data["text"]:
+                    # WinForms Edit 等控件的 Name 常为空，内容在 ValuePattern 里
+                    data["text"] = uia_actions.get_value(target.element, uia)
                 if "rect" in fields:
                     data["rect"] = list(uia_actions.element_rect(target.element))
                 if "enabled" in fields:
@@ -192,12 +199,18 @@ class ExecuteEngine:
                         data["enabled"] = bool(target.element.IsEnabled)
                     except Exception:
                         data["enabled"] = None
+                if "checked" in fields:
+                    data["checked"] = uia_actions.toggle_state_of(target.element, uia)
                 return data
 
             out = ctx.worker.call(_read, 10.0, "extract 读取元素")
         elif target.kind == "point":
             out = {"point": list(target.point or [])}
-        variables[step["saveAs"]] = out.get("text", out.get("value", ""))
+            if getattr(target, "text", None):
+                out["text"] = target.text
+        # saveAs 取第一个请求字段的值（用户字段顺序即意图优先级）
+        primary = fields[0]
+        variables[step["saveAs"]] = out.get(primary, "") if primary in out else ""
         return {"ok": True, "extracted": {k: (v if not isinstance(v, str) else v[:120]) for k, v in out.items()},
                 "savedAs": step["saveAs"]}
 

@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "goto",
+      "kind": "action",
+      "action": "navigate",
+      "value": "https://example.com",
+      "expect": [{ "kind": "url_contains", "value": "example.com" }]
+    },
+    {
+      "id": "read-heading",
+      "kind": "extract",
+      "target": { "by": "role", "role": "heading", "name": "Example Domain", "exact": true },
+      "fields": ["text", "count"],
+      "saveAs": "heading"
+    },
+    {
+      "id": "verify-heading",
+      "kind": "assert",
+      "expect": [{ "kind": "var_equals", "variable": "heading.text", "value": "Example Domain" }]
+    },
+    {
+      "id": "shot",
+      "kind": "action",
+      "action": "screenshot"
+    }
+  ],
+  "values": {}
+}

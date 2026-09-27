@@ -13,7 +13,7 @@
 
 阅读顺序：[方案总览](jev-browser/README.md) → [技术设计](jev-browser/DESIGN.md) → [开发计划](jev-browser/DEVELOPMENT_PLAN.md)；事实依据与待验证项见 [研究记录](jev-browser/RESEARCH.md)。
 
-`jev-desktop/` 当前仅包含桌面控制工具的设计与开发计划：LLM 规划 + Jev 判断，UIA 语义树与截图/OCR/视觉三档可降级观察，`execute` / `run` 双模式共用执行引擎，Python 实现，MCP + CLI 入口。尚未创建包配置或运行入口，因此不会出现在启动器的可用工具列表中。
+`jev-desktop/` Windows 桌面控制工具：LLM 规划 + Jev 判断，UIA 语义树与截图/OCR/视觉三档可降级观察，`execute` / `run` 双模式共用执行引擎，Python 实现（`core + cli + mcp` + `launcher.json`），MCP + CLI 入口。**已实现并通过本地端到端验证**（UIA 快照/语义动作/SendInput 中文输入/剪贴板/截图/OCR/ref 活性校验/execute 流程/run 有界 ReAct mock 联调/MCP 协议），OCR 为可选依赖（`requirements-ocr.txt`）。
 
 阅读顺序：[方案总览](jev-desktop/README.md) → [技术设计](jev-desktop/DESIGN.md) → [开发计划](jev-desktop/DEVELOPMENT_PLAN.md)；事实依据与待验证项见 [研究记录](jev-desktop/RESEARCH.md)。
 

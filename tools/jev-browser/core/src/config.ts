@@ -68,12 +68,20 @@ export interface SafetyConfig {
   preauthorizedActions: string[];
   /** 高风险目标名 pattern（命中即需要确认，如 支付/购买/删除/发送）。 */
   riskyNamePatterns: string[];
+  /** 上传授权目录（绝对路径；空数组 = 拒绝一切上传，DESIGN §10：须授权具体文件）。 */
+  allowedUploadDirs: string[];
+  /** 单文件上传大小上限（字节，已知长度时预检）。 */
+  maxUploadBytes: number;
 }
 
 export interface ApiConfig {
   host: string;
   port: number;
   tokenEnv: string;
+  /** 每 token 每分钟写请求上限（DESIGN §10：限定速率；0 = 不限）。 */
+  rateLimitPerMin: number;
+  /** 同时在途请求上限（DESIGN §10：限定并发；超出返回 429）。 */
+  maxConcurrentRequests: number;
 }
 
 export interface JevBrowserConfig {
@@ -156,13 +164,16 @@ export function defaultConfig(): JevBrowserConfig {
       allowedOrigins: [],
       modelOrigins: [],
       approvalTtlMs: 120_000,
-      preauthorizedActions: ['navigate', 'scroll', 'wait', 'screenshot', 'fill', 'press', 'select', 'click'],
+      preauthorizedActions: ['navigate', 'scroll', 'wait', 'screenshot', 'fill', 'press', 'select', 'click', 'upload'],
       riskyNamePatterns: [
         '支付', '付款', '购买', '下单', '结算', '删除', '发送', '提交订单', '确认订单',
         'pay', 'checkout', 'purchase', 'delete', 'remove', 'send', 'place order',
       ],
+      // 默认无授权目录 = 拒绝一切上传（显式配置目录后，具体文件路径即显式授权，DESIGN §10）
+      allowedUploadDirs: [],
+      maxUploadBytes: 50 * 1024 * 1024,
     },
-    api: { host: '127.0.0.1', port: 3737, tokenEnv: 'JEV_BROWSER_API_TOKEN' },
+    api: { host: '127.0.0.1', port: 3737, tokenEnv: 'JEV_BROWSER_API_TOKEN', rateLimitPerMin: 120, maxConcurrentRequests: 16 },
   };
 }
 
@@ -176,15 +187,29 @@ function isPlainObject(v: unknown): v is Plain {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/** 可选字段（不在默认值对象中，但配置文件/覆盖允许提供）。 */
+const OPTIONAL_FIELDS = new Set([
+  'browser.launch.userDataDir',
+  'planner.provider',
+  'planner.baseUrl',
+  'planner.model',
+]);
+
 /** 以 template 的键为准：未知键报错；标量类型必须与默认值一致；数组与对象递归。 */
-function mergeInto(target: Plain, patch: Plain, template: Plain, where: string): void {
+function mergeInto(target: Plain, patch: Plain, template: Plain, where: string, prefix = ''): void {
   for (const [k, v] of Object.entries(patch)) {
+    const fieldPath = prefix ? `${prefix}.${k}` : k;
     if (!(k in template)) {
+      if (OPTIONAL_FIELDS.has(fieldPath)) {
+        if (typeof v !== 'string') throw err('CONFIG_INVALID', `${fieldPath}: 需要 string，得到 ${typeof v}`);
+        target[k] = v;
+        continue;
+      }
       throw err('CONFIG_INVALID', `${where}: 未知字段 "${k}"`);
     }
     const tv = template[k];
     if (isPlainObject(v) && isPlainObject(tv)) {
-      mergeInto(target[k] as Plain, v, tv, `${where}.${k}`);
+      mergeInto(target[k] as Plain, v, tv, `${where}.${k}`, fieldPath);
     } else if (isPlainObject(v) || Array.isArray(v) && isPlainObject(tv)) {
       throw err('CONFIG_INVALID', `${where}.${k}: 类型错误`);
     } else if (Array.isArray(tv)) {
@@ -301,7 +326,35 @@ function applyEnv(cfg: JevBrowserConfig, env: NodeJS.ProcessEnv): void {
   if (modelOrigins !== undefined && modelOrigins !== '') safety.modelOrigins = parseJsonArray('JEV_BROWSER_MODEL_ORIGINS', modelOrigins);
   setNum(safety, 'approvalTtlMs', 'JEV_BROWSER_APPROVAL_TTL_MS');
 
+  const safety2 = cfg.safety as unknown as Plain;
+  const uploadDirs = get('JEV_BROWSER_ALLOWED_UPLOAD_DIRS');
+  if (uploadDirs !== undefined && uploadDirs !== '') {
+    const dirs = parseJsonArray('JEV_BROWSER_ALLOWED_UPLOAD_DIRS', uploadDirs);
+    for (const d of dirs) {
+      if (!path.isAbsolute(d)) throw err('CONFIG_INVALID', `JEV_BROWSER_ALLOWED_UPLOAD_DIRS: 需要绝对路径: ${d}`);
+    }
+    safety2.allowedUploadDirs = dirs;
+  }
+  const maxUpload = get('JEV_BROWSER_MAX_UPLOAD_BYTES');
+  if (maxUpload !== undefined && maxUpload !== '') {
+    const n = Number(maxUpload);
+    if (!Number.isFinite(n) || n <= 0) throw err('CONFIG_INVALID', 'JEV_BROWSER_MAX_UPLOAD_BYTES: 需要正数');
+    safety2.maxUploadBytes = n;
+  }
+
   const api = cfg.api as unknown as Plain;
+  const rateLimit = get('JEV_BROWSER_API_RATE_LIMIT_PER_MIN');
+  if (rateLimit !== undefined && rateLimit !== '') {
+    const n = Number(rateLimit);
+    if (!Number.isFinite(n) || n < 0) throw err('CONFIG_INVALID', 'JEV_BROWSER_API_RATE_LIMIT_PER_MIN: 需要非负数');
+    api.rateLimitPerMin = n;
+  }
+  const maxConc = get('JEV_BROWSER_API_MAX_CONCURRENT');
+  if (maxConc !== undefined && maxConc !== '') {
+    const n = Number(maxConc);
+    if (!Number.isFinite(n) || n < 1) throw err('CONFIG_INVALID', 'JEV_BROWSER_API_MAX_CONCURRENT: 需要正整数');
+    api.maxConcurrentRequests = n;
+  }
   const host = get('JEV_BROWSER_API_HOST');
   if (host) {
     if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
@@ -328,11 +381,36 @@ function validateFinal(cfg: JevBrowserConfig): void {
   for (const o of [...cfg.safety.allowedOrigins, ...cfg.safety.modelOrigins]) {
     if (!originRe.test(o)) throw err('CONFIG_INVALID', `safety origin 非法（只允许明确的 http/https origin）: "${o}"`);
   }
+  if (cfg.browser.mode === 'attach') {
+    const ep = cfg.browser.attach.endpoint;
+    if (ep !== 'chrome') {
+      if (!/^https?:\/\//i.test(ep)) {
+        throw err('CONFIG_INVALID', `browser.attach.endpoint 只支持 "chrome" 或 http(s) URL: "${ep}"`);
+      }
+      let u: URL;
+      try {
+        u = new URL(ep);
+      } catch {
+        throw err('CONFIG_INVALID', `browser.attach.endpoint 不是合法 URL: "${ep}"`);
+      }
+      if (!/^(localhost|127\.0\.0\.1|\[::1\]|::1)$/i.test(u.hostname)) {
+        throw err('CONFIG_INVALID', `browser.attach.endpoint 只允许 loopback（DESIGN §4.1）: ${u.hostname}`);
+      }
+    }
+  }
   if (cfg.browser.mode === 'launch' && cfg.browser.launch.userDataDir && !path.isAbsolute(cfg.browser.launch.userDataDir)) {
     throw err('CONFIG_INVALID', 'browser.launch.userDataDir 需要绝对路径');
   }
-  if (cfg.planner.enabled && (!cfg.planner.provider || !cfg.planner.baseUrl || !cfg.planner.model)) {
-    throw err('CONFIG_INVALID', 'planner.enabled=true 时需要 provider/baseUrl/model（无默认厂商，DESIGN §7）');
+  if (cfg.planner.enabled) {
+    if (!cfg.planner.provider || !cfg.planner.baseUrl || !cfg.planner.model) {
+      throw err('CONFIG_INVALID', 'planner.enabled=true 时需要 provider/baseUrl/model（无默认厂商，DESIGN §7）');
+    }
+    if (cfg.planner.provider !== 'openai-compatible') {
+      throw err('CONFIG_INVALID', `planner.provider 暂只支持 openai-compatible: ${cfg.planner.provider}`);
+    }
+    if (!/^https?:\/\//i.test(cfg.planner.baseUrl)) {
+      throw err('CONFIG_INVALID', `planner.baseUrl 必须是 http(s) URL: ${cfg.planner.baseUrl}`);
+    }
   }
   // 数值合理性：时限/预算必须为正（配置文件来源的字段在此兜底）
   const positive: Array<[number, string]> = [
@@ -411,7 +489,8 @@ export function loadConfig(opts: LoadConfigOptions = {}): LoadedConfig {
     'JEV_BROWSER_MAX_OUTPUT_TOKENS', 'JEV_BROWSER_QUEUE_TIMEOUT_MS', 'JEV_BROWSER_PAUSE_TTL_MS',
     'JEV_BROWSER_TASK_TTL_MS', 'JEV_BROWSER_ACTION_TIMEOUT_MS', 'JEV_BROWSER_ALLOWED_ORIGINS',
     'JEV_BROWSER_MODEL_ORIGINS', 'JEV_BROWSER_APPROVAL_TTL_MS', 'JEV_BROWSER_API_HOST',
-    'JEV_BROWSER_API_PORT', 'JEV_BROWSER_API_TOKEN_ENV',
+    'JEV_BROWSER_API_PORT', 'JEV_BROWSER_API_TOKEN_ENV', 'JEV_BROWSER_ALLOWED_UPLOAD_DIRS',
+    'JEV_BROWSER_MAX_UPLOAD_BYTES', 'JEV_BROWSER_API_RATE_LIMIT_PER_MIN', 'JEV_BROWSER_API_MAX_CONCURRENT',
   ];
   for (const k of envKeys) {
     const v = env[k];
@@ -424,12 +503,19 @@ export function loadConfig(opts: LoadConfigOptions = {}): LoadedConfig {
     mergeInto(cfg as unknown as Plain, opts.overrides, defaultConfig() as unknown as Plain, 'overrides');
   }
 
+  // 4) 相对路径按配置文件所在目录解析（DESIGN §5.1）；须在最终校验前完成
+  if (sources.file) {
+    const base = path.dirname(sources.file);
+    if (cfg.browser.launch.userDataDir && !path.isAbsolute(cfg.browser.launch.userDataDir)) {
+      cfg.browser.launch.userDataDir = path.resolve(base, cfg.browser.launch.userDataDir);
+    }
+    if (!path.isAbsolute(cfg.runtime.dataDir)) {
+      cfg.runtime.dataDir = path.resolve(base, cfg.runtime.dataDir);
+    }
+  }
+
   validateFinal(cfg);
 
-  // 4) 相对路径按配置文件目录解析（DESIGN §5.1）
-  if (sources.file && cfg.browser.launch.userDataDir && !path.isAbsolute(cfg.browser.launch.userDataDir)) {
-    cfg.browser.launch.userDataDir = path.resolve(path.dirname(sources.file), cfg.browser.launch.userDataDir);
-  }
   return { config: cfg, sources };
 }
 

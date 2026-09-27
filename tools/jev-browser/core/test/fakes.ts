@@ -9,11 +9,16 @@ import * as nodeFs from 'node:fs';
 export class FakeLocator implements LocatorPort {
   calls: string[] = [];
   constructor(
-    private readonly state: { count: number; text: string; visible: boolean; clickError?: Error; fillError?: Error },
+    private readonly state: { count: number; text: string; visible: boolean; clickError?: Error; fillError?: Error; log?: string[] },
   ) {}
 
+  private record(entry: string): void {
+    this.calls.push(entry);
+    this.state.log?.push(entry);
+  }
+
   async count(): Promise<number> {
-    this.calls.push('count');
+    this.record('count');
     return this.state.count;
   }
 
@@ -22,12 +27,12 @@ export class FakeLocator implements LocatorPort {
   }
 
   async click(): Promise<void> {
-    this.calls.push('click');
+    this.record('click');
     if (this.state.clickError) throw this.state.clickError;
   }
 
   async fill(value: string): Promise<void> {
-    this.calls.push(`fill:${value}`);
+    this.record(`fill:${value}`);
     if (this.state.fillError) throw this.state.fillError;
   }
 
@@ -37,6 +42,10 @@ export class FakeLocator implements LocatorPort {
 
   async selectOption(value: string): Promise<void> {
     this.calls.push(`select:${value}`);
+  }
+
+  async setInputFiles(files: string[]): Promise<void> {
+    this.record(`setInputFiles:${files.join(',')}`);
   }
 
   async isVisible(): Promise<boolean> {
@@ -61,6 +70,8 @@ export interface FakePageOptions {
   elements?: Array<{ role: string; name: string }>;
   clickError?: Error;
   downloadAfterClick?: { filename: string; content: string };
+  /** 共享的 locator 级调用记录（用于断言 fill/press 等实际参数）。 */
+  locatorLog?: string[];
 }
 
 export class FakePage implements PagePort {
@@ -70,9 +81,11 @@ export class FakePage implements PagePort {
   urlAfterNavigate?: string;
   downloads: Array<{ filename: string; content: string }> = [];
   isClosedFlag = false;
+  readonly locatorLog: string[] = [];
 
   constructor(private readonly opts: FakePageOptions = {}) {
     this.currentUrl = opts.url ?? 'https://example.com/';
+    if (opts.locatorLog) this.locatorLog = opts.locatorLog;
   }
 
   url(): string {
@@ -100,6 +113,7 @@ export class FakePage implements PagePort {
       text: this.opts.bodyText ?? 'Example',
       visible: true,
       clickError: this.opts.clickError,
+      log: this.locatorLog,
     });
   }
 
@@ -175,6 +189,10 @@ export class FakeContext implements ContextPort {
 
   pages(): PagePort[] {
     return this.pagesList.filter((p) => !p.isClosedFlag);
+  }
+
+  indexOfPage(page: PagePort): number {
+    return this.pagesList.indexOf(page as FakePage);
   }
 
   async newPage(url?: string): Promise<PagePort> {

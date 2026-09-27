@@ -5,8 +5,6 @@ done 判定三重：规划器 done 标志 + Jev Noul(done) + success_criteria �
 规划器反复误报完成（≥3 次）即失败，不无限循环。
 """
 
-import time
-
 from . import winapi
 from .envelope import check_cancel
 from .errors import JevError, err
@@ -52,7 +50,6 @@ class RunEngine:
         false_done = 0
         last_snapshot_text = ""
         artifacts: list[str] = []
-        final_note = ""
         while True:
             check_cancel(ctx.cancel)
             budget.check_deadline("run")
@@ -172,8 +169,6 @@ class RunEngine:
         if criteria:
             crit_ok = all(verdicts.get(f"crit{i}", 0) >= ctx.cfg["jev"]["doneAt"] for i in range(len(criteria)))
             done = done and crit_ok
-        if snap and snap.image_path:
-            pass
         return {"done": done, "probabilities": verdicts, "criteriaCount": len(criteria),
                 "criteriaNote": "未配置 success_criteria，按『完成目标的直接可观察结果』验收" if not criteria else ""}
 

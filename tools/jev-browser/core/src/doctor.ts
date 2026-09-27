@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { loadConfig, credentialPresent, redactForDoctor, type LoadConfigOptions } from './config.js';
+import { loadConfig, credentialPresent, redactForDoctor, type JevBrowserConfig, type LoadConfigOptions } from './config.js';
 import { PlaywrightConnector } from './connectors.js';
+import { describeCapabilities } from './capabilities.js';
 
 /**
  * doctor（DESIGN §5.1 / P1）：区分“只检查配置”与“经用户同意尝试连接”。
@@ -16,6 +17,8 @@ export interface DoctorResult {
   };
   checks: Array<{ name: string; ok: boolean; detail: string }>;
   credentials: { jev: boolean; planner: boolean; api: boolean };
+  /** 能力探测（DESIGN §11：未知/未实测能力不标 supported）。 */
+  capabilities: ReturnType<typeof describeCapabilities>;
   connect?: {
     attempted: boolean;
     ok: boolean;
@@ -71,6 +74,7 @@ export async function runDoctor(opts: LoadConfigOptions & { attemptConnect?: boo
     config: { file: sources.file, envKeys: sources.envKeys, effective: redactForDoctor(config) },
     checks,
     credentials,
+    capabilities: describeCapabilities(config),
   };
 
   if (opts.attemptConnect && config.browser.mode === 'attach') {

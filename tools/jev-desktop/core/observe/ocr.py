@@ -25,13 +25,22 @@ def backend_available() -> bool:
             return False
 
 
+def engine_loaded() -> bool:
+    return _ENGINE["engine"] is not None
+
+
 def _get_engine():
     """懒加载 OCR 引擎（进程内单例）。"""
     with _ENGINE_LOCK:
         if _ENGINE["engine"] is not None:
             return _ENGINE["engine"]
         try:
+            import logging
             import rapidocr  # type: ignore
+            # rapidocr 的 INFO 日志走自己的 logger，压到 WARNING 以下（stderr 纪律）
+            for lname in list(logging.root.manager.loggerDict) + ["RapidOCR"]:
+                if "rapid" in lname.lower():
+                    logging.getLogger(lname).setLevel(logging.WARNING)
             engine = rapidocr.RapidOCR()
             _ENGINE["key"] = "rapidocr"
             _ENGINE["engine"] = engine

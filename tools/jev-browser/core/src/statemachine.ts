@@ -5,6 +5,7 @@ import { isTerminal } from './types.js';
 /**
  * 任务状态机（DESIGN §8.2）：
  * queued → running → done|failed|expired
+ *   queued → failed（启动前被拒绝：隔离/策略/配置）
  *   running → paused → queued（显式恢复）
  *   queued/running/paused → cancelling → cancelled|failed
  *   queued/paused → expired；running → cancelling → expired|failed
@@ -12,7 +13,8 @@ import { isTerminal } from './types.js';
  */
 
 const TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
-  queued: ['running', 'cancelling', 'expired', 'cancelled', 'paused'], // paused 仅用于崩溃恢复标记
+  // queued → failed：任务在启动前被拒绝（隔离/策略），附错误收尾，不卡队列
+  queued: ['running', 'cancelling', 'expired', 'cancelled', 'paused', 'failed'],
   running: ['done', 'failed', 'paused', 'cancelling', 'expired'],
   paused: ['queued', 'cancelled', 'expired'],
   cancelling: ['cancelled', 'failed', 'expired'],

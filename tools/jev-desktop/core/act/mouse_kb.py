@@ -85,6 +85,11 @@ def wheel(direction: str, times: int, *, x: int | None = None, y: int | None = N
     return "coordinate"
 
 
+def ensure_foreground(hwnd: int | None) -> None:
+    """确保目标窗口在前台（键盘输入前置条件）；失败抛 INPUT_DENIED。"""
+    _ensure_foreground(hwnd)
+
+
 def _ensure_foreground(hwnd: int | None) -> None:
     """坐标动作前置条件：目标窗口在前台（DESIGN §5）。失败时给出可操作错误。"""
     if hwnd is None:

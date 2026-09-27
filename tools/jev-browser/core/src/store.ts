@@ -24,6 +24,7 @@ export interface TaskRow {
   metricsJson: string;
   errorJson: string | null;
   goalJson: string | null;
+  planJson: string | null;
   createdAt: number;
   updatedAt: number;
   deadlineAt: number | null;
@@ -55,7 +56,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   request_json TEXT NOT NULL, cursor INTEGER NOT NULL DEFAULT 0,
   vars_json TEXT NOT NULL DEFAULT '{}', results_json TEXT NOT NULL DEFAULT '[]',
   metrics_json TEXT NOT NULL DEFAULT '{}',
-  error_json TEXT, goal_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  error_json TEXT, goal_json TEXT, plan_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   deadline_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS actions (
@@ -89,6 +90,15 @@ export class TaskStore {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
     this.db.exec(DDL);
+    this.migrate();
+  }
+
+  /** 轻量迁移：为早期库补齐后增列（新库由 DDL 直接包含）。 */
+  private migrate(): void {
+    const cols = (this.db.prepare("PRAGMA table_info('tasks')").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!cols.includes('plan_json')) {
+      this.db.exec('ALTER TABLE tasks ADD COLUMN plan_json TEXT');
+    }
   }
 
   close(): void {
@@ -136,10 +146,10 @@ export class TaskStore {
   insertTask(t: TaskRow): void {
     this.db.prepare(
       `INSERT INTO tasks (task_id, session_id, principal, mode, status, pause_reason, revision, request_json,
-        cursor, vars_json, results_json, metrics_json, error_json, goal_json, created_at, updated_at, deadline_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        cursor, vars_json, results_json, metrics_json, error_json, goal_json, plan_json, created_at, updated_at, deadline_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(t.taskId, t.sessionId, t.principal, t.mode, t.status, t.pauseReason, t.revision, t.requestJson,
-      t.cursor, t.varsJson, t.resultsJson, t.metricsJson, t.errorJson, t.goalJson, t.createdAt, t.updatedAt, t.deadlineAt);
+      t.cursor, t.varsJson, t.resultsJson, t.metricsJson, t.errorJson, t.goalJson, t.planJson, t.createdAt, t.updatedAt, t.deadlineAt);
   }
 
   getTask(taskId: string): TaskRow | undefined {
@@ -157,6 +167,7 @@ export class TaskStore {
     pauseReason?: string | null;
     errorJson?: string | null;
     goalJson?: string | null;
+    planJson?: string | null;
     cursor?: number;
     varsJson?: string;
     resultsJson?: string;
@@ -170,16 +181,17 @@ export class TaskStore {
         pauseReason: patch.pauseReason !== undefined ? patch.pauseReason : cur.pauseReason,
         errorJson: patch.errorJson !== undefined ? patch.errorJson : cur.errorJson,
         goalJson: patch.goalJson !== undefined ? patch.goalJson : cur.goalJson,
+        planJson: patch.planJson !== undefined ? patch.planJson : cur.planJson,
         cursor: patch.cursor ?? cur.cursor,
         varsJson: patch.varsJson ?? cur.varsJson,
         resultsJson: patch.resultsJson ?? cur.resultsJson,
         metricsJson: patch.metricsJson ?? cur.metricsJson,
       };
       const res = this.db.prepare(
-        `UPDATE tasks SET status=?, pause_reason=?, error_json=?, goal_json=?, cursor=?, vars_json=?,
+        `UPDATE tasks SET status=?, pause_reason=?, error_json=?, goal_json=?, plan_json=?, cursor=?, vars_json=?,
           results_json=?, metrics_json=?, revision=revision+1, updated_at=? WHERE task_id=? AND revision=?`,
       ).run(
-        next.status, next.pauseReason, next.errorJson, next.goalJson, next.cursor, next.varsJson,
+        next.status, next.pauseReason, next.errorJson, next.goalJson, next.planJson, next.cursor, next.varsJson,
         next.resultsJson, next.metricsJson, Date.now(), taskId, expectedRevision,
       );
       return Number(res.changes);
@@ -237,8 +249,9 @@ export class TaskStore {
 
   // ---- 审批 grant ----
   putGrant(g: { grantId: string; taskId: string; actionRevision: number; token: string; expiresAt: number }): void {
+    // 同一 grant 重复 approve 幂等（不覆盖已消费状态；重放由 grant_id 主键保护）
     this.db.prepare(
-      'INSERT INTO grants (grant_id, task_id, action_revision, token, consumed, expires_at, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)',
+      'INSERT OR IGNORE INTO grants (grant_id, task_id, action_revision, token, consumed, expires_at, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)',
     ).run(g.grantId, g.taskId, g.actionRevision, g.token, g.expiresAt, Date.now());
   }
 
@@ -278,15 +291,20 @@ export class TaskStore {
 
   listArtifactsByTask(taskId: string): ArtifactRow[] {
     const rows = this.db.prepare('SELECT * FROM artifacts WHERE task_id = ? ORDER BY created_at').all(taskId) as Array<Record<string, unknown>>;
-    return rows.map((r) => ({
-      artifactId: String(r.artifact_id),
-      taskId: String(r.task_id),
-      filename: String(r.filename),
-      size: Number(r.size),
-      sha256: String(r.sha256),
-      path: String(r.path),
-      createdAt: Number(r.created_at),
-    }));
+    return rows.map(rowToArtifact);
+  }
+
+  /** 终态任务的过期 artifact（拟保留 24h，DESIGN §9.1）；调用方负责删文件后调 deleteArtifact。 */
+  artifactsOfTerminalTasksOlderThan(cutoff: number): ArtifactRow[] {
+    const rows = this.db.prepare(
+      `SELECT a.* FROM artifacts a JOIN tasks t ON a.task_id = t.task_id
+       WHERE a.created_at < ? AND t.status IN ('done','failed','expired','cancelled')`,
+    ).all(cutoff) as Array<Record<string, unknown>>;
+    return rows.map(rowToArtifact);
+  }
+
+  deleteArtifact(artifactId: string): void {
+    this.db.prepare('DELETE FROM artifacts WHERE artifact_id = ?').run(artifactId);
   }
 
   // ---- kv（预约/隔离/锁） ----
@@ -302,6 +320,18 @@ export class TaskStore {
   kvDel(key: string): void {
     this.db.prepare('DELETE FROM kv WHERE k = ?').run(key);
   }
+}
+
+function rowToArtifact(r: Record<string, unknown>): ArtifactRow {
+  return {
+    artifactId: String(r.artifact_id),
+    taskId: String(r.task_id),
+    filename: String(r.filename),
+    size: Number(r.size),
+    sha256: String(r.sha256),
+    path: String(r.path),
+    createdAt: Number(r.created_at),
+  };
 }
 
 function rowToTask(r: Record<string, unknown>): TaskRow {
@@ -320,6 +350,7 @@ function rowToTask(r: Record<string, unknown>): TaskRow {
     metricsJson: String(r.metrics_json),
     errorJson: (r.error_json as string) ?? null,
     goalJson: (r.goal_json as string) ?? null,
+    planJson: (r.plan_json as string) ?? null,
     createdAt: Number(r.created_at),
     updatedAt: Number(r.updated_at),
     deadlineAt: (r.deadline_at as number) ?? null,

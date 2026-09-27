@@ -17,13 +17,14 @@ ACTIONS = {
     "launch", "close", "minimize", "maximize", "restore", "move", "resize",
     "clipboard_get", "clipboard_set",
 }
-NEED_TARGET = {"click", "double_click", "right_click", "hover", "drag", "type", "set_value",
+NEED_TARGET = {"click", "double_click", "right_click", "hover", "drag", "set_value",
                "scroll", "select", "toggle", "check", "uncheck", "expand", "collapse",
                "focus", "invoke"}
+# type/press 支持无目标（输入到当前焦点/目标窗口），与 desktop_act 语义一致
 NEED_VALUE = {"type", "set_value", "press", "launch", "move", "resize", "clipboard_set", "drag"}
 EXPECT_KINDS = {"element_exists", "element_gone", "text_present", "window_title_contains"}
 WAIT_MODES = {"element", "text", "time"}
-EXTRACT_FIELDS = {"text", "value", "rect", "enabled"}
+EXTRACT_FIELDS = {"text", "value", "rect", "enabled", "checked"}
 ASSERT_OPS = {"var_equals", "var_contains", "var_exists", "element_exists", "element_gone",
               "window_title_contains"}
 VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -117,6 +118,7 @@ def validate_step(s, *, where: str, index: int, variables: dict) -> dict:
                 ms = int(ms)
             except (TypeError, ValueError):
                 raise err("INVALID_STEP", f"{where}: wait.ms 必须是整数")
+            ms = max(0, ms)
             return {"id": step_id, "kind": "wait", "mode": "time", "ms": ms,
                     "timeoutMs": min(timeout, 30000) if timeout else None}
         return {"id": step_id, "kind": "wait", "mode": mode, "target": target, "text": text, "timeoutMs": timeout}

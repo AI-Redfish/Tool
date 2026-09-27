@@ -1,0 +1,3 @@
+# OCR 档可选依赖（DESIGN §3：rapidocr v3 统一包；首次使用懒加载模型）
+# 不安装本文件时：ocr 档返回 OCR_UNAVAILABLE，auto 档自动跳过 OCR，其余功能不受影响。
+rapidocr>=3.9,<4

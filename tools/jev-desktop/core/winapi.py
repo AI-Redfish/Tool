@@ -19,6 +19,43 @@ shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 ole32 = ctypes.WinDLL("ole32", use_last_error=True)
 dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
 
+# Win64 正确性：返回指针/句柄的函数必须显式 restype（ctypes 默认 32 位 int 会截断）
+kernel32.GlobalAlloc.restype = ctypes.c_void_p
+kernel32.GlobalAlloc.argtypes = (ctypes.c_uint, ctypes.c_size_t)
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
+kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
+kernel32.GlobalFree.argtypes = (ctypes.c_void_p,)
+kernel32.OpenProcess.restype = ctypes.c_void_p
+kernel32.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+kernel32.QueryFullProcessImageNameW.argtypes = (ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p, ctypes.POINTER(wt.DWORD))
+user32.GetClipboardData.restype = ctypes.c_void_p
+user32.GetClipboardData.argtypes = (ctypes.c_uint,)
+user32.SetClipboardData.restype = ctypes.c_void_p
+user32.SetClipboardData.argtypes = (ctypes.c_uint, ctypes.c_void_p)
+user32.GetForegroundWindow.restype = ctypes.c_void_p
+user32.SetForegroundWindow.argtypes = (ctypes.c_void_p,)
+user32.IsWindow.argtypes = (ctypes.c_void_p,)
+user32.IsWindowVisible.argtypes = (ctypes.c_void_p,)
+user32.IsIconic.argtypes = (ctypes.c_void_p,)
+user32.IsHungAppWindow.argtypes = (ctypes.c_void_p,)
+user32.BringWindowToTop.argtypes = (ctypes.c_void_p,)
+user32.ShowWindow.argtypes = (ctypes.c_void_p, ctypes.c_int)
+user32.SetWindowPos.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint)
+user32.GetWindowRect.argtypes = (ctypes.c_void_p, ctypes.POINTER(wt.RECT))
+user32.GetWindowTextLengthW.argtypes = (ctypes.c_void_p,)
+user32.GetWindowTextW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int)
+user32.GetClassNameW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int)
+user32.GetWindowThreadProcessId.argtypes = (ctypes.c_void_p, ctypes.POINTER(wt.DWORD))
+user32.GetWindowLongW.argtypes = (ctypes.c_void_p, ctypes.c_int)
+user32.AttachThreadInput.argtypes = (ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int)
+user32.SendMessageTimeoutW.argtypes = (ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(wt.DWORD))
+user32.EnumWindows.argtypes = (ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM), wt.LPARAM)
+user32.OpenClipboard.argtypes = (ctypes.c_void_p,)
+user32.EmptyClipboard.restype = ctypes.c_int
+user32.CloseClipboard.restype = ctypes.c_int
+
 # ---------------------------------------------------------------------------
 
 _DPI_PMV2 = ctypes.c_void_p(-4)  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
@@ -363,7 +400,7 @@ def window_title(hwnd: int) -> str:
 
 
 def list_top_windows() -> list[WindowInfo]:
-    """可见、非工具窗、未 cloaked 的顶层窗口（跳过任务栏/桌面等外壳）。"""
+    """可见顶层窗口（含最小化，已标记）；跳过任务栏/桌面等外壳与工具窗。"""
     ensure_dpi_awareness()
     results: list[WindowInfo] = []
     fg = user32.GetForegroundWindow()
@@ -388,15 +425,28 @@ def list_top_windows() -> list[WindowInfo]:
         except Exception:
             pass
         rect = window_rect(hwnd)
-        if not rect or rect[2] <= 0 or rect[3] <= 0:
+        if not rect:
             return True
         pid = window_pid(hwnd)
-        results.append(WindowInfo(hwnd, title, pid, _process_name(pid), rect, klass, hwnd == fg, bool(user32.IsIconic(hwnd))))
+        minimized = bool(user32.IsIconic(hwnd))
+        # 最小化窗口的 GetWindowRect 是 (-32000,...) 占位值，不做矩形合法性检查
+        if not minimized and (rect[2] <= rect[0] or rect[3] <= rect[1]):
+            return True
+        results.append(WindowInfo(hwnd, title, pid, _process_name(pid), rect, klass, hwnd == fg, minimized))
         return True
 
     user32.EnumWindows(cb, 0)
-    results.sort(key=lambda w: ((not w.foreground), -(w.rect[2] * w.rect[3])))
+    results.sort(key=lambda w: ((not w.foreground), w.minimized, -(w.rect[2] * w.rect[3])))
     return results
+
+
+def ensure_restored(hwnd: int, *, wait_s: float = 0.3) -> bool:
+    """最小化窗口先还原（观察/截图/坐标动作的前提）。返回是否发生了还原。"""
+    if not is_window(hwnd) or not user32.IsIconic(hwnd):
+        return False
+    user32.ShowWindow(hwnd, SW_RESTORE)
+    time.sleep(wait_s)
+    return True
 
 
 def focus_window(hwnd: int, *, timeout_s: float = 2.0) -> bool:
@@ -477,7 +527,7 @@ def show_window(hwnd: int, cmd: int) -> None:
 # ---------------------------------------------------------------------------
 
 def clipboard_get() -> str:
-    _ensure_dpi = ensure_dpi_awareness()
+    ensure_dpi_awareness()
     for _ in range(6):
         if user32.OpenClipboard(None):
             break

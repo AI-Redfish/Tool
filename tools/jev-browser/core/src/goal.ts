@@ -28,11 +28,13 @@ export interface GoalLoopOptions {
   maxOutputTokens?: number;
   actionTimeoutMs: number;
   /** 阈值来自 config.jev（dev 初值，须按业务校准，DESIGN §6.3）。 */
-  thresholds: { doneAt: number; confirmLow: number; confirmHigh: number };
+  thresholds: { doneAt: number; confirmLow: number; confirmHigh: number; blockedAt: number; errorAt: number };
   artifacts: ArtifactSink;
   ledger: LedgerHook;
   cancelFlag: { cancelled: boolean };
   dialogs?: DialogManager;
+  allowedUploadDirs?: string[];
+  maxUploadBytes?: number;
   /** 派发前的策略闸门：未授权抛 PauseSignal(needs_confirmation)（DESIGN §10）。 */
   requestApproval?: (step: ActionStep, actionRevision: number) => Promise<void>;
   nextActionRevision(): number;
@@ -81,11 +83,11 @@ export class GoalExecutor {
         diff,
       });
 
-      // 判定→状态映射固定（DESIGN §6.3）
-      if (decision.blocked >= 0.7) {
+      // 判定→状态映射固定（DESIGN §6.3）；阈值来自配置（须按业务数据校准）
+      if (decision.blocked >= this.opts.thresholds.blockedAt) {
         throw new PauseSignal('needs_input', `页面疑似被阻塞（p=${decision.blocked.toFixed(2)}），转人工处理`);
       }
-      if (decision.error >= 0.7) {
+      if (decision.error >= this.opts.thresholds.errorAt) {
         throw err('ACTION_FAILED', `页面显示错误（p=${decision.error.toFixed(2)}）`);
       }
       const doneMid = decision.done >= this.opts.thresholds.confirmLow && decision.done < this.opts.thresholds.doneAt;
@@ -152,6 +154,8 @@ export class GoalExecutor {
         actionTimeoutMs: this.opts.actionTimeoutMs,
         cancelFlag: this.opts.cancelFlag,
         dialogs: this.opts.dialogs,
+        allowedUploadDirs: this.opts.allowedUploadDirs,
+        maxUploadBytes: this.opts.maxUploadBytes,
       });
     }
   }

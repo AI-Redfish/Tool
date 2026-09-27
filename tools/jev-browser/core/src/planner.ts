@@ -1,3 +1,4 @@
+import path from 'node:path';
 import type { ActionStep, FlowStep } from './types.js';
 import { err } from './errors.js';
 import type { PlannerConfig } from './config.js';
@@ -18,8 +19,10 @@ export interface PlannerInput {
 
 export interface PlannerProvider {
   plan(input: PlannerInput): Promise<FlowStep[]>;
+  /** 重规划（DESIGN §7）：只生成未完成后缀；保留已完成步骤由调用方负责。 */
+  replan?(input: PlannerInput & { completedStepIds: string[]; pausedReason: string }): Promise<FlowStep[]>;
   /** 已消耗的请求与 token（DESIGN §6.4 预算/DESIGN §11 可观测）。 */
-  usage?(): { requests: number; inputTokens: number; outputTokens: number };
+  usage?(): { requests: number; inputTokens: number; outputTokens: number; model?: string };
 }
 
 const STEP_LIMIT = 30;
@@ -36,6 +39,7 @@ function systemPrompt(): string {
     `5. 总步骤数不得超过 ${STEP_LIMIT}；优先 extract+assert 组合而不是猜测。`,
     '6. 不要发明 values 中不存在的键；敏感值用 valuesRef 引用。',
     '7. 目标不可达或信息不足时，输出 {"steps":[]}。',
+    '8. 不要生成 upload 步骤（本地文件路径是调用方资源，规划器不得发明）。',
   ].join('\n');
 }
 
@@ -49,9 +53,9 @@ function userPrompt(input: PlannerInput): string {
   });
 }
 
-const ACTION_NAMES = new Set(['navigate', 'click', 'fill', 'press', 'select', 'scroll', 'wait', 'screenshot']);
+const ACTION_NAMES = new Set(['navigate', 'click', 'fill', 'press', 'select', 'scroll', 'wait', 'screenshot', 'upload']);
 /** 导航与写操作必须提供后置条件；纯观察动作可由返回证据验证（DESIGN §8.1）。 */
-export const WRITE_ACTIONS = new Set(['navigate', 'click', 'fill', 'press', 'select']);
+export const WRITE_ACTIONS = new Set(['navigate', 'click', 'fill', 'press', 'select', 'upload']);
 const LOCATOR_BY = new Set(['role', 'label', 'testId', 'text', 'css']);
 const EXPECT_KINDS = new Set(['url_contains', 'text_present', 'visible', 'hidden', 'count_gte', 'download_completed', 'var_equals']);
 
@@ -93,6 +97,11 @@ export function validatePlannedSteps(raw: unknown, depth = 0): FlowStep[] {
         }
         if (action === 'navigate' && step.value === undefined && step.valuesRef === undefined) {
           throw err('PLANNER_INVALID_OUTPUT', `steps[${idx}] navigate 需要 value 或 valuesRef`);
+        }
+        if (action === 'upload') {
+          if (typeof step.filePath !== 'string' || !path.isAbsolute(step.filePath)) {
+            throw err('PLANNER_INVALID_OUTPUT', `steps[${idx}] upload 需要绝对路径 filePath`);
+          }
         }
         const out: ActionStep = {
           id,
@@ -169,9 +178,11 @@ export class OpenAICompatibleProvider implements PlannerProvider {
     },
   ) {}
 
-  usage(): ChatUsage {
-    return { ...this.stats };
+  usage(): ChatUsage & { model?: string } {
+    return { ...this.stats, model: this.lastModel };
   }
+
+  private lastModel: string | undefined;
 
   private async chat(messages: ChatMessage[], jsonMode: boolean): Promise<string> {
     const { cfg, apiKey, fetchImpl = fetch } = this.opts;
@@ -191,10 +202,32 @@ export class OpenAICompatibleProvider implements PlannerProvider {
       if (res.status === 400 && jsonMode) return this.chat(messages, false);
       throw err('PLANNER_INVALID_OUTPUT', `规划服务 ${res.status}: ${text.slice(0, 200)}`);
     }
-    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }>; usage?: { input_tokens?: number; prompt_tokens?: number; output_tokens?: number; completion_tokens?: number } };
+    const data = (await res.json()) as { model?: string; choices?: Array<{ message?: { content?: string } }>; usage?: { input_tokens?: number; prompt_tokens?: number; output_tokens?: number; completion_tokens?: number } };
     this.stats.inputTokens += data.usage?.input_tokens ?? data.usage?.prompt_tokens ?? 0;
     this.stats.outputTokens += data.usage?.output_tokens ?? data.usage?.completion_tokens ?? 0;
+    if (data.model) this.lastModel = data.model;
     return data.choices?.[0]?.message?.content ?? '';
+  }
+
+  async replan(input: PlannerInput & { completedStepIds: string[]; pausedReason: string }): Promise<FlowStep[]> {
+    const messages: ChatMessage[] = [
+      { role: 'system', content: systemPrompt() + '\n这是重规划：只输出尚未完成的后缀步骤，不要重复已完成步骤。' },
+      {
+        role: 'user',
+        content: JSON.stringify({
+          goal: input.goal,
+          successCriteria: input.successCriteria,
+          valuesKeys: input.valuesKeys,
+          allowedOrigins: input.allowedOrigins,
+          currentUrl: input.currentUrl,
+          completedStepIds: input.completedStepIds,
+          pausedReason: input.pausedReason,
+        }),
+      },
+    ];
+    const content = await this.chat(messages, true);
+    const parsed = JSON.parse(extractJson(content)) as { steps?: unknown };
+    return validatePlannedSteps(parsed.steps);
   }
 
   async plan(input: PlannerInput): Promise<FlowStep[]> {

@@ -8,11 +8,20 @@ import time
 
 from ..errors import JevError, err
 from ..winapi import window_rect
+from .. import winapi
 from . import ocr as ocr_mod
 from . import screenshot as shot
 from . import uia_tree
 from . import vlm as vlm_mod
-from .model import Snapshot, TextBlock, estimate_tokens
+from .model import Snapshot, estimate_tokens
+
+
+def _window_dict(w) -> dict:
+    """统一窗口信息：接受 winapi.WindowInfo 或 dict。"""
+    if isinstance(w, dict):
+        return dict(w)
+    return {"hwnd": w.hwnd, "pid": w.pid, "title": w.title, "rect": w.rect,
+            "process": w.process, "class": w.klass, "foreground": w.foreground, "minimized": w.minimized}
 
 
 def select_level(cfg: dict, worker, hwnd: int, requested: str) -> str:
@@ -46,9 +55,13 @@ def take_snapshot(ctx, hwnd: int, window_info: dict, *, level: str | None = None
     lvl = select_level(cfg, worker, hwnd, level)
     from ..session import new_snapshot_id
     sid = new_snapshot_id()
+    window_info = _window_dict(window_info)
+    if winapi.ensure_restored(hwnd):
+        window_info["rect"] = winapi.window_rect(hwnd) or window_info.get("rect")
+        window_info["minimized"] = False
 
     notes: list[str] = []
-    snap = Snapshot(id=sid, level=lvl, window=dict(window_info))
+    snap = Snapshot(id=sid, level=lvl, window=window_info)
 
     if lvl == "uia":
         uia = worker.import_uia()
@@ -66,7 +79,7 @@ def take_snapshot(ctx, hwnd: int, window_info: dict, *, level: str | None = None
         def _do():
             win_ctrl = uia_tree.window_control(uia, hwnd)
             return uia_tree.walk_tree(uia, win_ctrl, snapshot_id=sid, hwnd=hwnd, pid=window_info.get("pid", 0),
-                                      max_depth=max_depth, max_elements=cap)
+                                      max_depth=max_depth, max_elements=cap, root_runtime_id=root_rid)
 
         elements, lines, truncated = worker.call(_do, timeout_s, f"UIA 树遍历（深度{max_depth}）")
         snap.elements = elements
@@ -77,7 +90,7 @@ def take_snapshot(ctx, hwnd: int, window_info: dict, *, level: str | None = None
         if save_artifact:
             try:
                 screen = shot.grab_rect(worker, window_rect(hwnd))
-                snap.image_path = worker.call(lambda: shot.save_artifact(ctx.artifacts_dir, screen, "snap-uia"),
+                snap.image_path = worker.call(lambda: shot.save_artifact(ctx.artifacts_dir_cached, screen, "snap-uia"),
                                               10.0, "保存观察截图")
             except JevError:
                 pass
@@ -85,6 +98,15 @@ def take_snapshot(ctx, hwnd: int, window_info: dict, *, level: str | None = None
             notes.append("快照被截断：优先用 root 参数下钻；token 预算参考 " + str(estimate_tokens(snap.text)))
 
     elif lvl in ("ocr", "vlm"):
+        # 截图走屏幕区域：被遮挡/最小化的窗口截出来是覆盖物内容。
+        # 先还原并置前目标窗口（观察动作会短暂抢占前台，文档已声明）。
+        if winapi.ensure_restored(hwnd):
+            window_info["rect"] = winapi.window_rect(hwnd) or window_info.get("rect")
+            window_info["minimized"] = False
+            notes.append("目标窗口已从最小化还原")
+        if not winapi.focus_window(hwnd):
+            notes.append("警告：无法把目标窗口置前，截图可能包含覆盖其上的其他窗口内容")
+        time.sleep(0.2)  # 等待合成器刷新
         rect = window_rect(hwnd)
         if not rect:
             raise err("WINDOW_LOST", f"窗口 {hwnd} 矩形获取失败（可能已最小化或关闭）；请先 focus/restore 再观察")
@@ -93,7 +115,7 @@ def take_snapshot(ctx, hwnd: int, window_info: dict, *, level: str | None = None
         screen = shot.grab_rect(worker, rect)
         # ocr/vlm 档截图即证据，始终落 artifact（仅目标窗口区域，非整屏）
         try:
-            snap.image_path = worker.call(lambda: shot.save_artifact(ctx.artifacts_dir, screen, f"snap-{lvl}"),
+            snap.image_path = worker.call(lambda: shot.save_artifact(ctx.artifacts_dir_cached, screen, f"snap-{lvl}"),
                                           10.0, "保存观察截图")
         except JevError:
             pass
@@ -105,7 +127,10 @@ def take_snapshot(ctx, hwnd: int, window_info: dict, *, level: str | None = None
             def _ocr():
                 return ocr_mod.recognize(png)
 
-            blocks = worker.call(_ocr, max(15.0, cfg["runtime"]["snapshotTimeoutMs"] / 1000), "OCR 识别")
+            # 首次调用含模型加载（数秒），给更宽的超时；进程内热调用走 snapshotTimeout
+            ocr_timeout = max(45.0, cfg["runtime"]["snapshotTimeoutMs"] / 1000) \
+                if not ocr_mod.engine_loaded() else max(15.0, cfg["runtime"]["snapshotTimeoutMs"] / 1000)
+            blocks = worker.call(_ocr, ocr_timeout, "OCR 识别")
             ocr_mod.assign_refs(blocks, sid)
             snap.blocks = blocks
             lines = ocr_mod.render_lines(sid, blocks)
@@ -138,7 +163,7 @@ def take_snapshot(ctx, hwnd: int, window_info: dict, *, level: str | None = None
 
     snap.notes.extend(notes)
     snap.elapsed_ms = int((time.monotonic() - t0) * 1000)
-    ctx.registry.put_snapshot(snap.to_dict(include_refs=True))
+    ctx.registry.put_snapshot(snap.to_registry_dict())
     return snap
 
 

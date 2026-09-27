@@ -1,7 +1,30 @@
-# jev-browser —— 浏览器控制工具（规划中）
+# jev-browser —— 浏览器控制工具（核心已实现，实机验证未完成）
 
-> 状态：方案已确认，当前仅交付设计与开发计划，尚未实现、构建或发布。
-> 方案版本：v0.2；核对日期：2026-09-24。本文的接口、配置和命令均为拟议契约，不是当前可运行功能。
+> 状态：`core + cli + mcp + api` 四包工作区已实现，62 个离线单元/集成测试通过（假件驱动，无需浏览器与模型 key）。
+> **P0 实机验证（接管日常 Chrome、对话框非干扰、下载保真）尚未执行**，暂不可用于生产，未列入根 README 的可用工具表。
+> 方案版本：v0.2。本文的接口、配置和命令为实现契约；能力边界以 P0—P6 验收为准。
+
+## 当前实现范围（对应开发计划）
+
+| 能力 | 状态 |
+| --- | --- |
+| 严格配置合并/校验（env + JSON + CLI 覆盖，未知字段/类型/布尔拒绝） | 已实现，有测试 |
+| 任务状态机、乐观 revision、动作账本（prepared/in_flight/verified/failed/unknown） | 已实现，有测试 |
+| 幂等提交（Idempotency-Key，同键同体重放/异体冲突，24h 保留） | 已实现，有测试 |
+| 高风险动作 → 暂停 needs_confirmation → HMAC grant 审批（一次性、绑定 actionRevision） | 已实现，有测试 |
+| 超时未知动作 → profile 隔离（新写任务拒绝、只读放行、rerunConfirmed 解除） | 已实现，有测试 |
+| forEach 断点续跑（processed 计数，恢复不重放副作用）、取消/恢复/过期回收 | 已实现，有测试 |
+| secretRef（`JEV_BROWSER_SECRET_<NAME>`，内存解析不落盘） | 已实现，有测试 |
+| Playwright 适配层（attach/launch、locator 白名单映射、download/dialog 端口） | 已实现；attach 行为待 P0 实测 |
+| upload 动作（allowedUploadDirs 授权 + realpath 防穿越 + 秘密文件拒绝 + 大小预检，DESIGN §10） | 已实现，有测试 |
+| 能力探测（DESIGN §11 全部 12 项；未实测标 unverified，不冒充 supported） | 已实现，有测试 |
+| HTTP 速率/并发限制（DESIGN §10；RateLimiter 固定窗口 + 并发上限） | 已实现，有测试 |
+| run 重规划（resume 显式 allowReplan，只改未完成后缀，受 maxReplans 预算，DESIGN §7） | 已实现，有测试 |
+| §11 细粒度度量（connectMs、每步 durationMs、goal rounds、模型实际版本、envelope.evidence） | 已实现 |
+| 快照串行化（经 profile 队列；跨会话预约期间拒绝窃读，DESIGN §8.3） | 已实现，有测试 |
+| Jev 局部循环（fan-out、候选切片、阈值映射、modelOrigins 外发约束） | 已实现；需真实 key 联调 |
+| openai-compatible 规划器（schema 白名单校验、一次修复请求） | 已实现；需真实服务联调 |
+| MCP（14 工具）/ HTTP API（loopback + token + Host 校验）/ CLI 三入口 | 已实现，冒烟通过 |
 
 ## 目标
 
@@ -71,9 +94,9 @@ Agent / CLI / HTTP API
 - 已打开的有头 Chrome 不能因配置 `headless=true` 而变成无头。需要显式选择 `launch`，启动另一个实例。
 - 新启动的 Chromium/独立 Chrome 不会自动继承日常 Chrome 的全部登录状态；不复制主 profile、不导出全部 Cookie。
 
-## 配置示意（拟议，尚未实现）
+## 配置示意
 
-默认：
+默认（完整字段见 DESIGN §5.2；可直接复制的文件见 [examples/](examples/)）：
 
 ```json
 {
@@ -120,23 +143,21 @@ attach/launch 配置按分支存放，只启用当前 mode 对应参数，无需
 
 开启自主模式需另外配置规划模型；Jev 的 API key 不能代替规划模型凭据。缺少规划器时 `run` 返回明确错误，不自动猜模型、供应商或费用预算。
 
-## 拟议使用入口
-
-以下命令需待实现和构建后才能使用；目前不要执行 `build jev-browser` 或把它加入生产 MCP 配置。
+## 使用入口
 
 ```powershell
-# 在 tools/jev-browser 中：诊断默认接管环境
+# 在 tools/jev-browser 中：诊断默认接管环境（--connect 尝试接管，需 Chrome 授权）
 node cli/dist/index.js doctor
 
-# 运行已定义步骤，不进行内部任务规划
-node cli/dist/index.js execute --file examples/read-page.flow.json --url "https://example.com"
+# 运行已定义步骤，不进行内部任务规划（模型调用为 0）
+node cli/dist/index.js execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com"
 
 # 内部规划：先授权业务站点/模型外发，再指定目标页和验收条件
-node cli/dist/index.js run --page "page-from-pages" --goal "查找本月可下载的发票，逐个下载并记录失败项" --success "处理范围最多20项；每项都有已保存文件或明确失败原因；报告是否还有未处理项"
+node cli/dist/index.js run --page "p0" --goal "查找本月可下载的发票，逐个下载并记录失败项" --success "处理范围最多20项；每项都有已保存文件或明确失败原因；报告是否还有未处理项"
 # --success 是人类可读条件，工具会校验/必要时澄清，不等于模型可以自行宣布完成。
 
 # 长驻本地 HTTP 服务：供 API、本机 CLI、可选 MCP 客户端复用同一会话
-node api/dist/index.js --config "D:\config\jev-browser.json"
+$env:JEV_BROWSER_API_TOKEN = "<随机token>"; node api/dist/index.js --config "D:\config\jev-browser.json"
 
 # 在仓库根目录中，统一入口仍然是 MCP
 # node bin/tool-launcher.js jev-browser
@@ -144,8 +165,34 @@ node api/dist/index.js --config "D:\config\jev-browser.json"
 
 ## 当前交付与下一步
 
-本次仅新增文档与索引，不创建 `package.json`、依赖、运行入口或假实现。因此启动器 `list` 暂时不会把这个目录识别成可运行工具。
+四包工作区、执行引擎、安全/审批/恢复机制与三入口适配器已实现并通过离线测试；启动器 `list` 已能识别本目录，`node bin/tool-launcher.js jev-browser` 可拉起 MCP（构建后）。
 
-下一步是 **P0：接管可行性与保护性验证**，尤其验证未选中标签页的原生对话框不被自动处理、下载文件在断开后仍可用。通过后再搭建 `core + cli + mcp + api` 工作区，先完成 A 的执行引擎，再增加 B 的可选规划器。
+下一步是 **P0：接管可行性与保护性验证**（真实 Chrome 环境）：验证未选中标签页的原生对话框不被自动处理、下载文件在断开后仍可用、channel 端点发现与授权流。P0 结论出来之前，不要把本工具加入生产 MCP 配置；`execute/run` 对真实站点的端到端表现也未验证。
 
-本轮修订还补齐了 profile 级暂停预约、取消/恢复竞态、持久化动作账本、任务级验收和独立审批边界。审查发现与验证记录见 [RESEARCH.md](RESEARCH.md)；它们是设计约束，不是已经通过的运行测试。
+使用入口见上一节；P0 结论出来之前，不要把本工具加入生产 MCP 配置；`execute/run` 对真实站点的端到端表现也未验证。
+
+```powershell
+cd tools/jev-browser
+pnpm install && pnpm build          # 或 npm install && npm run build
+
+# 诊断（不连接浏览器）
+node cli/dist/index.js doctor
+
+# 尝试接管日常 Chrome（需 Chrome ≥ 144 在 chrome://inspect/#remote-debugging 授权）
+node cli/dist/index.js doctor --connect
+
+# 执行确定性流程（模型调用为 0；示例见 examples/）
+node cli/dist/index.js execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com"
+
+# 长驻本地 HTTP 服务（loopback + token）
+$env:JEV_BROWSER_API_TOKEN = "<随机token>"; node api/dist/index.js
+
+# 在仓库根目录中，统一入口仍然是 MCP
+# node bin/tool-launcher.js jev-browser
+```
+
+审查发现与验证记录见 [RESEARCH.md](RESEARCH.md)；实现阶段的已知限制：
+
+- iframe、开放 Shadow DOM、上传为受限/后置能力，观察脚本不穿透闭合 Shadow DOM（DESIGN §6.2）。
+- 高风险动作的对话框确认接受属 P5 审批里程碑；首版 grant 消费后动作放行，但站点弹出的 confirm 仍按保守策略处理。
+- `attach.endpoint` 的 `chrome` 哨兵依赖固定版本 Playwright 的 channel 发现语义，失败时回退读取默认用户目录的 DevToolsActivePort；两者均为 P0 验证项。

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "browser": {
+    "mode": "launch",
+    "engine": "chromium",
+    "headless": true,
+    "launch": {
+      "userDataDir": "profiles/chromium/default",
+      "chromiumSandbox": true
+    }
+  },
+  "safety": {
+    "allowedOrigins": ["https://example.com"],
+    "modelOrigins": []
+  },
+  "planner": {
+    "enabled": false
+  }
+}

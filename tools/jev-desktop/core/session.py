@@ -12,6 +12,7 @@ import time
 import uuid
 from pathlib import Path
 
+from . import winapi
 from .errors import err
 
 REF_PATTERN = re.compile(r"^@([A-Za-z0-9]+):(e|b)(\d+)$")
@@ -36,6 +37,7 @@ class RefRegistry:
         self.session_id = session_id or "default"
         self.ttl_ms = ttl_ms
         self.data: dict = {"schemaVersion": 1, "id": self.session_id, "updatedAt": 0, "snapshots": {}}
+        self._last_window_hint: dict | None = None
         self._load()
 
     # -- 持久化 --------------------------------------------------------------
@@ -56,6 +58,22 @@ class RefRegistry:
             return
         self.data = data
         self.data["id"] = self.session_id
+        lw = data.get("lastWindow")
+        self._last_window_hint = lw if isinstance(lw, dict) else None
+        # 规范化 refs：容忍旧格式（列表）与损坏条目
+        for sid, snap in self.data["snapshots"].items():
+            if not isinstance(snap, dict):
+                self.data["snapshots"][sid] = {"createdAt": 0, "refs": {}}
+                continue
+            refs = snap.get("refs")
+            if isinstance(refs, list):
+                fixed: dict = {}
+                for item in refs:
+                    if isinstance(item, dict) and isinstance(item.get("ref"), str):
+                        fixed[item["ref"].split(":")[-1]] = item
+                snap["refs"] = fixed
+            elif not isinstance(refs, dict):
+                snap["refs"] = {}
         self._prune()
 
     def _prune(self) -> None:
@@ -68,6 +86,8 @@ class RefRegistry:
     def save(self) -> None:
         self.data["updatedAt"] = int(time.time() * 1000)
         self._prune()
+        if self._last_window_hint:
+            self.data["lastWindow"] = self._last_window_hint
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
@@ -98,19 +118,28 @@ class RefRegistry:
         snap = self.data["snapshots"].get(sid)
         if not snap:
             return None
-        refs = snap.get("refs") or {}
+        refs = snap.get("refs")
+        if not isinstance(refs, dict):
+            return None
         return refs.get(f"{kind}{idx}")
 
     def snapshot_meta(self, sid: str) -> dict | None:
         return self.data["snapshots"].get(sid)
 
     def last_window(self) -> dict | None:
-        """最近一次快照的窗口信息（供缺省目标选择）。"""
+        """最近一次快照/动作的窗口信息（供缺省目标选择）。"""
         snaps = [s for s in self.data["snapshots"].values() if isinstance(s.get("window"), dict)]
         if not snaps:
-            return None
+            return self._last_window_hint
         snaps.sort(key=lambda s: s.get("createdAt", 0))
         return snaps[-1]["window"]
+
+    def set_last_window_hwnd(self, hwnd: int) -> None:
+        """launch 后记录新窗口（会话内缺省目标）。"""
+        self._last_window_hint = {"hwnd": hwnd, "pid": winapi.window_pid(hwnd),
+                                  "title": winapi.window_title(hwnd),
+                                  "rect": list(winapi.window_rect(hwnd) or ())}
+        self.save()
 
     def check_ttl(self, ref: str) -> None:
         sid, _, _ = parse_ref(ref)

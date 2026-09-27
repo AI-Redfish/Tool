@@ -9,16 +9,17 @@ import time
 
 from .. import winapi
 from ..errors import JevError, err
-from ..observe.model import TextBlock
 from . import mouse_kb, uia_actions, winmgmt
+from ..observe import uia_tree
 
 GLOBAL_ACTIONS = {"launch", "close", "minimize", "maximize", "restore", "move", "resize",
                   "press", "clipboard_get", "clipboard_set"}
 SCROLL_DIRS = ("up", "down", "left", "right")
 
 
-def perform(ctx, action: str, target, *, value: str | None = None) -> dict:
-    """执行单动作。target: ResolvedTarget | None。返回 {used, detail...}。
+def perform(ctx, action: str, target, *, value: str | None = None,
+            scope_hwnd: int | None = None) -> dict:
+    """执行单动作。target: ResolvedTarget | None。scope_hwnd 为调用方解析到的目标窗口。
 
     抛出的 JevError 由上层转 envelope；账本由调用方记。
     """
@@ -30,7 +31,7 @@ def perform(ctx, action: str, target, *, value: str | None = None) -> dict:
     if act == "launch":
         cmd = winmgmt.resolve_launch_cmd(value or (target.summary if target else ""))
         wait_ms = min(ctx.cfg["runtime"]["waitMaxMs"], 10000)
-        out = winmgmt.launch(cmd, wait_ms=wait_ms)
+        out = winmgmt.launch(cmd, wait_ms=wait_ms, title_hint=getattr(ctx, "args_title", None))
         out["used"] = "process"
         if out.get("hwnd"):
             ctx.registry.set_last_window_hwnd(out["hwnd"])
@@ -42,13 +43,43 @@ def perform(ctx, action: str, target, *, value: str | None = None) -> dict:
         return {"used": "clipboard", "length": len(value or "")}
 
     if act in ("close", "minimize", "maximize", "restore", "move", "resize", "focus"):
-        return _window_action(ctx, act, target, value)
+        return _window_action(ctx, act, target, value, scope_hwnd=scope_hwnd)
 
     if act == "press":
         if not value:
             raise err("INVALID_PARAMS", "press 需要 value=键组合，如 ctrl+s / enter / alt+f4")
-        used = mouse_kb.press_combo(value, hwnd=_hwnd_of(target))
-        return {"used": used, "keys": value}
+        if target is not None and target.kind != "none":
+            hwnd = target.hwnd
+            used = mouse_kb.press_combo(value, hwnd=hwnd)
+            return {"used": used, "keys": value}
+        hwnd = scope_hwnd or ctx.resolve_default_window()
+        if not hwnd:
+            raise err("APP_NOT_FOUND", "press 无目标时需要目标窗口（app/title/window_id）")
+        winmgmt.focus_window(hwnd)
+        winapi.key_combo(value)
+        return {"used": "sendinput_key", "keys": value, "note": "已发送到当前焦点"}
+    if act == "type":
+        if value is None:
+            raise err("INVALID_PARAMS", "type 需要 value=要输入的文本")
+        if target is not None and target.kind != "none":
+            return _uia_action(ctx, act, target, value)
+        hwnd = scope_hwnd or ctx.resolve_default_window()
+        if not hwnd:
+            raise err("APP_NOT_FOUND", "type 无目标时需要目标窗口（app/title/window_id）")
+        winmgmt.focus_window(hwnd)
+        used, n = mouse_kb.type_text(str(value), hwnd=hwnd)
+        return {"used": used, "length": n, "note": "已输入到当前焦点控件"}
+    if act == "scroll":
+        if target is not None and target.kind != "none":
+            return _uia_action(ctx, act, target, value)
+        hwnd = scope_hwnd or ctx.resolve_default_window()
+        if not hwnd:
+            raise err("APP_NOT_FOUND", "scroll 无目标时需要目标窗口（app/title/window_id）")
+        direction, times = _parse_scroll(value)
+        rect = winapi.window_rect(hwnd) or (0, 0, 0, 0)
+        cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
+        return {"used": mouse_kb.wheel(direction, times, x=cx, y=cy, hwnd=hwnd),
+                "direction": direction, "times": times}
 
     # ---- 元素动作 ----
     if target is None:
@@ -66,8 +97,8 @@ def _hwnd_of(target) -> int | None:
     return target.hwnd if target else None
 
 
-def _window_action(ctx, act: str, target, value) -> dict:
-    hwnd = target.hwnd if target and target.hwnd else ctx.resolve_default_window()
+def _window_action(ctx, act: str, target, value, *, scope_hwnd: int | None = None) -> dict:
+    hwnd = (target.hwnd if target and target.hwnd else None) or scope_hwnd or ctx.resolve_default_window()
     if not hwnd:
         raise err("APP_NOT_FOUND", f"窗口动作 {act} 需要目标窗口（app/title/window_id 或 ref）")
     if act == "focus":
@@ -137,8 +168,9 @@ def _uia_action(ctx, act: str, target, value) -> dict:
             used = uia_actions.do_set_value(element, uia, str(value))
             if used:
                 return {"used": used}
-            # 兜底：焦点 + 全选 + 输入
+            # 兜底：焦点 + 全选 + 输入（SendInput 需要前台窗口）
             if uia_actions.do_focus(element, uia):
+                mouse_kb.ensure_foreground(hwnd)
                 time.sleep(0.05)
                 try:
                     winapi.key_combo("ctrl+a")
@@ -154,7 +186,9 @@ def _uia_action(ctx, act: str, target, value) -> dict:
             if not uia_actions.do_focus(element, uia):
                 pt = uia_actions.element_clickable_point(element) or uia_actions.element_center(element)
                 mouse_kb.click_at(pt[0], pt[1], hwnd=hwnd)
-            used, n = mouse_kb.type_text(str(value), hwnd=None)  # 已聚焦，不再切前台
+            # SendInput 只作用于前台窗口：键盘输入前确保目标窗口在前台
+            mouse_kb.ensure_foreground(hwnd)
+            used, n = mouse_kb.type_text(str(value), hwnd=None)
             return {"used": used, "length": n}
         if act in ("toggle", "check", "uncheck"):
             if act == "toggle":
@@ -166,7 +200,13 @@ def _uia_action(ctx, act: str, target, value) -> dict:
             changed, state = uia_actions.do_check(element, uia, want)
             return {"used": "uia_toggle", "changed": changed, "state": state}
         if act == "select":
-            used = uia_actions.do_select(element, uia, value)
+            win_ctrl = None
+            if hwnd:
+                try:
+                    win_ctrl = uia_tree.window_control(uia, hwnd)
+                except Exception:
+                    win_ctrl = None
+            used = uia_actions.do_select(element, uia, value, win_ctrl=win_ctrl)
             if not used:
                 return _coordinate_fallback(ctx, target, "click")
             return {"used": used, "option": value}
@@ -229,11 +269,14 @@ def _coordinate_fallback(ctx, target, act: str) -> dict:
     point = target.point or target.center_point
     if not point:
         raise err("TARGET_NOT_FOUND", "元素无可用坐标（不可见或零矩形），无法坐标兜底")
-    used = mouse_kb.click_at(point[0], point[1], count=2 if act == "double_click" else 1,
-                             button="right" if act == "right_click" else "left",
-                             hwnd=target.hwnd)
     if act == "hover":
-        used = mouse_kb.hover_at(point[0], point[1], hwnd=target.hwnd)
+        # hover 不产生点击（否则会误触）
+        mouse_kb.hover_at(point[0], point[1], hwnd=target.hwnd)
+        return {"used": "coordinate_fallback(hover)", "point": list(point),
+                "note": "UIA Pattern 不可用，已用坐标悬停兜底（窗口已置前台）"}
+    mouse_kb.click_at(point[0], point[1], count=2 if act == "double_click" else 1,
+                      button="right" if act == "right_click" else "left",
+                      hwnd=target.hwnd)
     out = {"used": f"coordinate_fallback({act})", "point": list(point),
            "note": "UIA Pattern 不可用，已用坐标点击兜底（窗口已置前台）"}
     return out

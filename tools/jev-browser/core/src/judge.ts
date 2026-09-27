@@ -1,6 +1,7 @@
 import { TypeSafeClient, type EntryType, type Questions, type TypeSafeClientConfig } from '@typesafe-ai/sdk';
 import type { JevConfig } from './config.js';
 import { err } from './errors.js';
+import { redactUrl } from './ports.js';
 import type { PageObservation } from './observe.js';
 
 /**
@@ -42,7 +43,8 @@ export interface JudgePort {
   decideRound(input: RoundObservationInput): Promise<RoundDecision>;
   /** 独立是/否校验（browser_check 场景）。 */
   check(state: Record<string, unknown>, question: string): Promise<number>;
-  usage(): { jevRequests: number; inputTokens: number; outputTokens: number };
+  /** usage.model = 服务实际返回的模型标识（DESIGN §11）。 */
+  usage(): { jevRequests: number; inputTokens: number; outputTokens: number; model?: string };
 }
 
 const MAX_CANDIDATES = 200;
@@ -132,6 +134,7 @@ export class TypeSafeJudge implements JudgePort {
   private client: TypeSafeClient | null;
   private readonly cfg: JevConfig;
   private readonly stats = { jevRequests: 0, inputTokens: 0, outputTokens: 0 };
+  private lastModel: string | undefined;
 
   constructor(cfg: JevConfig, opts?: { client?: TypeSafeClient; env?: NodeJS.ProcessEnv }) {
     this.cfg = cfg;
@@ -140,7 +143,8 @@ export class TypeSafeJudge implements JudgePort {
       this.client = opts.client;
     } else {
       const key = env[cfg.apiKeyEnv];
-      this.client = key ? new TypeSafeClient({ apiKey: key } satisfies TypeSafeClientConfig) : null;
+      // 每次尝试 30s 超时（SDK 默认 10s 对页面状态判断偏短）；SDK 自带重试，本工具不叠加外层重试（DESIGN §6.4）
+      this.client = key ? new TypeSafeClient({ apiKey: key, timeout: 30_000 } satisfies TypeSafeClientConfig) : null;
     }
   }
 
@@ -148,8 +152,8 @@ export class TypeSafeJudge implements JudgePort {
     return this.client !== null;
   }
 
-  usage(): { jevRequests: number; inputTokens: number; outputTokens: number } {
-    return { ...this.stats };
+  usage(): { jevRequests: number; inputTokens: number; outputTokens: number; model?: string } {
+    return { ...this.stats, model: this.lastModel };
   }
 
   private requireClient(): TypeSafeClient {
@@ -162,7 +166,8 @@ export class TypeSafeJudge implements JudgePort {
     const { questions, candidates } = buildQuestions(input);
     const state = {
       goal: input.goal,
-      url: input.observation.url,
+      // URL query/fragment 裁剪：防止查询串中的 token/凭据进入云模型（DESIGN §10）
+      url: redactUrl(input.observation.url),
       title: input.observation.title,
       elements: candidates,
       valuesKeys: input.valuesKeys,
@@ -173,6 +178,7 @@ export class TypeSafeJudge implements JudgePort {
     this.stats.jevRequests += 1;
     // ObservedElement 是纯 JSON 值；序列化以满足 SDK 的 EntryType（JsonValue）约束
     const result = await client.systemOne({ state: JSON.parse(JSON.stringify(state)) as EntryType, model: this.cfg.model, questions });
+    this.lastModel = result.model;
     this.stats.inputTokens += result.usage?.input_tokens ?? 0;
     this.stats.outputTokens += result.usage?.output_tokens ?? 0;
 
@@ -203,6 +209,7 @@ export class TypeSafeJudge implements JudgePort {
     const questions: Questions = { check: { type: 'noul', instructions: question } };
     this.stats.jevRequests += 1;
     const result = await client.systemOne({ state: JSON.parse(JSON.stringify(state)) as EntryType, model: this.cfg.model, questions });
+    this.lastModel = result.model;
     this.stats.inputTokens += result.usage?.input_tokens ?? 0;
     this.stats.outputTokens += result.usage?.output_tokens ?? 0;
     return Number((result.answers as Record<string, any>).check?.noul ?? 0);

@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "app": "jev-smoke",
+  "steps": [
+    { "id": "s1", "kind": "action", "act": "type", "target": { "kind": "none" }, "value": "echo EXEC-OK-中文" },
+    { "id": "s2", "kind": "action", "act": "press", "target": { "kind": "none" }, "value": "enter" },
+    { "id": "s3", "kind": "action", "act": "type", "target": { "kind": "none" }, "value": "echo DONE-MARK-888" },
+    { "id": "s4", "kind": "action", "act": "press", "target": { "kind": "none" }, "value": "enter" },
+    { "id": "s5", "kind": "wait", "mode": "text", "text": "DONE-MARK-888", "timeoutMs": 8000 },
+    { "id": "s6", "kind": "screenshot" },
+    { "id": "s7", "kind": "assert", "op": "window_title_contains", "value": "jev-smoke" }
+  ]
+}

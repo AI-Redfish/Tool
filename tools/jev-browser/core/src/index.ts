@@ -43,30 +43,33 @@ export {
   type SubmitOptions, type ResumeOptions, type CancelOptions,
 } from './taskservice.js';
 export { runDoctor, type DoctorResult } from './doctor.js';
+export { RateLimiter } from './ratelimit.js';
 export { ApiClient } from './httpclient.js';
 
 /** 工具元数据（MCP 注册与 CLI help 的单一事实来源，沿用仓库 TOOLS 约定）。 */
 export interface ToolMeta {
   name: string;
   description: string;
+  /** 风险标签（DESIGN §3：TOOLS 携带风险标签）。 */
+  risk: 'readonly' | 'write' | 'control';
 }
 
 export const SERVER_NAME = 'jev-browser';
 export const SERVER_VERSION = '0.1.0';
 
 export const TOOLS: ToolMeta[] = [
-  { name: 'browser_doctor', description: '诊断环境与配置（可选：尝试连接日常 Chrome，需授权）' },
-  { name: 'browser_connect', description: '创建会话：绑定目标标签页/新页，并声明 allowedOrigins/modelOrigins（默认不许可任何网站）' },
-  { name: 'browser_pages', description: '列出会话可见的标签页（脱敏 URL）' },
-  { name: 'browser_select_page', description: '选择/切换会话绑定的标签页' },
-  { name: 'browser_execute', description: '执行确定性步骤序列（action/assert/extract，写操作需后置条件，不调用规划模型）' },
-  { name: 'browser_run', description: '执行完整目标（内部规划器拆解为步骤；需配置 planner 与 successCriteria）' },
-  { name: 'browser_snapshot', description: '只读页面快照（脱敏；for-model 需 origin ∈ modelOrigins，默认禁止云外发）' },
-  { name: 'browser_act', description: '单步动作（受同一策略/预算/审批约束）' },
-  { name: 'browser_task_get', description: '查询任务状态（envelope）' },
-  { name: 'browser_task_cancel', description: '取消任务（requestId + expectedRevision）' },
-  { name: 'browser_task_resume', description: '恢复暂停任务（requestId + expectedRevision；未知结果需 rerunConfirmed）' },
-  { name: 'browser_task_approve', description: '核验并登记审批 grant（不执行动作；派发前才消费）' },
-  { name: 'browser_artifact_get', description: '取回任务产物（下载文件/截图）的元信息与路径' },
-  { name: 'browser_disconnect', description: '断开会话（活动任务会拒绝；暂停任务需显式 detachTask）' },
+  { name: 'browser_doctor', description: '诊断环境与配置（可选：尝试连接日常 Chrome，需授权）', risk: 'readonly' },
+  { name: 'browser_connect', description: '创建会话：绑定目标标签页/新页，并声明 allowedOrigins/modelOrigins（默认不许可任何网站）', risk: 'control' },
+  { name: 'browser_pages', description: '列出会话可见的标签页（脱敏 URL）', risk: 'readonly' },
+  { name: 'browser_select_page', description: '选择/切换会话绑定的标签页', risk: 'control' },
+  { name: 'browser_execute', description: '执行确定性步骤序列（action/assert/extract，写操作需后置条件，不调用规划模型）', risk: 'write' },
+  { name: 'browser_run', description: '执行完整目标（内部规划器拆解为步骤；需配置 planner 与 successCriteria）', risk: 'write' },
+  { name: 'browser_snapshot', description: '只读页面快照（脱敏；for-model 需 origin ∈ modelOrigins，默认禁止云外发）', risk: 'readonly' },
+  { name: 'browser_act', description: '单步动作（受同一策略/预算/审批约束）', risk: 'write' },
+  { name: 'browser_task_get', description: '查询任务状态（envelope）', risk: 'readonly' },
+  { name: 'browser_task_cancel', description: '取消任务（requestId + expectedRevision）', risk: 'control' },
+  { name: 'browser_task_resume', description: '恢复暂停任务（requestId + expectedRevision；未知结果需 rerunConfirmed）', risk: 'control' },
+  { name: 'browser_task_approve', description: '核验并登记审批 grant（不执行动作；派发前才消费）', risk: 'control' },
+  { name: 'browser_artifact_get', description: '取回任务产物（下载文件/截图）的元信息与路径', risk: 'readonly' },
+  { name: 'browser_disconnect', description: '断开会话（活动任务会拒绝；暂停任务需显式 detachTask）', risk: 'control' },
 ];

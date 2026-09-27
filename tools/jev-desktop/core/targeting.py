@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from . import winapi
 from .errors import JevError, err
 from .observe import uia_tree
+from .observe.model import TextBlock
 from .session import REF_DRIFT_PX, parse_ref
 
 
@@ -26,6 +27,7 @@ class ResolvedTarget:
     summary: str = ""
     via: str = ""                   # ref | selector | coords | text | scope
     note: str = ""
+    text: str | None = None         # 文字块 ref 携带的原始文本（供 extract）
 
     def describe(self) -> str:
         if self.summary:
@@ -213,12 +215,15 @@ def resolve_ref(ctx, ref: str) -> ResolvedTarget:
         cur_rect = winapi.window_rect(hwnd)
         if not cur_rect:
             raise err("STALE_REF", f"ref {ref} 的窗口矩形不可得（可能最小化）；请先还原窗口再重试")
+        if winapi.ensure_restored(hwnd):
+            cur_rect = winapi.window_rect(hwnd) or cur_rect
         rel = info.get("relRect") or [0, 0, 0, 0]
         l, t = cur_rect[0], cur_rect[1]
         cx, cy = info.get("relCenter") or ((rel[0] + rel[2]) // 2, (rel[1] + rel[3]) // 2)
         point = (l + int(cx), t + int(cy))
         return ResolvedTarget(kind="point", hwnd=hwnd, pid=cur_pid, point=point, center_point=point,
                               rect=(l + rel[0], t + rel[1], l + rel[2], t + rel[3]),
+                              text=str(info.get("text", "")),
                               summary=f"{ref} \"{str(info.get('text', ''))[:30]}\"", via="ref")
 
     # UIA 元素 ref
@@ -348,7 +353,7 @@ def resolve_text(ctx, text: str, *, window_hwnd: int | None = None, allow_jev: b
     candidates, labels = build_candidates(snap)
     if not candidates:
         raise err("TARGET_NOT_FOUND",
-                  f"快照中没有可选候选（窗口可能不可交互）；可尝试 level=ocr/vlm 观察后用 ref/coords 定位")
+                  "快照中没有可选候选（窗口可能不可交互）；可尝试 level=ocr/vlm 观察后用 ref/coords 定位")
     idx, probs = jev.choice(
         state={"goal": text, "window": {"title": win_info.get("title"), "pid": win_info.get("pid")},
                "candidates": labels},

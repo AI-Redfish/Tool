@@ -49,30 +49,38 @@ class UiaWorker:
         if self._thread is not None and self._thread.is_alive():
             return
         self._gen += 1
-        t = threading.Thread(target=self._loop, name=f"jev-desktop-uia-{self._gen}", daemon=True)
+        gen = self._gen
+        t = threading.Thread(target=self._loop, args=(gen,), name=f"jev-desktop-uia-{gen}", daemon=True)
         self._thread = t
         t.start()
 
-    def _loop(self) -> None:  # pragma: no cover - 线程体
+    def _loop(self, my_gen: int) -> None:  # pragma: no cover - 线程体
         try:
             winapi.ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
         except Exception:
             pass
-        while True:
-            job = self._jobs.get()
-            if job is None:
-                break
-            try:
-                job.result = job.fn()
-            except BaseException as e:  # noqa: BLE001 - 必须回传到调用方
-                job.error = e
-            finally:
-                job.event.set()
-                self._pump()
         try:
-            winapi.ole32.CoUninitialize()
-        except Exception:
-            pass
+            while my_gen == self._gen:
+                # 带超时取任务：空闲时泵消息；被毒化（gen 变更）时自行退出
+                try:
+                    job = self._jobs.get(timeout=0.2)
+                except queue.Empty:
+                    self._pump()
+                    continue
+                if job is None:
+                    continue  # 兼容旧哨兵，直接忽略
+                try:
+                    job.result = job.fn()
+                except BaseException as e:  # noqa: BLE001 - 必须回传到调用方
+                    job.error = e
+                finally:
+                    job.event.set()
+                    self._pump()
+        finally:
+            try:
+                winapi.ole32.CoUninitialize()
+            except Exception:
+                pass
 
     def _pump(self) -> None:
         """STA 线程消息泵：让跨套间封送与剪贴板等系统消息得到处理。"""
@@ -86,14 +94,17 @@ class UiaWorker:
             pass
 
     def _poison(self) -> None:
-        """超时后放弃当前线程（悬死 COM 调用随其自然结束），重建新的 STA 线程。"""
+        """超时后放弃当前线程（悬死 COM 调用随其自然结束），递增代数并重建线程。
+
+        旧线程在当前任务返回后通过代数检查自行退出；不能向队列投哨兵，
+        否则哨兵会被新一代线程消费导致其退出（毒化恢复失效）。
+        """
         old = self._thread
         with self._lock:
             if old is not None and old is threading.current_thread():
                 return
             self._thread = None
-        if old is not None:
-            self._jobs.put(None)  # 尽力唤醒；若悬死则由 daemon 机制回收
+            self._gen += 1
 
     # -- 对外接口 -----------------------------------------------------------
 

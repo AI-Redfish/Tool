@@ -24,6 +24,9 @@ export interface FlowRunContext {
   maxSteps: number;
   /** 已派发动作数上限（DESIGN §6.4 预算）。 */
   maxActions: number;
+  /** 上传授权目录与大小上限（透传 executor 安全检查，DESIGN §10）。 */
+  allowedUploadDirs?: string[];
+  maxUploadBytes?: number;
   /** 动作派发前钩子：PolicyGate + 审批消费（DESIGN §8.2/§10）；抛错则动作不派发。 */
   beforeAction?: (step: ActionStep) => Promise<{ acceptDialogOnce?: boolean } | void>;
   /** 每个步骤边界的截止检查（超限抛错终止）。 */
@@ -38,7 +41,7 @@ export type GoalRunner = (
   page: PagePort,
   step: Extract<FlowStep, { kind: 'goal' }>,
   ctx: FlowRunContext,
-) => Promise<void>;
+) => Promise<void | { rounds: number }>;
 
 export interface FlowRunResult {
   stepResults: StepResult[];
@@ -85,6 +88,21 @@ export class FlowExecutor {
 
   private async runOne(step: FlowStep): Promise<StepResult> {
     this.tick();
+    const stepStart = Date.now();
+    try {
+      return this.decorate(await this.runOneInner(step), stepStart);
+    } catch (e) {
+      // 失败/暂停的步骤同样记录耗时
+      void e;
+      throw e;
+    }
+  }
+
+  private decorate(r: StepResult, start: number): StepResult {
+    return { ...r, durationMs: Date.now() - start };
+  }
+
+  private async runOneInner(step: FlowStep): Promise<StepResult> {
     switch (step.kind) {
       case 'action': {
         this.actionCount += 1;
@@ -97,7 +115,7 @@ export class FlowExecutor {
           if (gate?.acceptDialogOnce) p.acceptDialogOnce = true;
         }
         const out = await performAction(this.page, step, p);
-        return { id: step.id, kind: 'action', status: 'done', artifactId: out.artifactId };
+        return { id: step.id, kind: 'action', status: 'done', artifactId: out.artifactId, evidence: out.evidence };
       }
       case 'assert': {
         const verdict = await verifyExpects(this.page, step.expect, { vars: this.ctx.vars }, this.ctx.actionTimeoutMs);
@@ -154,8 +172,9 @@ export class FlowExecutor {
       }
       case 'goal': {
         if (!this.ctx.goalRunner) throw err('INVALID_INPUT', 'goal 步骤需要 goalRunner（Jev 局部循环，P3）');
-        await this.ctx.goalRunner(this.page, step, this.ctx);
-        return { id: step.id, kind: 'goal', status: 'done' };
+        const out = await this.ctx.goalRunner(this.page, step, this.ctx);
+        // rounds 记入 iterations（DESIGN §11 task/step/round 关联）
+        return { id: step.id, kind: 'goal', status: 'done', iterations: out?.rounds };
       }
       default: {
         const never: never = step;
@@ -175,6 +194,8 @@ export class FlowExecutor {
       cancelFlag: this.ctx.cancelFlag,
       dialogs: this.ctx.dialogs,
       acceptDialogOnce: this.ctx.acceptDialogOnce,
+      allowedUploadDirs: this.ctx.allowedUploadDirs,
+      maxUploadBytes: this.ctx.maxUploadBytes,
     };
   }
 }

@@ -5,6 +5,10 @@
 # ===== 依赖目录（pnpm/npm install 可再生） =====
 node_modules/
 
+# ===== Python 字节码缓存（可再生） =====
+__pycache__/
+*.py[cod]
+
 # ===== TypeScript 构建产物（pnpm build / tsc -b 可再生） =====
 dist/
 *.tsbuildinfo

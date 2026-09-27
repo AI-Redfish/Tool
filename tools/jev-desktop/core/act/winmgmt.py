@@ -13,6 +13,8 @@ import time
 from ..errors import err
 from .. import winapi
 
+_KEEP_ALIVE: list[subprocess.Popen] = []  # 持有 stdin 管道写端，防子控制台 EOF 退出
+
 APP_ALIASES: dict[str, str] = {
     "记事本": "notepad", "notepad": "notepad",
     "计算器": "calc", "calc": "calc", "calculator": "calc",
@@ -54,26 +56,44 @@ def resolve_launch_cmd(name: str) -> list[str]:
 
 
 def launch(cmd: list[str], *, wait_ms: int, title_hint: str | None = None) -> dict:
-    """启动进程并等待其顶层窗口出现。返回 {pid, hwnd?, title?}。"""
+    """启动应用并等待其顶层窗口出现（DESIGN §5 窗口管理）。
+
+    经 `cmd /c start`（ShellExecute）启动：
+    - 控制台程序能获得可见的新控制台窗口（直接 Popen 会继承父进程的隐藏 show-state）；
+    - 与父进程 stdio 完全隔离（MCP 模式下 stdout 是协议通道，绝不能被子进程继承）；
+    - start 立即返回，launchedPid 是包装进程；窗口检测依赖新增窗口对比 + title 提示。
+    """
     before = {w.hwnd for w in winapi.list_top_windows()}
+    start_cmd = ["cmd", "/c", "start", "", *cmd]
+    # stdin 用保持打开的管道而非 DEVNULL：控制台程序会继承句柄，
+    # DEVNULL 立即 EOF 会让 cmd /k 等交互程序执行完命令就退出；
+    # 本进程存活期间管道保持打开（MCP 长进程内语义正确）。
     try:
-        proc = subprocess.Popen(cmd, cwd=os.getcwd(), shell=False)
+        proc = subprocess.Popen(start_cmd, cwd=os.getcwd(), shell=False,
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        _KEEP_ALIVE.append(proc)
+        del _KEEP_ALIVE[:-8]  # 只保留最近几个，防泄漏
     except FileNotFoundError as e:
         raise err("APP_NOT_FOUND", f"启动失败: {e}")
     except OSError as e:
         raise err("APP_NOT_FOUND", f"启动失败: {e}")
     deadline = time.monotonic() + max(1.0, wait_ms / 1000)
+    hint_l = (title_hint or "").strip().strip('"').lower()
     while time.monotonic() < deadline:
         wins = winapi.list_top_windows()
-        fresh = [w for w in wins if w.hwnd not in before and w.pid == proc.pid]
-        if not fresh and title_hint:
-            fresh = [w for w in wins if w.hwnd not in before and title_hint.lower() in w.title.lower()]
+        fresh = [w for w in wins if w.hwnd not in before]
+        if hint_l:
+            fresh = [w for w in fresh if hint_l in w.title.lower()]
         if fresh:
             w = fresh[0]
-            return {"pid": w.pid, "hwnd": w.hwnd, "title": w.title, "launchedPid": proc.pid}
+            return {"pid": w.pid, "hwnd": w.hwnd, "title": w.title,
+                    "launchedPid": proc.pid, "via": "start"}
         time.sleep(0.15)
-    return {"pid": proc.pid, "hwnd": None, "title": None, "launchedPid": proc.pid,
-            "note": "进程已启动但未检测到新窗口（可能是单实例应用或启动较慢）"}
+    return {"pid": None, "hwnd": None, "title": None, "launchedPid": proc.pid,
+            "note": "进程已启动但未检测到新窗口（可能是单实例应用复用已有窗口/启动较慢/"
+                    "未给 title 提示）；可用 desktop_windows 标题搜索确认，或提供 --title 提示"}
+
 
 
 def close_window(hwnd: int) -> None:

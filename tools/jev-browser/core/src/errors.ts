@@ -7,7 +7,7 @@ export class JevError extends Error {
   readonly details?: Record<string, unknown>;
 
   constructor(code: ErrorCode, message: string, opts?: { retryable?: boolean; details?: Record<string, unknown> }) {
-    super(`[${code}] ${message}`);
+    super(message);
     this.name = 'JevError';
     this.code = code;
     this.retryable = opts?.retryable ?? false;

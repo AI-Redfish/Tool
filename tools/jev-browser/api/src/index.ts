@@ -7,6 +7,7 @@
  */
 import http from 'node:http';
 import {
+  RateLimiter,
   Runtime,
   SCHEMA_VERSION,
   loadConfig,
@@ -32,15 +33,18 @@ function parseFlags(argv: string[]): CliFlags {
 const flags = parseFlags(process.argv.slice(2));
 const { config } = loadConfig({ file: flags.config });
 const token = process.env[config.api.tokenEnv];
-if (!token) {
+// 作为入口直接运行时必须有 token；被测试导入（createApiServer）时不强制
+if (!token && require.main === module) {
   console.error(`[jev-browser-api] 缺少 API token（环境变量 ${config.api.tokenEnv}）；拒绝启动`);
   process.exit(2);
 }
 
 const PRINCIPAL = 'api-host';
-const runtime = new Runtime(config);
-const recovery = runtime.recoverOnStartup();
-console.error(`[jev-browser-api] 崩溃恢复: ${recovery.recovered} 个遗留任务转暂停，${recovery.expired} 个过期${recovery.isolated ? '；存在未知在途动作已隔离' : ''}`);
+const runtime = require.main === module ? new Runtime(config) : (undefined as unknown as Runtime);
+const recovery = runtime?.recoverOnStartup();
+if (require.main === module) {
+  console.error(`[jev-browser-api] 崩溃恢复: ${recovery?.recovered ?? 0} 个遗留任务转暂停，${recovery?.expired ?? 0} 个过期${recovery?.isolated ? '；存在未知在途动作已隔离' : ''}`);
+}
 
 const MAX_BODY = 1024 * 1024;
 
@@ -88,8 +92,12 @@ function hostOf(req: http.IncomingMessage): string {
 }
 
 /** 创建 API 服务器（测试可注入 runtime；生产入口使用真实 runtime）。 */
-export function createApiServer(rt: Runtime, opts: { token: string }): http.Server {
+export function createApiServer(rt: Runtime, opts: { token: string; rateLimitPerMin?: number; maxConcurrent?: number }): http.Server {
   const accessToken = opts.token;
+  // DESIGN §10：限定速率/并发（固定窗口按 token 计；仅限写请求）
+  const limiter = new RateLimiter(opts.rateLimitPerMin ?? 120);
+  let inFlight = 0;
+  const maxConcurrent = opts.maxConcurrent ?? 16;
   return http.createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
     // Host/Origin 校验：防 DNS rebinding / 浏览器跨站调用（DESIGN §10）
@@ -103,6 +111,28 @@ export function createApiServer(rt: Runtime, opts: { token: string }): http.Serv
     }
     const parts = url.pathname.split('/').filter(Boolean);
     const idem = req.headers['idempotency-key'] as string | undefined;
+    // 速率限制：仅写请求（POST/DELETE）；GET 诊断/查询不限
+    if (req.method !== 'GET' && !limiter.allow('api')) {
+      return fail(res, 429, 'POLICY_BLOCKED', '请求过于频繁（速率限制，DESIGN §10）');
+    }
+    if (inFlight >= maxConcurrent) {
+      return fail(res, 429, 'POLICY_BLOCKED', `并发请求超过上限 ${maxConcurrent}（DESIGN §10）`);
+    }
+    inFlight += 1;
+    try {
+      return await handle(req, res, url, parts, idem);
+    } finally {
+      inFlight -= 1;
+    }
+  });
+
+  async function handle(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    url: URL,
+    parts: string[],
+    idem: string | undefined,
+  ): Promise<void> {
     // 长任务期间周期回收过期暂停（幂等，成本极低）
     rt.reapExpired();
 
@@ -157,15 +187,20 @@ export function createApiServer(rt: Runtime, opts: { token: string }): http.Serv
         return send(res, 200, { artifacts: rt.listArtifacts(PRINCIPAL, parts[2]!) });
       }
 
-      // GET /v1/tasks/:id/artifacts/:artifactId（下载）
+      // GET /v1/tasks/:id/artifacts/:artifactId（下载；大小上限防内存耗尽）
       if (req.method === 'GET' && parts[1] === 'tasks' && parts[3] === 'artifacts' && parts.length === 5) {
         const { path: filePath, filename } = rt.artifactPath(PRINCIPAL, parts[2]!, parts[4]!);
+        const stat = fs.statSync(filePath);
+        if (stat.size > 200 * 1024 * 1024) {
+          return fail(res, 413, 'POLICY_BLOCKED', `artifact 超过 200MB 下载上限: ${stat.size}B`);
+        }
         const data = fs.readFileSync(filePath);
         res.writeHead(200, {
           'content-type': 'application/octet-stream',
           'content-disposition': `attachment; filename="${encodeURIComponent(filename)}"`,
         });
-        return res.end(data);
+        res.end(data);
+        return;
       }
 
       // POST /v1/tasks/:id/cancel|resume|approve
@@ -185,6 +220,9 @@ export function createApiServer(rt: Runtime, opts: { token: string }): http.Serv
       return fail(res, 404, 'NOT_FOUND', `未知路由: ${req.method} ${url.pathname}`);
     } catch (e) {
       const errObj = e as { code?: string; message?: string };
+      if (errObj.code === undefined && /JSON|请求体/.test(errObj.message ?? '')) {
+        return fail(res, 400, 'INVALID_INPUT', errObj.message ?? '请求体非法');
+      }
       const statusMap: Record<string, number> = {
         NOT_FOUND: 404,
         IDEMPOTENCY_CONFLICT: 409,
@@ -203,22 +241,28 @@ export function createApiServer(rt: Runtime, opts: { token: string }): http.Serv
       };
       return fail(res, statusMap[errObj.code ?? ''] ?? 500, errObj.code ?? 'INTERNAL', errObj.message ?? String(e));
     }
-  });
+  }
 }
 
 export { runtime as apiRuntime };
 
-const server = createApiServer(runtime, { token: token! });
-const port = flags.port ?? config.api.port;
-server.listen(port, config.api.host, () => {
-  console.error(`[jev-browser-api] 已启动 http://${config.api.host}:${port}（loopback + token；数据目录 ${config.runtime.dataDir}）`);
-});
+if (require.main === module) {
+  const server = createApiServer(runtime, {
+    token: token!,
+    rateLimitPerMin: config.api.rateLimitPerMin,
+    maxConcurrent: config.api.maxConcurrentRequests,
+  });
+  const port = flags.port ?? config.api.port;
+  server.listen(port, config.api.host, () => {
+    console.error(`[jev-browser-api] 已启动 http://${config.api.host}:${port}（loopback + token；数据目录 ${config.runtime.dataDir}）`);
+  });
 
-async function shutdown(signal: string): Promise<void> {
-  console.error(`[jev-browser-api] 收到 ${signal}，收尾中…`);
-  server.close();
-  await runtime.close().catch(() => undefined);
-  process.exit(0);
+  async function shutdown(signal: string): Promise<void> {
+    console.error(`[jev-browser-api] 收到 ${signal}，收尾中…`);
+    server.close();
+    await runtime.close({ graceMs: 5000 }).catch(() => undefined);
+    process.exit(0);
+  }
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }
-process.on('SIGINT', () => void shutdown('SIGINT'));
-process.on('SIGTERM', () => void shutdown('SIGTERM'));

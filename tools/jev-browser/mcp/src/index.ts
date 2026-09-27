@@ -42,6 +42,9 @@ async function rt(): Promise<Runtime> {
 
 const originSchema = z.array(z.string()).describe('http/https origin 列表，如 ["https://example.com"]');
 
+/** 工具描述统一附加风险标签（DESIGN §3：TOOLS 携带风险标签）。 */
+const desc = (i: number) => `${TOOLS[i].description}【风险: ${TOOLS[i].risk}】`;
+
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
 function text(data: unknown) {
@@ -55,7 +58,7 @@ function textErr(e: unknown) {
   };
 }
 
-server.tool('browser_doctor', TOOLS[0].description, { connect: z.boolean().optional().describe('尝试接管（需 Chrome 授权）') }, async ({ connect }) => {
+server.tool('browser_doctor', desc(0), { connect: z.boolean().optional().describe('尝试接管（需 Chrome 授权）') }, async ({ connect }) => {
   try {
     if (api) return text(await api.diagnostics());
     const result = await runDoctor({ attemptConnect: connect ?? false });
@@ -65,7 +68,7 @@ server.tool('browser_doctor', TOOLS[0].description, { connect: z.boolean().optio
   }
 });
 
-server.tool('browser_connect', TOOLS[1].description, {
+server.tool('browser_connect', desc(1), {
   url: z.string().optional(),
   pageId: z.string().optional(),
   allowedOrigins: originSchema,
@@ -80,7 +83,7 @@ server.tool('browser_connect', TOOLS[1].description, {
   }
 });
 
-server.tool('browser_pages', TOOLS[2].description, { sessionId: z.string() }, async ({ sessionId }) => {
+server.tool('browser_pages', desc(2), { sessionId: z.string() }, async ({ sessionId }) => {
   try {
     const result = api ? await api.pages(sessionId) : await (await rt()).listPages(PRINCIPAL, sessionId);
     return text(result);
@@ -89,7 +92,7 @@ server.tool('browser_pages', TOOLS[2].description, { sessionId: z.string() }, as
   }
 });
 
-server.tool('browser_select_page', TOOLS[3].description, { sessionId: z.string(), pageId: z.string() }, async ({ sessionId, pageId }) => {
+server.tool('browser_select_page', desc(3), { sessionId: z.string(), pageId: z.string() }, async ({ sessionId, pageId }) => {
   try {
     const result = api ? await api.selectPage(sessionId, pageId) : await (await rt()).selectPage(PRINCIPAL, sessionId, pageId);
     return text(result);
@@ -98,7 +101,7 @@ server.tool('browser_select_page', TOOLS[3].description, { sessionId: z.string()
   }
 });
 
-server.tool('browser_snapshot', TOOLS[6].description, { sessionId: z.string(), forModel: z.boolean().optional().describe('true = 打算发给云模型，要求 origin ∈ modelOrigins') }, async ({ sessionId, forModel }) => {
+server.tool('browser_snapshot', desc(6), { sessionId: z.string(), forModel: z.boolean().optional().describe('true = 打算发给云模型，要求 origin ∈ modelOrigins') }, async ({ sessionId, forModel }) => {
   try {
     const obs = api ? await api.snapshot(sessionId, forModel) : await (await rt()).snapshot(PRINCIPAL, sessionId, { forModel });
     return text(obs);
@@ -107,7 +110,7 @@ server.tool('browser_snapshot', TOOLS[6].description, { sessionId: z.string(), f
   }
 });
 
-server.tool('browser_execute', TOOLS[4].description, {
+server.tool('browser_execute', desc(4), {
   sessionId: z.string(),
   steps: z.array(z.record(z.unknown())).describe('FlowStep[]；导航/写操作需 expect 后置条件'),
   values: z.record(z.unknown()).optional().describe('值字典；敏感值用 {"secretRef":"NAME"}（环境 JEV_BROWSER_SECRET_<NAME>）'),
@@ -124,7 +127,7 @@ server.tool('browser_execute', TOOLS[4].description, {
   }
 });
 
-server.tool('browser_run', TOOLS[5].description, {
+server.tool('browser_run', desc(5), {
   sessionId: z.string(),
   goal: z.string(),
   successCriteria: z.string().describe('用户可观察的验收条件；防止规划器自证成功'),
@@ -142,7 +145,7 @@ server.tool('browser_run', TOOLS[5].description, {
   }
 });
 
-server.tool('browser_act', TOOLS[7].description, {
+server.tool('browser_act', desc(7), {
   sessionId: z.string(),
   step: z.record(z.unknown()).describe('单个 ActionStep'),
   values: z.record(z.unknown()).optional(),
@@ -159,7 +162,7 @@ server.tool('browser_act', TOOLS[7].description, {
   }
 });
 
-server.tool('browser_task_get', TOOLS[8].description, { taskId: z.string() }, async ({ taskId }) => {
+server.tool('browser_task_get', desc(8), { taskId: z.string() }, async ({ taskId }) => {
   try {
     const env = api ? (await api.getTask(taskId)).envelope : (await rt()).getTask(PRINCIPAL, taskId);
     return text(env);
@@ -168,7 +171,7 @@ server.tool('browser_task_get', TOOLS[8].description, { taskId: z.string() }, as
   }
 });
 
-server.tool('browser_task_cancel', TOOLS[9].description, {
+server.tool('browser_task_cancel', desc(9), {
   taskId: z.string(),
   requestId: z.string().describe('幂等请求 ID（重复调用返回原结果）'),
   expectedRevision: z.number().optional(),
@@ -181,14 +184,15 @@ server.tool('browser_task_cancel', TOOLS[9].description, {
   }
 });
 
-server.tool('browser_task_resume', TOOLS[10].description, {
+server.tool('browser_task_resume', desc(10), {
   taskId: z.string(),
   requestId: z.string(),
   expectedRevision: z.number().optional(),
   rerunConfirmed: z.boolean().optional().describe('未知结果/歧义/断连恢复暂停后，人工确认允许重跑当前步骤'),
-}, async ({ taskId, requestId, expectedRevision, rerunConfirmed }) => {
+  allowReplan: z.boolean().optional().describe('仅 run 任务：允许规划器对未完成后缀重规划（受 maxReplans 预算）'),
+}, async ({ taskId, requestId, expectedRevision, rerunConfirmed, allowReplan }) => {
   try {
-    const opts = { requestId, expectedRevision, rerunConfirmed };
+    const opts = { requestId, expectedRevision, rerunConfirmed, allowReplan };
     const env = api ? (await api.resumeTask(taskId, opts)).envelope : await (await rt()).resumeTask(PRINCIPAL, taskId, opts);
     return text(env);
   } catch (e) {
@@ -196,7 +200,7 @@ server.tool('browser_task_resume', TOOLS[10].description, {
   }
 });
 
-server.tool('browser_task_approve', TOOLS[11].description, {
+server.tool('browser_task_approve', desc(11), {
   taskId: z.string(),
   grant: z.string().describe('HMAC grant token（独立签发，不注入执行 Agent）'),
 }, async ({ taskId, grant }) => {
@@ -208,7 +212,7 @@ server.tool('browser_task_approve', TOOLS[11].description, {
   }
 });
 
-server.tool('browser_artifact_get', TOOLS[12].description, { taskId: z.string() }, async ({ taskId }) => {
+server.tool('browser_artifact_get', desc(12), { taskId: z.string() }, async ({ taskId }) => {
   try {
     const arts = api ? (await api.listArtifacts(taskId)).artifacts : (await rt()).listArtifacts(PRINCIPAL, taskId);
     return text({ taskId, artifacts: arts });
@@ -217,7 +221,7 @@ server.tool('browser_artifact_get', TOOLS[12].description, { taskId: z.string() 
   }
 });
 
-server.tool('browser_disconnect', TOOLS[13].description, {
+server.tool('browser_disconnect', desc(13), {
   sessionId: z.string(),
   detachTask: z.boolean().optional().describe('有暂停任务时，显式 detach 才允许断开'),
 }, async ({ sessionId, detachTask }) => {
@@ -242,7 +246,7 @@ async function pollUntilSettled(client: ApiClient, taskId: string): Promise<Task
 async function shutdown(signal: string): Promise<void> {
   console.error(`[${SERVER_NAME}] 收到 ${signal}，收尾中…`);
   try {
-    if (runtime) await runtime.close();
+    if (runtime) await runtime.close({ graceMs: 5000 });
   } catch {
     /* 尽力而为 */
   }

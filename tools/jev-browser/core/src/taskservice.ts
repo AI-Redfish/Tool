@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import type {
   ActInput,
@@ -17,7 +18,7 @@ import type {
   ValueInput,
 } from './types.js';
 import { SCHEMA_VERSION } from './types.js';
-import type { ErrorCode } from './types.js';
+import type { CapabilityReport, ErrorCode } from './types.js';
 import { ActionOutcomeUnknownError, JevError, PauseSignal, err } from './errors.js';
 import type { JevBrowserConfig } from './config.js';
 import { credentialPresent } from './config.js';
@@ -36,6 +37,7 @@ import { FlowExecutor, type FlowRunContext, type GoalRunner } from './flow.js';
 import { GoalExecutor } from './goal.js';
 import type { BrowserConnector, BrowserPort, Logger, PagePort } from './ports.js';
 import { consoleLogger, systemClock, type Clock } from './ports.js';
+import { describeCapabilities } from './capabilities.js';
 
 /** 取消/截止的内部信号（在步骤边界抛出，动作不派发）。 */
 class DeadlineSignal extends Error {
@@ -60,6 +62,8 @@ export interface ResumeOptions {
   expectedRevision?: number;
   /** 未知结果/歧义/断连恢复暂停后，人工确认允许重跑当前步骤。 */
   rerunConfirmed?: boolean;
+  /** 仅 run 模式：恢复时允许规划器对未完成后缀重规划（受 maxReplans 预算，DESIGN §7）。 */
+  allowReplan?: boolean;
 }
 
 export interface CancelOptions {
@@ -83,6 +87,9 @@ export class Runtime {
   private readonly heartbeatTimer: NodeJS.Timeout | undefined;
 
   private browser: { port: BrowserPort; ownership: 'borrowed' | 'owned' } | null = null;
+  private closed = false;
+  /** resume(allowReplan) 的显式意图：taskId → 下次执行时对未完成后缀重规划。 */
+  private readonly replanRequests = new Set<string>();
   private readonly sessionPages = new Map<string, PagePort>();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly running = new Map<string, RunningCtx>();
@@ -125,10 +132,15 @@ export class Runtime {
   // 浏览器连接（宿主共享一条连接）
   // ------------------------------------------------------------------
 
+  private connectMs: number | undefined;
+
   private async ensureBrowser(): Promise<{ browser: BrowserPort; ownership: 'borrowed' | 'owned' }> {
     if (this.browser) return { browser: this.browser.port, ownership: this.browser.ownership };
     this.acquireHostLock();
+    const t0 = this.clock.now();
     const res = await this.connector.connect();
+    // 连接耗时（含授权等待）计入任务度量（DESIGN §11 queue/connect 分段）
+    this.connectMs = this.clock.now() - t0;
     this.browser = { port: res.browser, ownership: res.ownership };
     return { browser: res.browser, ownership: res.ownership };
   }
@@ -156,6 +168,7 @@ export class Runtime {
 
   async createSession(principal: string, input: CreateSessionInput): Promise<SessionInfo> {
     validateOrigins(input.allowedOrigins, input.modelOrigins);
+    validateSessionTarget(input.target);
     const { browser } = await this.ensureBrowser();
     const context = browser.contexts()[0];
     if (!context) throw err('PAGE_NOT_RESOLVED', '浏览器没有可用 context');
@@ -171,8 +184,17 @@ export class Runtime {
       page = await context.newPage(url);
       this.sessionPages.set(sessionId, page);
     } else {
-      const sel = await selectPage(context, input.target.pageId);
-      candidates = sel.candidates;
+      let sel = await selectPage(context, input.target.pageId);
+      // 仅列出已授权域的脱敏页面元数据（DESIGN §8.1；宿主级 + 会话级许可的并集）
+      const authorized = new Set([...this.cfg.safety.allowedOrigins, ...input.allowedOrigins]);
+      const filterAuthorized = (cs: PageCandidate[]) => cs.filter((c) => authorized.has(originOf(c.url)));
+      let filtered = filterAuthorized(sel.candidates);
+      // 未指定页且唯一匹配（过滤后仅剩一个授权页）→ 自动绑定；否则保持 awaiting_page（DESIGN §8.1）
+      if (!input.target.pageId && !sel.page && filtered.length === 1) {
+        sel = await selectPage(context, filtered[0]!.pageId);
+        filtered = filterAuthorized(sel.candidates);
+      }
+      candidates = filtered;
       if (sel.page) {
         page = sel.page;
         this.sessionPages.set(sessionId, page);
@@ -204,7 +226,9 @@ export class Runtime {
     const { browser } = await this.ensureBrowser();
     const context = browser.contexts()[0];
     const sel = await selectPage(context, s.pageId ?? undefined);
-    return sel.candidates;
+    // 仅列出已授权域的脱敏页面元数据（DESIGN §8.1）
+    const authorized = new Set([...this.cfg.safety.allowedOrigins, ...(JSON.parse(s.allowedJson) as string[])]);
+    return sel.candidates.filter((c) => authorized.has(originOf(c.url)));
   }
 
   async selectPage(principal: string, sessionId: string, pageId: string): Promise<SessionInfo> {
@@ -283,6 +307,7 @@ export class Runtime {
     opts: SubmitOptions,
     budget?: { deadlineAt?: number },
   ): Promise<TaskEnvelope> {
+    if (this.closed) throw err('INTERNAL', '宿主已关闭，拒绝新任务');
     this.reapExpired();
     const now = this.clock.now();
     const bodyHash = sha256(JSON.stringify(request));
@@ -303,6 +328,7 @@ export class Runtime {
       metricsJson: JSON.stringify({ queuedMs: 0, runningMs: 0, actions: 0, jevRequests: 0, plannerRequests: 0 }),
       errorJson: null,
       goalJson: null,
+      planJson: null,
       createdAt: now,
       updatedAt: now,
       deadlineAt: deadline === Number.MAX_SAFE_INTEGER ? null : deadline,
@@ -346,6 +372,8 @@ export class Runtime {
         const clean = this.waiters.delete(taskId);
         if (clean) reject(err('ACTION_TIMEOUT', '等待任务超时（宿主未在期限内收敛）', { retryable: true }));
       }, 30 * 60_000);
+      // 不阻止宿主进程退出（等待器只是同进程便利设施）
+      timer.unref?.();
       this.waiters.set(taskId, (e) => {
         clearTimeout(timer);
         resolve(e);
@@ -358,6 +386,7 @@ export class Runtime {
   // ------------------------------------------------------------------
 
   private async runTask(taskId: string): Promise<void> {
+    if (this.closed) return;
     let row = this.store.getTask(taskId);
     if (!row) return;
     if (isTerminalStatus(row.status as TaskStatus)) return;
@@ -399,7 +428,10 @@ export class Runtime {
     this.store.kvSet(`lock:${pk}`, JSON.stringify({ pid: process.pid, at: Date.now() }));
 
     const startedAt = this.clock.now();
-    const metrics = JSON.parse(row.metricsJson) as { queuedMs?: number; runningMs?: number; actions?: number; jevRequests?: number; plannerRequests?: number; inputTokens?: number; outputTokens?: number };
+    // judge/planner 是 Runtime 级实例，usage 为累计值：记录任务起点，度量只计增量
+    const judgeStart = { ...this.judge.usage() };
+    const plannerStart = this.planner?.usage ? { ...this.planner.usage() } : null;
+    const metrics = JSON.parse(row.metricsJson) as { queuedMs?: number; runningMs?: number; actions?: number; jevRequests?: number; plannerRequests?: number; inputTokens?: number; outputTokens?: number; connectMs?: number; jevModel?: string; plannerModel?: string; replans?: number };
     metrics.queuedMs = startedAt - row.createdAt;
     if (!this.transitionTo(row, 'running')) {
       this.resolveWaiter(taskId);
@@ -409,6 +441,7 @@ export class Runtime {
     const runningCtx: RunningCtx = { taskId, cancelFlag, stopReason: 'error' };
     this.running.set(taskId, runningCtx);
 
+    if (this.connectMs !== undefined) metrics.connectMs = this.connectMs;
     const runDeadline = Math.min(
       row.deadlineAt ?? Number.MAX_SAFE_INTEGER,
       startedAt + this.cfg.runtime.timeoutMs,
@@ -425,17 +458,19 @@ export class Runtime {
 
     const pullUsage = () => {
       const ju = this.judge.usage();
-      metrics.jevRequests = ju.jevRequests;
-      metrics.inputTokens = ju.inputTokens;
-      metrics.outputTokens = ju.outputTokens;
-      if (this.planner?.usage) {
+      metrics.jevRequests = ju.jevRequests - judgeStart.jevRequests;
+      metrics.inputTokens = ju.inputTokens - judgeStart.inputTokens;
+      metrics.outputTokens = ju.outputTokens - judgeStart.outputTokens;
+      if (ju.model) metrics.jevModel = ju.model;
+      if (this.planner?.usage && plannerStart) {
         const pu = this.planner.usage();
-        metrics.plannerRequests = Math.max(metrics.plannerRequests ?? 0, pu.requests);
-        metrics.inputTokens = (metrics.inputTokens ?? 0) + pu.inputTokens;
-        metrics.outputTokens = (metrics.outputTokens ?? 0) + pu.outputTokens;
+        metrics.plannerRequests = Math.max(metrics.plannerRequests ?? 0, pu.requests - plannerStart.requests);
+        metrics.inputTokens += pu.inputTokens - plannerStart.inputTokens;
+        metrics.outputTokens += pu.outputTokens - plannerStart.outputTokens;
+        if (pu.model) metrics.plannerModel = pu.model;
       }
     };
-    const persist = (patch: Partial<{ cursor: number; goalJson: string | null }> = {}) => {
+    const persist = (patch: Partial<{ cursor: number; goalJson: string | null; planJson: string | null }> = {}) => {
       const cur = this.store.getTask(taskId);
       if (!cur) return;
       pullUsage();
@@ -446,6 +481,7 @@ export class Runtime {
         resultsJson: JSON.stringify(results),
         metricsJson: JSON.stringify(metrics),
         goalJson: patch.goalJson !== undefined ? patch.goalJson : cur.goalJson,
+        planJson: patch.planJson !== undefined ? patch.planJson : cur.planJson,
       });
     };
 
@@ -463,7 +499,36 @@ export class Runtime {
       let steps: FlowStep[];
       if (row.mode === 'run') {
         const req = request as unknown as { goal: string; successCriteria: string; values?: Record<string, ValueInput> };
-        if (!row.goalJson) {
+        // 恢复 + 显式 allowReplan：对未完成后缀重规划（DESIGN §7：只改后缀，受 maxReplans 约束）
+        if (row.planJson && this.replanRequests.has(taskId)) {
+          this.replanRequests.delete(taskId);
+          const replanner = this.planner;
+          if (!replanner?.replan) throw err('PLANNER_NOT_CONFIGURED', '当前 planner 不支持重规划');
+          const replans = metrics.replans ?? 0;
+          if (replans >= this.cfg.runtime.maxReplans) {
+            throw err('BUDGET_EXCEEDED', `重规划次数超过预算 ${this.cfg.runtime.maxReplans}`);
+          }
+          if ((metrics.plannerRequests ?? 0) + 1 > this.cfg.runtime.maxPlannerRequests) {
+            throw err('BUDGET_EXCEEDED', `规划请求数超过预算 ${this.cfg.runtime.maxPlannerRequests}`);
+          }
+          const steps0 = JSON.parse(row.planJson) as FlowStep[];
+          const doneIds = new Set(results.filter((r) => r.status === 'done').map((r) => r.id));
+          const plannedSuffix = await replanner.replan({
+            goal: req.goal,
+            successCriteria: req.successCriteria,
+            valuesKeys: Object.keys(req.values ?? {}),
+            allowedOrigins,
+            currentUrl: page.url(),
+            completedStepIds: steps0.filter((st) => doneIds.has(st.id)).map((st) => st.id),
+            pausedReason: row.pauseReason ?? 'needs_input',
+          });
+          metrics.replans = replans + 1;
+          // 只替换未完成后缀：已完成步骤与其副作用记录原样保留（DESIGN §7）
+          const merged = [...steps0.slice(0, row.cursor), ...plannedSuffix];
+          persist({ planJson: JSON.stringify(merged) });
+          row = this.store.getTask(taskId)!;
+        }
+        if (!row.planJson) {
           if (!this.planner) throw err('PLANNER_NOT_CONFIGURED', 'planner 未配置');
           if ((metrics.plannerRequests ?? 0) + 1 > this.cfg.runtime.maxPlannerRequests) {
             throw err('BUDGET_EXCEEDED', `规划请求数超过预算 ${this.cfg.runtime.maxPlannerRequests}`);
@@ -479,11 +544,11 @@ export class Runtime {
           if (planned.length === 0) {
             throw new PauseSignal('needs_input', '规划器无法生成计划（目标不可达或信息不足），需人工补充信息');
           }
-          persist({ goalJson: JSON.stringify(planned) });
+          persist({ planJson: JSON.stringify(planned) });
           row = this.store.getTask(taskId)!;
           steps = planned;
         } else {
-          steps = JSON.parse(row.goalJson) as FlowStep[];
+          steps = JSON.parse(row.planJson) as FlowStep[];
         }
       } else {
         steps = (request as unknown as { steps: FlowStep[] }).steps;
@@ -506,11 +571,15 @@ export class Runtime {
             doneAt: this.cfg.jev.doneAt,
             confirmLow: this.cfg.jev.confirmLow,
             confirmHigh: this.cfg.jev.confirmHigh,
+            blockedAt: this.cfg.jev.blockedAt,
+            errorAt: this.cfg.jev.errorAt,
           },
           artifacts: fctx.artifacts,
           ledger: fctx.ledger,
           cancelFlag,
           dialogs: fctx.dialogs,
+          allowedUploadDirs: this.cfg.safety.allowedUploadDirs,
+          maxUploadBytes: this.cfg.safety.maxUploadBytes,
           requestApproval: async (step) => {
             await gate(step); // 未授权时抛 PauseSignal(needs_confirmation)，动作不派发
           },
@@ -528,6 +597,8 @@ export class Runtime {
         actionTimeoutMs: this.cfg.runtime.actionTimeoutMs,
         cancelFlag,
         dialogs: this.dialogs,
+        allowedUploadDirs: this.cfg.safety.allowedUploadDirs,
+        maxUploadBytes: this.cfg.safety.maxUploadBytes,
         maxSteps: this.cfg.runtime.maxSteps,
         maxActions: this.cfg.runtime.maxActions,
         beforeAction: async (step) => {
@@ -618,7 +689,8 @@ export class Runtime {
         const jev = e as JevError;
         const code = jev.code ?? 'INTERNAL';
         this.transitionTo(row, 'failed', {
-          errorJsonRaw: JSON.stringify({ code, message: (e as Error).message.slice(0, 400), retryable: jev.retryable ?? false }),
+          // details（如断言失败清单）进入 envelope.evidence（DESIGN §8.2/§11）
+          errorJsonRaw: JSON.stringify({ code, message: (e as Error).message.slice(0, 400), retryable: jev.retryable ?? false, details: jev.details }),
           resultsJson: JSON.stringify(results),
           metricsJson,
         });
@@ -690,7 +762,10 @@ export class Runtime {
     return this.store.listArtifactsByTask(taskId).map(({ artifactId, filename, size, sha256 }) => ({ artifactId, filename, size, sha256 }));
   }
 
-  /** 只读快照（browser_snapshot）：不建任务、受 origin/modelOrigins 约束。 */
+  /**
+   * 只读快照（browser_snapshot）：不建任务、受 origin/modelOrigins 约束。
+   * 经 profile 队列串行执行——不能绕开已暂停/运行任务窃读页面（DESIGN §8.3）。
+   */
   async snapshot(principal: string, sessionId: string, opts: { forModel?: boolean } = {}): Promise<unknown> {
     const s = this.requireSession(principal, sessionId);
     const page = this.sessionPages.get(sessionId);
@@ -701,7 +776,31 @@ export class Runtime {
       // 空列表 = 全部禁止外发（DESIGN §10 默认不许可）
       throw err('ORIGIN_NOT_ALLOWED', `forModel 快照要求 origin ∈ modelOrigins（当前为空或未包含）: ${originOf(page.url())}`);
     }
-    return observePage(page, { allowedOrigins: allowed });
+    const pk = this.profileKey();
+    const prev = this.queues.get(pk) ?? Promise.resolve();
+    const run = prev.then(async () => {
+      // 暂停任务预约整个 profile：预约期间拒绝其他会话的快照窃读（DESIGN §8.2）
+      const raw = this.store.kvGet(`reserve:${pk}`);
+      if (raw) {
+        try {
+          const r = JSON.parse(raw) as { taskId: string };
+          const owner = this.store.getTask(r.taskId);
+          if (owner && owner.sessionId !== sessionId) {
+            throw err('SESSION_BUSY', `浏览器被任务 ${r.taskId}（其他会话）预约，禁止跨会话窃读`);
+          }
+        } catch (e) {
+          if ((e as JevError).code) throw e;
+        }
+      }
+      return observePage(page, { allowedOrigins: allowed });
+    });
+    this.queues.set(pk, run.then(() => undefined, () => undefined));
+    return run;
+  }
+
+  /** 能力探测（DESIGN §11）：委托 capabilities.ts（单一事实来源）。 */
+  capabilities(): CapabilityReport[] {
+    return describeCapabilities(this.cfg);
   }
 
   async cancelTask(principal: string, taskId: string, opts: CancelOptions): Promise<TaskEnvelope> {
@@ -758,6 +857,12 @@ export class Runtime {
     const errInfo = row.errorJson ? (JSON.parse(row.errorJson) as { code?: string }) : null;
     // 未知结果/歧义/断连恢复必须显式确认（DESIGN §8.2：不确定不自动重放）
     const needsRerunConfirm = errInfo?.code === 'ACTION_OUTCOME_UNKNOWN' || row.pauseReason === 'ambiguous' || row.pauseReason === 'interrupted';
+    if (opts.allowReplan && row.mode !== 'run') {
+      throw err('INVALID_INPUT', 'allowReplan 仅适用于 run 模式任务');
+    }
+    if (opts.allowReplan && row.pauseReason !== 'ambiguous' && row.pauseReason !== 'needs_input') {
+      throw err('INVALID_INPUT', `allowReplan 仅适用于 ambiguous/needs_input 暂停（当前 ${row.pauseReason}）`);
+    }
     if (row.pauseReason === 'needs_confirmation') {
       const pending = errInfo ? (JSON.parse(row.errorJson!) as { pendingApproval?: PendingApproval }).pendingApproval : undefined;
       const grant = pending ? this.store.findGrant(taskId, pending.actionRevision) : undefined;
@@ -776,6 +881,10 @@ export class Runtime {
     }
     row = this.store.getTask(taskId)!;
     if (row.status !== 'paused') return this.envelope(row);
+    // 登记 replan 意图（runTask 执行时消费；不满足条件在下方拒绝后才登记）
+    if (opts.allowReplan && row.planJson) {
+      this.replanRequests.add(taskId);
+    }
     this.store.transition(taskId, row.revision, { status: 'queued', pauseReason: null, errorJson: null });
     this.store.putIdempotent(`resume:${taskId}:${opts.requestId}`, sha256('queued'), taskId);
     const pk = this.profileKey();
@@ -832,6 +941,7 @@ export class Runtime {
 
   recoverOnStartup(): { recovered: number; expired: number; isolated: boolean } {
     this.store.pruneIdempotency(RETENTION_MS);
+    this.pruneArtifacts();
     const unresolved = this.store.unresolvedActions();
     for (const a of new Set(unresolved.map((u) => u.taskId))) {
       this.store.setActionState(a, this.store.maxActionSeq(a), 'unknown', undefined, JSON.stringify({ reason: 'host_crash' }));
@@ -872,6 +982,25 @@ export class Runtime {
     return { recovered, expired, isolated: unresolved.length > 0 };
   }
 
+  /** 终态任务的 artifact 拟保留 24h，到期删除文件与元数据（DESIGN §9.1；仅限工具自有目录）。 */
+  private pruneArtifacts(): void {
+    const cutoff = this.clock.now() - RETENTION_MS;
+    let rows: ReturnType<TaskStore['artifactsOfTerminalTasksOlderThan']> = [];
+    try {
+      rows = this.store.artifactsOfTerminalTasksOlderThan(cutoff);
+    } catch {
+      return;
+    }
+    for (const row of rows) {
+      try {
+        fs.rmSync(row.path, { force: true });
+      } catch {
+        // 文件可能已被人工另存/移动；元数据仍按保留期清理
+      }
+      this.store.deleteArtifact(row.artifactId);
+    }
+  }
+
   /** paused 超过 pauseTtl（或绝对 deadline）→ expired；预约一并释放（DESIGN §6.4）。 */
   reapExpired(): number {
     const now = this.clock.now();
@@ -898,13 +1027,30 @@ export class Runtime {
     return n;
   }
 
-  async close(): Promise<void> {
+  async close(opts: { graceMs?: number } = {}): Promise<void> {
+    this.closed = true;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    // 请求运行中任务在步骤边界收尾（在途动作按账本规则 settle/隔离，不强行中断）
+    for (const ctx of this.running.values()) {
+      ctx.stopReason = 'user_cancel';
+      ctx.cancelFlag.cancelled = true;
+    }
+    const deadline = this.clock.now() + Math.max(0, opts.graceMs ?? 0);
+    while (this.running.size > 0 && this.clock.now() < deadline) {
+      await this.clock.sleep(50);
+    }
+    // 关闭后不再有转移动作：用当前快照收口所有悬挂等待者（须在 store.close 之前）
+    for (const [taskId2, w] of this.waiters) {
+      this.waiters.delete(taskId2);
+      const row2 = this.store.getTask(taskId2);
+      if (row2) w(this.envelope(row2));
+    }
     if (this.browser) {
       await this.browser.port.close().catch(() => undefined);
       this.browser = null;
     }
     this.store.kvDel(`lock:${this.profileKey()}`);
+    this.store.close();
   }
 
   // ------------------------------------------------------------------
@@ -970,7 +1116,7 @@ export class Runtime {
 
   envelope(row: TaskRow): TaskEnvelope {
     const parsedError = row.errorJson
-      ? (JSON.parse(row.errorJson) as { code: string; message: string; retryable?: boolean; pendingApproval?: PendingApproval; stopReason?: string })
+      ? (JSON.parse(row.errorJson) as { code: string; message: string; retryable?: boolean; pendingApproval?: PendingApproval; stopReason?: string; details?: Record<string, unknown> })
       : undefined;
     const error: TaskEnvelope['error'] = parsedError && parsedError.code !== 'CANCEL_PENDING'
       ? { code: parsedError.code as ErrorCode, message: parsedError.message, retryable: parsedError.retryable ?? false }
@@ -991,6 +1137,8 @@ export class Runtime {
       pauseReason: (row.pauseReason as TaskEnvelope['pauseReason']) ?? undefined,
       stepResults: safeParse(row.resultsJson, [] as StepResult[]),
       metrics: safeParse(row.metricsJson, { queuedMs: 0, runningMs: 0, actions: 0, jevRequests: 0, plannerRequests: 0 }),
+      // 脱敏证据：断言失败清单等（DESIGN §8.2 evidence / §11 成功证据）
+      evidence: parsedError?.details && Object.keys(parsedError.details).length > 0 ? [{ source: 'error', code: parsedError.code, ...parsedError.details }] : undefined,
       artifacts,
       error,
       pendingApproval: parsedError?.pendingApproval,
@@ -1077,8 +1225,23 @@ function isPidAlive(pid: number): boolean {
 }
 
 function guessPageId(context: import('./ports.js').ContextPort, page: PagePort): string {
-  const idx = context.pages().indexOf(page);
+  const idx = context.indexOfPage(page);
   return idx >= 0 ? `p${idx}` : 'p0';
+}
+
+function validateSessionTarget(target: import('./types.js').SessionTarget): void {
+  if (typeof target !== 'object' || target === null) throw err('INVALID_INPUT', 'target 必须是对象');
+  if (target.kind === 'new') {
+    if (!target.url || !/^https?:\/\//i.test(String(target.url))) {
+      throw err('INVALID_INPUT', `target.url 必须是 http/https URL: ${String((target as { url?: unknown }).url ?? '')}`);
+    }
+  } else if (target.kind === 'existing') {
+    if (target.pageId !== undefined && !/^p\d+$/.test(target.pageId)) {
+      throw err('INVALID_INPUT', `target.pageId 格式非法（应为 pages 返回的 id）: ${target.pageId}`);
+    }
+  } else {
+    throw err('INVALID_INPUT', `target.kind 非法: ${String((target as { kind?: unknown }).kind)}`);
+  }
 }
 
 function validateOrigins(allowed: string[], model: string[]): void {
@@ -1087,10 +1250,20 @@ function validateOrigins(allowed: string[], model: string[]): void {
   for (const o of model) if (!allowed.includes(o)) throw err('INVALID_INPUT', `modelOrigins 必须是 allowedOrigins 子集: ${o}`);
 }
 
-/** execute 输入校验：白名单 + 写操作必须提供后置条件（DESIGN §8.1）。 */
+/** execute 输入校验：白名单 + 写操作必须提供后置条件 + id 全局唯一（DESIGN §8.1）。 */
 export function validateExecuteSteps(steps: FlowStep[]): void {
   if (!Array.isArray(steps) || steps.length === 0) throw err('INVALID_INPUT', 'steps 不能为空');
   validatePlannedSteps(JSON.parse(JSON.stringify(steps)) as unknown);
+  const seen = new Set<string>();
+  const walk = (list: FlowStep[]) => {
+    for (const s of list) {
+      if (seen.has(s.id)) throw err('INVALID_INPUT', `步骤 id 重复: ${s.id}`);
+      seen.add(s.id);
+      if (s.kind === 'branch') walk(s.then);
+      if (s.kind === 'forEach') walk(s.body);
+    }
+  };
+  walk(steps);
   let branchDepth = 0;
   for (const s of steps) {
     if (s.kind === 'action' && WRITE_ACTIONS.has(s.action) && (!s.expect || s.expect.length === 0)) {

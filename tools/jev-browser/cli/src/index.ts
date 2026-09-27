@@ -26,7 +26,7 @@ interface CliArgs {
 }
 
 function parseArgs(argv: string[]): CliArgs {
-  const command = argv[0] ?? 'help';
+  const command = argv[0] && !argv[0].startsWith('--') ? argv[0] : 'help';
   const positional: string[] = [];
   const flags: Record<string, string | boolean | string[]> = {};
   for (let i = 1; i < argv.length; i++) {
@@ -70,7 +70,8 @@ const HELP = `jev-browser-cli —— 浏览器控制（Playwright + Jev；方案
   run --goal <文本> --success <验收条件> (--url | --page) --origin ... [--model-origin ...]
                                               内部规划并执行（需 planner 与 Jev 配置）
   act --session <id> --step '<ActionStep JSON>' [--values '<json>']
-  task get|cancel|resume|approve <taskId>     cancel/resume 需 --request-id；resume 未证实结果需 --rerun-confirm
+  task get|cancel|resume|approve <taskId>     cancel/resume 需 --request-id；resume 未证实结果需 --rerun-confirm；
+                                              run 任务恢复时 --replan 允许规划器重规划未完成后缀（受 maxReplans）
   grant create --task <id> --action-revision <n>   签发审批 grant（需 JEV_BROWSER_APPROVAL_KEY）
   artifact list --task <id>                   列出任务产物
   artifact get --task <id> --artifact <id> --out <path>
@@ -205,6 +206,9 @@ async function main(): Promise<void> {
         console.error(`配置文件: ${result.config.file ?? '(未使用，默认值)'}`);
         if (result.config.envKeys.length) console.error(`环境变量覆盖: ${result.config.envKeys.join(', ')}`);
         for (const c of result.checks) console.error(`[${c.ok ? 'OK' : 'FAIL'}] ${c.name}: ${c.detail}`);
+        if (result.capabilities?.length) {
+          for (const cap of result.capabilities) console.error(`[capability] ${cap.id}: ${cap.state}${cap.detail ? ` — ${cap.detail}` : ''}`);
+        }
         if (result.connect) console.error(`[connect] ${result.connect.ok ? 'OK' : 'FAIL'}: ${result.connect.detail}`);
       }
       const connectFail = result.connect && !result.connect.ok;
@@ -340,7 +344,11 @@ async function main(): Promise<void> {
         finish(env, json);
       }
       if (sub === 'resume') {
-        const resumeOpts = { ...opts, rerunConfirmed: args.flags['rerun-confirm'] === true };
+        const resumeOpts = {
+          ...opts,
+          rerunConfirmed: args.flags['rerun-confirm'] === true,
+          allowReplan: args.flags['replan'] === true,
+        };
         if (api) {
           const env = (await api.resumeTask(taskId, resumeOpts)).envelope;
           const finalEnv = ['queued', 'running', 'cancelling'].includes(env.status) ? await pollApi(api, taskId) : env;

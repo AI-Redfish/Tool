@@ -21,6 +21,8 @@ LEAF_PROBE_ROLES = {"Text", "Image", "Pane", "Group", "Table", "TableCell", "Cus
                     "Header", "HeaderItem", "DataItem", "ListItem", "Thumb", "AppBar"}
 # 显示 value 的类型（ValuePattern 查询仅对这些类型做，控耗时）
 VALUE_ROLES = {"Edit", "Document", "Spinner", "ComboBox"}
+# 尝试 TextPattern 读取内容的类型（终端/文档/富文本）
+TEXT_PATTERN_ROLES = {"Document", "Text", "Custom", "Edit"}
 
 _NAME_MAX = 40
 _VAL_MAX = 30
@@ -54,17 +56,24 @@ def window_control(uia, hwnd: int):
 
 
 def walk_tree(uia, win_control, *, snapshot_id: str, hwnd: int, pid: int,
-              max_depth: int = 3, max_elements: int = 800) -> tuple[list[SnapElement], list[str], bool]:
+              max_depth: int = 3, max_elements: int = 800,
+              root_runtime_id: list[int] | None = None) -> tuple[list[SnapElement], list[str], bool]:
     """BFS 遍历 UIA 树。返回 (elements, lines, truncated)。
 
     - 每行：role | name | aid | value | 状态 | 矩形，交互元素带 ref；
     - 深度截断的容器标注 children_count 与下钻 ref（渐进骨架）；
-    - 超过 max_elements 即截断并标注。
+    - 超过 max_elements 即截断并标注；
+    - root_runtime_id 给定时从该元素开始局部下钻（渐进骨架遍历）。
     """
     elements: list[SnapElement] = []
     lines: list[str] = []
     truncated = False
-    queue: deque = deque([(win_control, 0)])
+    start = win_control
+    if root_runtime_id:
+        start = _find_by_runtime_id(uia, win_control, root_runtime_id)
+        if start is None:
+            raise err("STALE_REF", "下钻根元素已失效（RuntimeId 重找失败）；请重新快照后再选下钻 ref")
+    queue: deque = deque([(start, 0)])
 
     while queue:
         ctrl, depth = queue.popleft()
@@ -130,6 +139,31 @@ def _read_element(uia, ctrl, snapshot_id: str, hwnd: int, pid: int, depth: int, 
                 value = vp.Value or ""
         except Exception:
             value = ""
+    if not value and role in TEXT_PATTERN_ROLES:
+        # 终端/文档类控件常经 TextPattern 暴露内容（如 Windows Terminal），
+        # 子元素里看不到文本。优先可见区域（终端最新输出），取末尾 120 字符。
+        try:
+            tp = ctrl.GetPattern(uia.PatternId.TextPattern)
+            if tp is not None:
+                text = ""
+                try:
+                    ranges = tp.GetVisibleRanges() or []
+                    if ranges:
+                        text = ranges[-1].GetText(400) or ""
+                except Exception:
+                    text = tp.DocumentRange.GetText(800) or ""
+                value = text.strip()[-120:]
+        except Exception:
+            value = ""
+
+    toggle_state = None
+    if role in ("CheckBox", "RadioButton"):
+        try:
+            tp_ = ctrl.GetPattern(uia.PatternId.TogglePattern)
+            if tp_ is not None:
+                toggle_state = int(tp_.ToggleState)
+        except Exception:
+            toggle_state = None
 
     interactive = role in INTERACTIVE_ROLES
     if not interactive and role in LEAF_PROBE_ROLES:
@@ -143,20 +177,25 @@ def _read_element(uia, ctrl, snapshot_id: str, hwnd: int, pid: int, depth: int, 
     except Exception:
         runtime_id = []
 
-    name_disp = _clip(name)
-    val_disp = _clip(value, _VAL_MAX)
+    val_disp = _clip_val(value)
     fingerprint = f"{role}|{name[:60]}|{aid[:60]}|{klass[:60]}"
     return SnapElement(
         ref=f"@{snapshot_id}:e{index}",
         role=role, name=name, automation_id=aid, class_name=klass, value=val_disp,
         rect=rect, offscreen=offscreen, interactive=interactive, children_count=0,
         depth=depth, runtime_id=runtime_id, hwnd=hwnd, pid=pid, fingerprint=fingerprint,
+        toggle_state=toggle_state,
     )
 
 
 def _clip(s: str, n: int = _NAME_MAX) -> str:
     s = (s or "").replace("\n", " ").replace("\r", " ").strip()
     return s[:n] + ("…" if len(s) > n else "")
+
+
+def _clip_val(s: str) -> str:
+    s = (s or "").replace("\n", " ").replace("\r", " ").strip()
+    return s[:120] + ("…" if len(s) > 120 else "")
 
 
 def _render_line(info: SnapElement, *, drill: bool = False) -> str:
@@ -170,6 +209,8 @@ def _render_line(info: SnapElement, *, drill: bool = False) -> str:
         parts.append(f'val="{info.value}"')
     l, t, r, b = info.rect
     parts.append(f"({l},{t},{r},{b})")
+    if info.toggle_state is not None:
+        parts.append({0: "未勾选", 1: "已勾选", 2: "半选"}.get(info.toggle_state, f"state={info.toggle_state}"))
     if info.offscreen:
         parts.append("不可见")
     line = indent + " ".join(parts)
@@ -206,13 +247,14 @@ def find_by_fingerprint(uia, win_control, fingerprint: str, runtime_id: list[int
 
     def compare(c) -> bool:
         try:
+            # 与指纹存储口径一致（均截断到 60 字符），避免长名称假阴性
             if short_role(c.ControlTypeName) != role:
                 return False
-            if aid and (c.AutomationId or "") != aid:
+            if aid and (c.AutomationId or "")[:60] != aid:
                 return False
-            if klass and (c.ClassName or "") != klass:
+            if klass and (c.ClassName or "")[:60] != klass:
                 return False
-            if name and (c.Name or "") != name:
+            if name and (c.Name or "")[:60] != name:
                 return False
             return True
         except Exception:
@@ -248,6 +290,20 @@ def find_by_fingerprint(uia, win_control, fingerprint: str, runtime_id: list[int
 
     matches.sort(key=score)
     return matches[0], len(matches)
+
+
+def _find_by_runtime_id(uia, win_control, runtime_id: list[int]):
+    """在窗口子树内按 RuntimeId 精确重找元素（用于 --root 下钻）。"""
+    target = [int(x) for x in runtime_id]
+
+    def compare(c) -> bool:
+        try:
+            return [int(x) for x in (c.GetRuntimeId() or [])] == target
+        except Exception:
+            return False
+
+    matches = _find_all(uia, win_control, compare, 24)
+    return matches[0] if matches else None
 
 
 def _find_all(uia, win_control, compare, search_depth: int) -> list:

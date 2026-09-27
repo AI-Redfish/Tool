@@ -216,14 +216,15 @@ npx github:AI-Redfish/Tool server-py
 | --- | --- | --- | --- | --- |
 | `server-a` | TypeScript | core + cli + mcp 三包工作区示例 | `echo`、`now` | `server-a-cli`（可全局安装） |
 | `server-py` | Python（纯标准库） | 多语言演示，与 server-a 同构分层 | `echo`、`now` | `python tools/server-py/cli.py` |
+| `jev-desktop` | Python（uiautomation/mss/httpx） | Windows 桌面软件控制：UIA 语义树 + 截图/OCR/视觉三档观察，Jev 判断 + 规划 LLM，`execute`/`run` 双模式 | `desktop_doctor/windows/snapshot/act/execute/run/screenshot/clipboard` | `python tools/jev-desktop/cli.py` |
 
 ## 规划中的工具
 
-- **jev-browser**：Playwright + Jev 浏览器控制，拟支持 `execute` / `run` 两种模式，以及 MCP、CLI、HTTP API 入口；默认授权接管日常 Chrome、有头运行。
+- **jev-browser**：Playwright + Jev 浏览器控制，支持 `execute` / `run` 两种模式，以及 MCP、CLI、HTTP API 入口；默认授权接管日常 Chrome、有头运行。核心已实现（62 个离线测试通过），**P0 实机验证未完成，暂不可用**。
   详见 [方案总览](tools/jev-browser/README.md)、[技术设计](tools/jev-browser/DESIGN.md)、[开发计划](tools/jev-browser/DEVELOPMENT_PLAN.md)。
-- **jev-desktop**：LLM 规划 + Jev 判断的 Windows 桌面软件控制（Python 实现），UIA 语义树 + 截图/OCR/视觉三档可降级观察，`execute` / `run` 双模式共用执行引擎，MCP 与 CLI 入口。
+- **jev-desktop**：LLM 规划 + Jev 判断的 Windows 桌面软件控制（Python 实现），UIA 语义树 + 截图/OCR/视觉三档可降级观察，`execute` / `run` 双模式共用执行引擎，MCP 与 CLI 入口。**已实现并通过本地端到端验证，已加入可用工具列表**（P0 六应用实测矩阵与 P6 基准项后续推进；需 Windows 原生环境 + `pip install -r tools/jev-desktop/requirements.txt`）。
   详见 [方案总览](tools/jev-desktop/README.md)、[技术设计](tools/jev-desktop/DESIGN.md)、[开发计划](tools/jev-desktop/DEVELOPMENT_PLAN.md)、[研究记录](tools/jev-desktop/RESEARCH.md)。
-- 两个工具当前仅完成设计与开发计划，**尚不可运行，未加入可用工具列表**。
+- **jev-browser** 未通过实机验收，暂不可用；jev-desktop 的 P0 实测矩阵仍在推进。
 
 ## 如何新增一个工具
 
