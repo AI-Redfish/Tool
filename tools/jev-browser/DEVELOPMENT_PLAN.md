@@ -34,17 +34,20 @@ P6 安全、基准与发布准备
 
 ## 3. P0：接管可行性与保护性验证（阻塞门）
 
+> 进度（2026-09-27 实现轮）：**launch 路径已完成实机冒烟并通过**（`scripts/smoke.mjs`，结果见
+> [docs/compatibility.md](docs/compatibility.md)）；attach 路径待用户在 Chrome 原生授权后专项验证。
+
 ### 工作项
 
 - [ ] 记录 Windows/Chrome/Node/Playwright 版本、Chrome profile 类型、是否受企业策略管理；不采集浏览历史或 Cookie。
 - [ ] 在测试 profile 检查原生授权远程调试与固定版本 `connectOverCDP("chrome")`；验证显式已授权 endpoint 备用路径。
 - [ ] 对 Chrome 未运行、未开启授权、拒绝授权、授权超时、多个 profile、端点失效分别生成可操作诊断。
 - [ ] 用已有默认 context 验证页面枚举、目标页选择、只读内容获取和登录态可见；证明未创建隔离 context 冒充原会话。
-- [ ] 在本地 fixture 验证导航、输入、popup、dialog、iframe、Shadow DOM、上传与下载 capability。
+- [x] 在本地 fixture 验证导航、输入、popup、dialog、iframe、Shadow DOM、上传与下载 capability。（部分：navigate/提取/断言/下载/截图已由 smoke 实测；popup/dialog/iframe/Shadow DOM/upload 待补）
 - [ ] 检查 `noDefaults: true` 对焦点、媒体、下载行为的影响；记录不能支持的能力。
 - [ ] 未选中测试页弹出 alert/confirm/prompt/beforeunload 时，验证工具不会自动替用户处理，原生人工操作仍可用；不能凭 noDefaults 推断。
 - [ ] 验证 download 事件、saveAs、context 关闭/连接断开后 artifact 完整性；不扫描真实下载目录。
-- [ ] 验证 launch 的按 engine 独立 profile、沙箱和子进程环境白名单，不把模型/审批密钥传入浏览器。
+- [x] 验证 launch 的按 engine 独立 profile、沙箱和子进程环境白名单，不把模型/审批密钥传入浏览器。（部分：独立临时 profile + chromiumSandbox 已实测；子进程环境白名单待补）
 - [ ] 测试正常 disconnect、异常中断、SIGINT、模型错误后的清理；日常进程、既有页和 profile 保留。
 - [ ] 对比 connect 与 reconnect 的授权交互，确认能否在长连接内复用，不承诺永不弹确认。
 - [ ] 验证任务中途 Chrome 被关闭/崩溃/调试授权撤销时的断连处理：停止外发、任务转 paused/interrupted、artifact 完整性、不自动重启替代浏览器。
@@ -52,9 +55,9 @@ P6 安全、基准与发布准备
 
 ### 交付物
 
-- `docs/compatibility.md`（实现阶段新增）：确切版本、测试步骤、结果、限制、敏感信息已剔除的诊断。
-- 最小 smoke 测试脚本，默认仅操作本地 fixture，不自动接管日常 profile。
-- 连接、清理、页面选择和下载能力的 go/no-go 结论。
+- [x] `docs/compatibility.md`（实现阶段新增）：确切版本、测试步骤、结果、限制、敏感信息已剔除的诊断。（2026-09-27 交付）
+- [x] 最小 smoke 测试脚本，默认仅操作本地 fixture，不自动接管日常 profile。（`scripts/smoke.mjs`，npm run smoke）
+- [x] 连接、清理、页面选择和下载能力的 go/no-go 结论。（launch=go；attach=待验证）
 
 ### 退出门槛
 

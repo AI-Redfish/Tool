@@ -223,6 +223,16 @@ export class TaskStore {
     return rows.map((r) => ({ taskId: String(r.task_id), seq: Number(r.seq), state: String(r.state) }));
   }
 
+  /** 某任务全部 unknown 行（隔离自愈/审计用）。 */
+  unresolvedActionsByTask(taskId: string): Array<{ taskId: string; seq: number; state: string }> {
+    return this.unresolvedActions().filter((u) => u.taskId === taskId);
+  }
+
+  unknownActionsByTask(taskId: string): Array<{ taskId: string; seq: number }> {
+    const rows = this.db.prepare("SELECT task_id, seq FROM actions WHERE task_id = ? AND state = 'unknown'").all(taskId) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({ taskId: String(r.task_id), seq: Number(r.seq) }));
+  }
+
   // ---- 幂等 ----
   findIdempotent(pkey: string): { bodyHash: string; taskId: string } | undefined {
     const r = this.db.prepare('SELECT body_hash, task_id FROM idempotency WHERE pkey = ?').get(pkey) as { body_hash: string; task_id: string } | undefined;

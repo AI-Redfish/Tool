@@ -68,8 +68,9 @@ def _add_global_args(p: argparse.ArgumentParser, *, for_sub: bool) -> None:
     """全局参数同时挂在主解析器与子命令（任意位置可用）；for_sub 用 SUPPRESS 默认值，
     避免子命令未提供时覆盖主解析器已解析的值。"""
     kw = dict(default=argparse.SUPPRESS) if for_sub else {}
+    # 注意：argparse 会把 help 当格式串做 % 插值，字面 % 必须写成 %%
     p.add_argument("--config", **kw,
-                   help=r"配置文件路径（默认 %LOCALAPPDATA%\AI-Redfish\jev-desktop\config.json）")
+                   help=r"配置文件路径（默认 %%LOCALAPPDATA%%\AI-Redfish\jev-desktop\config.json）")
     p.add_argument("--json", action="store_true", **kw, help="禁交互，输出纯 envelope JSON")
     p.add_argument("--dry-run", dest="dry_run", action="store_true", **kw,
                    help="只观察/解析目标，不执行动作")

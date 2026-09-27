@@ -1,6 +1,7 @@
 # jev-desktop 开发计划与验收
 
 > 方案版本：v0.1；复核日期：2026-09-24。**状态更新（实现阶段）：P1–P5 核心功能已实现并通过本地端到端验证（含 mock 规划器/Jev 联调、真实窗口 UIA 快照与语义动作、SendInput 中文输入、剪贴板、截图、MCP 协议）；P0 六应用实测矩阵与 P6 基准/发布项仍按本计划推进。**
+> 复验（2026-09-27）：离线测试 30/30、doctor、真实窗口只读快照/execute 全链路、JevClient 真实 HTTP（mock）、MCP 握手重跑全绿；修复 `cli.py --help` 崩溃；明细见 [README.md](README.md) 实机验证记录。
 > 前置设计：[DESIGN.md](DESIGN.md)。资料与未决项：[RESEARCH.md](RESEARCH.md)。
 
 ## 1. 推进原则

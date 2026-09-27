@@ -114,7 +114,8 @@ export async function performAction(
   ctx.ledger.prepared(step, ctx.actionRevision);
   const timeout = ctx.actionTimeoutMs;
   let downloadPromise: Promise</* DownloadPort */ import('./ports.js').DownloadPort> | undefined;
-  const wantsDownload = step.expect.some((e) => e.kind === 'download_completed');
+  // expect 仅对写操作强制（validateExecuteSteps）；只读动作合法地无 expect
+  const wantsDownload = (step.expect ?? []).some((e) => e.kind === 'download_completed');
 
   try {
     ctx.ledger.inFlight(step, ctx.actionRevision);
@@ -127,6 +128,10 @@ export async function performAction(
       ctx.dialogs.armOnce(page, '已授权的预期 confirm');
     }
 
+    // 实测发现：screenshot 曾提前 return 绕过账本结算，动作永远留在 in_flight（重启后被标 unknown → 隔离）。
+    // 现统一走尾部结算：各分支只产生 evidence/artifactId，由尾部统一 finished('verified')。
+    let artifactId: string | undefined;
+    let extraEvidence: Record<string, unknown> = {};
     switch (step.action) {
       case 'navigate': {
         await page.goto(String(value ?? ''), { timeout, waitUntil: 'load' });
@@ -179,7 +184,9 @@ export async function performAction(
         const buf = await page.screenshot({ fullPage: false });
         const art = ctx.artifacts.save(`shot-${Date.now()}.png`, buf);
         ctx.vars['lastArtifact'] = art.artifactId;
-        return { evidence: { screenshot: art.artifactId }, artifactId: art.artifactId };
+        artifactId = art.artifactId;
+        extraEvidence = { screenshot: art.artifactId };
+        break;
       }
       default: {
         const never: never = step.action;
@@ -187,7 +194,6 @@ export async function performAction(
       }
     }
 
-    let artifactId: string | undefined;
     if (downloadPromise) {
       const download = await downloadPromise;
       const suggested = download.suggestedFilename();
@@ -202,7 +208,7 @@ export async function performAction(
       ctx.vars['lastArtifact'] = artifactId;
     }
 
-    const verdict = await verifyExpects(page, step.expect, { vars: ctx.vars, lastDownload: { artifactId } }, timeout);
+    const verdict = await verifyExpects(page, step.expect ?? [], { vars: ctx.vars, lastDownload: { artifactId } }, timeout);
     if (!verdict.ok) {
       ctx.ledger.finished(step, ctx.actionRevision, 'failed', { reason: 'postcondition', failures: verdict.failures });
       throw err('ACTION_FAILED', `后置条件未通过: ${verdict.failures.map((f) => f.reason).join('; ')}`.slice(0, 300), {
@@ -210,8 +216,8 @@ export async function performAction(
       });
     }
     // 结果落账：verified/failed/unknown 三态必须收口（DESIGN §9.1）
-    ctx.ledger.finished(step, ctx.actionRevision, 'verified', { url: page.url() });
-    return { evidence: { url: page.url() }, artifactId };
+    ctx.ledger.finished(step, ctx.actionRevision, 'verified', { url: page.url(), ...extraEvidence });
+    return { evidence: { url: page.url(), ...extraEvidence }, artifactId };
   } catch (e) {
     if (e instanceof JevError && e.code === 'ACTION_FAILED' && (e.details as { failures?: unknown } | undefined)?.failures !== undefined) {
       throw e; // 后置条件失败已在上方落账，直接上抛
@@ -220,7 +226,7 @@ export async function performAction(
     if (isTimeout) {
       // 超时 ≠ 未执行：先核实后置状态（DESIGN §6.4）
       try {
-        const verdict = await verifyExpects(page, step.expect, { vars: ctx.vars }, Math.min(timeout, 5000));
+        const verdict = await verifyExpects(page, step.expect ?? [], { vars: ctx.vars }, Math.min(timeout, 5000));
         if (verdict.ok) {
           ctx.ledger.finished(step, ctx.actionRevision, 'verified', { url: page.url(), verifiedAfterTimeout: true });
           return { evidence: { url: page.url(), verifiedAfterTimeout: true } };

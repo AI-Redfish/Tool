@@ -454,7 +454,23 @@ export class Runtime {
     const allowedOrigins: string[] = session ? JSON.parse(session.allowedJson) : [];
     const modelOrigins: string[] = session ? JSON.parse(session.modelJson) : [];
     const artifactsDir = path.join(this.cfg.runtime.dataDir, 'artifacts', taskId);
-    const artifacts: ArtifactSink = new FsArtifactSink(artifactsDir);
+    // 实测发现：FsArtifactSink 只写盘不登记，listArtifacts/artifactPath 全部为空——
+    // 这里包一层，保存后原子登记进同一事务库（putArtifact）。
+    const disk = new FsArtifactSink(artifactsDir);
+    const register = (m: ArtifactMeta): ArtifactMeta => {
+      this.store.putArtifact({
+        artifactId: m.artifactId, taskId,
+        filename: m.filename, size: m.size, sha256: m.sha256,
+        path: path.join(artifactsDir, `${m.artifactId}-${m.filename}`),
+        createdAt: this.clock.now(),
+      });
+      return m;
+    };
+    const artifacts: ArtifactSink = {
+      save: (filename, data) => register(disk.save(filename, data)),
+      saveDownload: (filename, tmpPath) => register(disk.saveDownload(filename, tmpPath)),
+      dir: () => disk.dir(),
+    };
 
     const pullUsage = () => {
       const ju = this.judge.usage();
@@ -944,10 +960,32 @@ export class Runtime {
     this.pruneArtifacts();
     const unresolved = this.store.unresolvedActions();
     for (const a of new Set(unresolved.map((u) => u.taskId))) {
-      this.store.setActionState(a, this.store.maxActionSeq(a), 'unknown', undefined, JSON.stringify({ reason: 'host_crash' }));
+      const t = this.store.getTask(a);
+      if (t?.status === 'done') {
+        // done 任务的未收口行是账本滞后（任务级验收已通过，每步实际都验证成功），安全结算而非隔离
+        for (const u of this.store.unresolvedActionsByTask(a)) {
+          this.store.setActionState(a, u.seq, 'verified', undefined, JSON.stringify({ reason: 'task_done_settle' }));
+        }
+      } else {
+        this.store.setActionState(a, this.store.maxActionSeq(a), 'unknown', undefined, JSON.stringify({ reason: 'host_crash' }));
+      }
     }
-    if (unresolved.length > 0) {
-      this.store.kvSet(`isolation:${this.profileKey()}`, JSON.stringify({ taskId: unresolved[0].taskId, at: Date.now(), reason: 'host_crash' }));
+    // 隔离标记自愈：被隔离任务若已 done，其 unknown 行一并结算后解除隔离（实测修复：历史遗留无法自清）
+    const isoRaw = this.store.kvGet(`isolation:${this.profileKey()}`);
+    if (isoRaw) {
+      const isoTaskId = (JSON.parse(isoRaw) as { taskId?: string }).taskId;
+      const isoTask = isoTaskId ? this.store.getTask(isoTaskId) : undefined;
+      if (isoTask?.status === 'done') {
+        for (const u of this.store.unknownActionsByTask(isoTaskId!)) {
+          this.store.setActionState(isoTaskId!, u.seq, 'verified', undefined, JSON.stringify({ reason: 'task_done_settle' }));
+        }
+        this.store.kvDel(`isolation:${this.profileKey()}`);
+      }
+    }
+    // 只对仍真实未收口的（非 done 任务）播种隔离；done 任务已结算不应再隔离
+    const stillUnresolved = unresolved.filter((u) => this.store.getTask(u.taskId)?.status !== 'done');
+    if (stillUnresolved.length > 0) {
+      this.store.kvSet(`isolation:${this.profileKey()}`, JSON.stringify({ taskId: stillUnresolved[0].taskId, at: Date.now(), reason: 'host_crash' }));
     }
     let recovered = 0;
     let expired = 0;

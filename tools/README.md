@@ -7,15 +7,14 @@
 - **TypeScript（默认约定）**：每个子目录是一个独立的 **core + cli + mcp 三包工作区**（pnpm/npm workspace + TypeScript 工程引用），例如 `server-a`；
 - **任意语言**：在子目录放一个 `launcher.json` 声明启动方式即可被启动器拉起，例如 `server-py`（纯 Python 标准库，与 server-a 同构的 core + cli + mcp 分层）。
 
-## 规划中的工具
+## 已实现工具
 
-`jev-browser/` 当前仅包含浏览器工具的设计与开发计划，拟采用 `core + cli + mcp + api` 分层，并共享 `execute` / `run` 执行引擎。尚未创建包配置或运行入口，因此不会出现在启动器的可用工具列表中。
+- [`server-a/`](server-a/README.md)：多入口工具最小示例（TypeScript，`core + cli + mcp` 三包工作区，echo/now），本目录分层约定的参考实现。
+- [`server-py/`](server-py/README.md)：同构 Python 标准库版（`core.py + cli.py + mcp_server.py` + `launcher.json`），演示任意语言工具接入。
+- [`jev-browser/`](jev-browser/README.md)：浏览器控制工具（Playwright + Jev，`core + cli + mcp + api` 四包工作区，execute/run 双模式共用执行引擎）。**核心已实现**：62 个离线测试通过；launch 路径（受管 Chromium）端到端冒烟通过（`scripts/smoke.mjs`）；attach 接管日常 Chrome 待用户授权后专项验证（见 [docs/compatibility.md](jev-browser/docs/compatibility.md)），此前勿用于生产。
+- [`jev-desktop/`](jev-desktop/README.md)：Windows 桌面控制工具（UIA 观察 + Jev 判断 + 规划 LLM，Python 实现 `core + cli + mcp` + `launcher.json`）。**已实现并通过本地端到端验证**（离线测试/真实窗口快照/execute 全链路/Jev mock 联调/MCP 协议，见其 README 实机验证记录）；SendInput 输入类动作待真人监督实测，OCR 为可选依赖。
 
-阅读顺序：[方案总览](jev-browser/README.md) → [技术设计](jev-browser/DESIGN.md) → [开发计划](jev-browser/DEVELOPMENT_PLAN.md)；事实依据与待验证项见 [研究记录](jev-browser/RESEARCH.md)。
-
-`jev-desktop/` Windows 桌面控制工具：LLM 规划 + Jev 判断，UIA 语义树与截图/OCR/视觉三档可降级观察，`execute` / `run` 双模式共用执行引擎，Python 实现（`core + cli + mcp` + `launcher.json`），MCP + CLI 入口。**已实现并通过本地端到端验证**（UIA 快照/语义动作/SendInput 中文输入/剪贴板/截图/OCR/ref 活性校验/execute 流程/run 有界 ReAct mock 联调/MCP 协议），OCR 为可选依赖（`requirements-ocr.txt`）。
-
-阅读顺序：[方案总览](jev-desktop/README.md) → [技术设计](jev-desktop/DESIGN.md) → [开发计划](jev-desktop/DEVELOPMENT_PLAN.md)；事实依据与待验证项见 [研究记录](jev-desktop/RESEARCH.md)。
+阅读顺序（两者同构）：[方案总览](jev-browser/README.md) → [技术设计](jev-browser/DESIGN.md) → [开发计划](jev-browser/DEVELOPMENT_PLAN.md) → [兼容性验证](jev-browser/docs/compatibility.md)；事实依据见 [RESEARCH](jev-browser/RESEARCH.md) / [jev-desktop RESEARCH](jev-desktop/RESEARCH.md)。
 
 ## TypeScript 工具的目录结构（以 server-a 为例）
 

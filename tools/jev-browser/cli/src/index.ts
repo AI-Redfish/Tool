@@ -265,7 +265,13 @@ async function main(): Promise<void> {
     }
 
     case 'execute': {
-      const raw = readJson(str(args.flags, 'file') ?? str(args.flags, 'steps'), 'steps');
+      const raw0 = readJson(str(args.flags, 'file') ?? str(args.flags, 'steps'), 'steps');
+      // 容两种输入：裸 FlowStep 数组，或完整 flow 对象 {schemaVersion, steps}（与 jev-desktop CLI 同约定）
+      const raw = Array.isArray(raw0)
+        ? raw0
+        : (raw0 !== null && typeof raw0 === 'object' && Array.isArray((raw0 as { steps?: unknown }).steps))
+          ? (raw0 as { steps: unknown[] }).steps
+          : raw0;
       const values = readJson(str(args.flags, 'values'), 'values') as Record<string, ValueInput> | undefined;
       const input = { steps: raw, values: values ?? {} };
       validateExecuteSteps(input.steps as never);
