@@ -1,10 +1,14 @@
-# jev-browser —— 浏览器控制工具（Playwright + Jev）
+# 技术原理
+
+浏览器控制工具（Playwright + Jev）。
 
 > `core + cli + mcp + api` 四包工作区；确定性步骤（execute）与自主目标（run）共用同一执行引擎。版本 `0.1.0`。
 
-## 技术原理
 
-### 总体分层：一个核心，三个薄适配器
+
+## 总体分层
+
+**一个核心，三个适配器**
 
 ```text
 CLI（node cli/dist/index.js）   MCP（stdio, 14 工具）   HTTP API（loopback+token）
@@ -20,9 +24,21 @@ CLI（node cli/dist/index.js）   MCP（stdio, 14 工具）   HTTP API（loopbac
 
 CLI、MCP、HTTP API 只是三种协议翻译层，行为与输出契约（TaskEnvelope）完全一致。
 
-### 两种入口模式与三个执行器的关系（易混点，重点）
 
-先分清两个概念：**入口模式**（execute / run，调用者显式选择）与**执行器**（core 里的三个类，内部组件）。对应关系：
+
+## 两种入口模式与三个执行器
+
+**入口模式**
+
+execute和run，外部工具如CLI的命令入口。
+
+如CLI有execute和run两种子命令。
+
+
+
+**执行器**
+
+core 里的三个类，内部组件。
 
 | 执行器 | 是什么 | 模型调用 | 什么时候被用到 |
 |---|---|---|---|
@@ -30,18 +46,35 @@ CLI、MCP、HTTP API 只是三种协议翻译层，行为与输出契约（TaskE
 | `GoalExecutor` | `kind:"goal"` 步骤的处理器：Jev 局部语义循环（观察→Jev 判断→执行一个动作→差量再观察） | 每轮调 Jev | **既不专属 execute 也不专属 run**：FlowExecutor 执行中遇到 `goal` 步骤就转入它（两入口的步骤里都可含 goal） |
 | `Planner` | 计划生成器：把 goal+successCriteria 拆成 FlowStep[] | 每次规划 1 次 | **仅 run 入口**在开工前调用一次；产出的计划仍交回 FlowExecutor 执行 |
 
-```text
-execute 入口：steps ──────────────→ FlowExecutor（goal 步骤 → GoalExecutor）
-run 入口：  goal+successCriteria → Planner 产计划 → FlowExecutor（goal 步骤 → GoalExecutor）
-                                   ↑ 计划只能用已定义的步骤类型（schema 白名单），B 模式不是另一套引擎
-```
 
-两个容易搞错的细节：
 
-- **"execute 是确定性的"指默认路径**：步骤里没有 `goal` 时全程 0 模型调用；含 `goal` 步骤时该步骤进入 GoalExecutor（需 Jev key，缺 key 报 `JEV_NOT_CONFIGURED`）。
-- **run 的任务级验收不是 GoalExecutor 做的**：规划步骤全部执行完后，Runtime 单独调一次 `judge.check(...)`（Noul 闭集判断，`p ≥ jev.doneAt` 才落 `done`，否则暂停 `likely_done`）。GoalExecutor 返回的验证只是 goal **步骤级**的。
+**run任务两层验收**
 
-### 变量体系（values 与 vars 是两个命名空间）
+ ```
+   run 任务的时间线：
+
+   Planner 产计划 → FlowExecutor 逐步执行
+                       │
+                       ├─ 遇到 goal 步骤 → GoalExecutor 循环
+                       │     └【第 1 层：步骤级验证】
+                       │       judge.decideRound() 判断"这一步做完了吗"
+                       │       → 返回 verification → 该步骤标 done → 继续下一步
+                       │
+                       ▼
+                 所有步骤都 done 了
+                       │
+                       ├【第 2 层：任务级验收】← 误解高发区
+                       │   Runtime 自己调 judge.check(
+                       │     `任务级验收：${successCriteria}`)
+                       │   p ≥ doneAt → 任务落 done
+                       │   p < doneAt → 暂停 likely_done（步骤全成功也没用！）
+                       ▼
+                    任务结束
+ ```
+
+
+
+## 变量体系（values 与 vars 是两个命名空间）
 
 | 命名空间 | 来源 | 内容 | 谁能读 |
 |---|---|---|---|
