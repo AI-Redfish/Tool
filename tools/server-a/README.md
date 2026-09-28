@@ -1,76 +1,108 @@
 # server-a —— 多入口工具最小示例（TypeScript）
 
-> 本仓库「一个工具，多种提供方式」约定的 TypeScript 参考实现：`core + cli + mcp` 三包工作区。
-> 自带两个示例工具：`echo`（回显消息）、`now`（服务器 UTC 时间）。
+> `core + cli + mcp` 三包工作区；示例工具：`echo`（回显）、`now`（UTC 时间）。版本 `0.1.0`。
 
-## 底层实现原理
+## 技术原理
 
-### 1. 分层：core 是唯一事实来源，适配器只做转发
+### 分层与调用链（谁调用谁）
 
 ```text
-                 ┌─────────────────────────────┐
-                 │ core（@ai-redfish/server-a-core）        │
-                 │  · 纯业务函数 echo()/now()              │
-                 │  · TOOLS 元数据（名称/描述/参数列表）      │
-                 └──────────┬──────────────────┘
-              ┌─────────────┴─────────────┐
-   cli/src/index.ts                mcp/src/index.ts
-   （argv 解析 → runTool）           （zod schema → 注册 handler）
+                 ┌──────────────────────────────────────┐
+                 │ core（@ai-redfish/server-a-core）                │
+                 │  · 纯业务函数 echo()/now()                      │
+                 │  · TOOLS 元数据（名称/描述/参数列表）              │
+                 │  · runTool(name, args) 统一分发 + 参数校验        │
+                 └──────────┬───────────────────┬──────┘
+              ┌─────────────┴─────┐      ┌──────┴──────────────┐
+   cli/src/index.ts          mcp/src/index.ts
+   argv 解析 → buildToolArgs     MCP SDK 收 tools/call
+   → runTool → 纯函数            → handler → 同一纯函数
 ```
 
-- **core 零传输依赖**：不 import 任何 CLI/MCP/IO 库，只有纯函数 + 工具元数据（`ToolMeta[]`：name/description/params）。
-- **TOOLS 元数据单一事实来源**：CLI 的子命令、参数帮助文案，MCP 的工具名/描述/zod schema，全部从同一份 `TOOLS` 生成——两侧文案与行为**结构上不可能漂移**（新增工具只需改 core 一处）。
-- **统一分发入口 `runTool(name, args)`**：参数校验（必填/类型）失败抛带原因的错误，两个适配器共享同一套报错行为。
+两条入口的调用链完全对称，业务实现只有一份：
 
-### 2. CLI 适配器（`cli/src/index.ts`）
+| 入口 | 调用链 |
+|---|---|
+| CLI | `argv` → `parseCliArgs`（`--name value` / `--name=value` / 位置参数）→ `buildToolArgs`（按 TOOLS 元数据：命名优先、位置按声明顺序补缺、必填校验）→ `runTool` → `echo()/now()` |
+| MCP | 客户端 `tools/call {name, arguments}` → SDK 校验 zod schema → handler → **同一个** `echo()/now()` |
 
-极简 argv 解析，同时支持三种传参形式：`--name value`、`--name=value`、位置参数；`list` 子命令从 `TOOLS` 自动生成。错误统一写 stderr，退出码：0 成功 / 1 错误。
+### 关键机制
 
-### 3. MCP 适配器（`mcp/src/index.ts`）
+1. **TOOLS 元数据是单一事实来源**：CLI 的子命令清单、参数帮助文案，MCP 的工具名/描述/参数 schema，全部从 core 的 `TOOLS: ToolMeta[]` 生成。两侧文案与行为**结构上不可能漂移**——新增工具只改 core 一处。
+2. **core 零传输依赖**：不 import 任何 CLI/MCP/IO 库。这就是"逻辑一样、对外方式不同"能成立的原因：适配器只做协议翻译，不含业务。
+3. **参数校验双层**：CLI 侧 `buildToolArgs` + `runTool` 校验（必填/类型）；MCP 侧 zod schema 由 SDK 在协议层校验。报错文案同源（`runTool` 的错误）。
+4. **stdio 纪律**：MCP 模式下 **stdout 是 JSON-RPC 协议通道**，服务自身日志一律 `console.error`（stderr）。任何往 stdout 打日志的改动都会破坏协议。
+5. **启动器发现机制**：仓库根 `bin/tool-launcher.js` 识别"workspace 布局"——工具目录下存在 `mcp/dist/index.js`（构建产物）即可被拉起，无需声明文件；缺产物时启动器自动 `install + tsc -b`。
 
-官方 `@modelcontextprotocol/sdk` + `StdioServerTransport`（stdio 传输）。**stdout 是 JSON-RPC 协议通道**，服务自身日志一律 `console.error`（stderr）。工具名/描述复用 `TOOLS`，参数用 zod 声明（运行时校验由 SDK 完成）。
+## 使用步骤
 
-### 4. 启动器如何发现它
+### 步骤 0：前置与构建
 
-仓库根 `bin/tool-launcher.js` 按「workspace 布局」识别：存在 `mcp/dist/index.js`（TypeScript 构建产物）即可以 MCP 方式拉起，无需任何额外声明文件。
-
-## 接入方式与使用步骤
-
-### 方式一：构建 + CLI
+| 项 | 要求 |
+| --- | --- |
+| Node.js | ≥ 18 |
+| 包管理器 | pnpm（优先）或 npm（均支持 workspaces） |
 
 ```powershell
 cd tools/server-a
-npm install && npm run build        # 或 pnpm install && pnpm build（需要 Node ≥ 18）
+npm install && npm run build        # 或 pnpm install && pnpm build
 ```
 
-构建成功标志：各包出现 `dist/`（`core/dist`、`cli/dist`、`mcp/dist`）。常见问题：`Cannot find module '@ai-redfish/server-a-core'` = 没装依赖或没构建，重跑上面两步。
-
-每条命令的预期输出：
+构建成功标志：`core/dist`、`cli/dist`、`mcp/dist` 三个目录出现。验证：
 
 ```powershell
-node cli/dist/index.js list                          # 列出工具
+node cli/dist/index.js list         # 能打印工具清单即成功
+```
+
+工作区 npm scripts：
+
+| 命令 | 作用 |
+| --- | --- |
+| `npm run build` / `npm run clean` | 构建 / 清理（`tsc -b`，按 core→cli/mcp 顺序） |
+| `npm run start:mcp` / `start:cli` | 直接启动对应适配器 |
+
+### 步骤 1：CLI 使用
+
+入口：`node cli/dist/index.js <命令> [参数...]`（下称 `cli`）。
+
+**全局命令**：
+
+| 命令 | 作用 | 预期输出 |
+|---|---|---|
+| `help` / `-h` / `--help`（或无参数） | 用法（工具清单自动生成） | 用法文本 |
+| `-v` / `--version` | 版本 | `server-a-cli v0.1.0` |
+| `list` / `-l` / `--list` | 工具清单 | 见下 |
+
+```powershell
+node cli/dist/index.js list
 # [server-a] 可用工具：
 #   - echo    原样返回输入的消息（server-a 示例工具）
 #   - now     返回服务器当前时间（server-a 示例工具）
-
-node cli/dist/index.js echo "hello"                  # → [server-a] echo: hello
-node cli/dist/index.js echo --message "hello"        # 同上（命名参数）
-node cli/dist/index.js echo --message=hello          # 同上（等号形式）
-node cli/dist/index.js now                           # → [server-a] server time: 2026-…T…Z
-node cli/dist/index.js echo                          # 缺必填参数 → stderr 报错，退出码 1
 ```
 
-`list` 与帮助文案由 core 的 `TOOLS` 元数据自动生成，无需手动同步。
+**工具命令与参数**：
 
-### 方式二：stdio MCP Server
+| 命令 | 参数 | 类型 | 必填 | 预期输出 |
+|---|---|---|---|---|
+| `echo` | `message` | string | 是 | `[server-a] echo: <message>` |
+| `now` | — | — | — | `[server-a] server time: <ISO 8601>` |
 
-直接拉起（MCP 客户端配置里指向构建产物）：
+`echo` 三种等价传参（`--name value` / `--name=value` / 位置参数；命名优先）：
 
 ```powershell
-node mcp/dist/index.js        # 启动后无 stdout 输出（stdout 是协议通道），启动日志在 stderr
+node cli/dist/index.js echo "hello"                 # → [server-a] echo: hello
+node cli/dist/index.js echo --message "hello"       # 同上
+node cli/dist/index.js echo --message=hello         # 同上
+node cli/dist/index.js now                          # → [server-a] server time: 2026-…T…Z
 ```
 
-在 MCP 客户端（Claude Desktop / pi 等）注册：
+**退出码**：`0` 成功（含 help/list/version）；`1` 未知工具 / 缺必填参数（stderr 报错，如 `工具 "echo" 缺少 string 类型的必填参数 "message"`）。
+
+**排错**：`Cannot find module '@ai-redfish/server-a-core'` → 没装依赖或没构建，重跑步骤 0。
+
+### 步骤 2：MCP 使用
+
+① 启动/注册（客户端配置，路径必须是构建产物的**绝对路径**）：
 
 ```json
 {
@@ -83,30 +115,48 @@ node mcp/dist/index.js        # 启动后无 stdout 输出（stdout 是协议通
 }
 ```
 
-> 路径必须绝对路径且指向**构建后**的 `dist/index.js`；客户端不继承你的 shell 工作目录。
+② 可用工具（`tools/list` 应返回这 2 个）：
 
-注册后可用工具：`echo`（参数 `message: string`）、`now`。验证方法：客户端连接后 `tools/list` 应返回这 2 个工具；手动冒烟可向进程 stdin 写一行 initialize JSON-RPC 观察应答（参见仓库内其它工具的 MCP 握手测试）。
+| 工具 | 参数 | 类型 | 必填 |
+|---|---|---|---|
+| `echo` | `message` | string | 是 |
+| `now` | — | — | — |
 
-异常排查：客户端连不上 → 先确认 `node mcp/dist/index.js` 能常驻不退出（报 MODULE_NOT_FOUND = 未构建/未装依赖）；stdio 模式下任何往 stdout 打日志的改动都会破坏协议，日志一律 `console.error`。
+服务器信息：`name=server-a`，`version=0.1.0`；能力声明 `tools`。
 
-### 方式三：仓库统一启动器
+③ 手动冒烟（PowerShell，不依赖客户端）：
+
+```powershell
+@'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+'@ | node mcp/dist/index.js
+# 第 2 帧应答应包含 echo / now
+```
+
+启动日志只在 stderr（`[server-a] MCP 服务已启动（stdio 传输）`）；stdout 无任何输出属正常（协议通道）。
+
+### 步骤 3：仓库启动器（统一 MCP 入口）
 
 ```powershell
 cd D:\develop\GitNote\Redfish-AI\Tool
-node bin/tool-launcher.js list                 # 确认识别 server-a（workspace 布局：存在 mcp/dist/index.js）
-node bin/tool-launcher.js server-a             # 以 MCP 方式拉起（缺 dist 会先触发自动构建）
+node bin/tool-launcher.js list             # 应列出 server-a
+node bin/tool-launcher.js build server-a   # 只装依赖并构建（可选）
+node bin/tool-launcher.js server-a         # 以 MCP stdio 拉起（缺 dist 自动构建）
 ```
 
-验证：`list` 输出应包含 `server-a`；拉起后进程常驻（stdio 服务不会主动退出），Ctrl+C 结束。
+拉起后进程常驻（stdio 服务不主动退出），Ctrl+C 结束。
 
-## 如何扩展一个新工具
+### 步骤 4（可选）：全局安装 CLI 命令
 
-1. `core/src/index.ts`：写纯函数 + 在 `TOOLS` 数组加一条元数据；
-2. `mcp/src/index.ts`：按元数据注册 handler（zod schema 对齐参数类型）；
-3. `cli/src/index.ts`：`runTool` 分发已自动覆盖（若用统一分发入口），无需改动；
-4. `npm run build` 后两个入口同时生效。
+```powershell
+cd tools/server-a/cli
+npm link                        # 或 pnpm link --global（需先 pnpm setup）
 
-## 文档导航
+server-a-cli list               # 任意目录可用，行为与 node cli/dist/index.js 一致
+server-a-cli echo --message=hi
+npm rm -g @ai-redfish/server-a-cli    # 卸载（Windows 若 bin shim 残留手动删）
+```
 
-- 上层约定：[../README.md](../README.md)（工具目录结构与启动器协议）
-- 同构 Python 实现：[../server-py/README.md](../server-py/README.md)
+> 必须用 link 而非 `npm install -g .`：`@ai-redfish/server-a-core` 是未发布的 workspace 私有包，link 才能从仓库内解析依赖。链接指向源码，`cli/dist` 被删后需重新 `npm run build`。

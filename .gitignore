@@ -5,6 +5,9 @@
 # ===== 依赖目录（pnpm/npm install 可再生） =====
 node_modules/
 
+# ===== Python 工具的 uv 虚拟环境（uv sync 可再生；uv.lock 为锁定文件应托管） =====
+.venv/
+
 # ===== Python 字节码缓存（可再生） =====
 __pycache__/
 *.py[cod]

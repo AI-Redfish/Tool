@@ -109,7 +109,7 @@ tools/
 | `command` | 是 | 启动命令（任意可执行程序，如 `python`、`./server-go`） |
 | `args` | 否 | 启动参数数组（客户端透传的额外参数会追加在后面） |
 | `description` | 否 | 一句话简介（启动器 `list` 展示） |
-| `setup` | 否 | 环境准备命令数组（如 `["pip","install","-r","requirements.txt"]`），由 `build` 子命令触发 |
+| `setup` | 否 | 环境准备命令数组（如 `["uv","sync"]`，Python 工具经 uv 建 .venv），由 `build` 子命令触发 |
 
 ## 新增一个能力（工具的某个功能，以 server-a 为例）
 
@@ -132,3 +132,4 @@ tools/
 - 非 UTF-8 默认编码的语言/平台（如 Windows 上的 Python）注意强制 stdout 为 UTF-8，参见 server-py 的做法；
 - 工具通过环境变量 `TOOL_NAME` 可获知自己的工具名；
 - TypeScript 工具需要Node.js >= 18；包管理器优先 pnpm，未安装时回退 npm（两种管理器都支持 workspaces）。
+- Python 工具的环境统一由 uv 管理：`uv sync` 在工具目录创建隔离的 `.venv`（依赖声明在 `pyproject.toml`，OCR 等可选依赖用 `--extra`），`uv run` 运行（launcher.json 的 command/setup 同理）；不直接使用 pip，缺 uv 时先安装（https://docs.astral.sh/uv/）。

@@ -51,7 +51,7 @@ function isWorkspace(toolDir) {
  *     "description": "…",          // 可选，list 时展示
  *     "command": "python",          // 启动命令（任意可执行程序）
  *     "args": ["mcp_server.py"],    // 启动参数
- *     "setup": [["pip", "install", "…"]]  // 可选，build 子命令时执行的环境准备命令
+ *     "setup": [["uv", "sync"]]      // 可选，build 子命令时执行的环境准备命令
  *   }
  */
 function readLauncherManifest(toolDir) {

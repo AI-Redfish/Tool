@@ -55,7 +55,7 @@ def _get_engine():
             return engine
         except Exception as e:
             raise err("OCR_UNAVAILABLE",
-                      f"rapidocr 不可用：{e}。请安装 OCR 依赖：pip install -r requirements-ocr.txt"
+                      f"rapidocr 不可用：{e}。请安装 OCR 依赖：uv sync --extra ocr（在 tools/jev-desktop/ 下）"
                       "（或改用 vlm 档）")
 
 

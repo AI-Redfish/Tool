@@ -32,7 +32,7 @@ def to_png_bytes(screen) -> bytes:
     except Exception:
         pass
     if mss is None:
-        raise err("UIA_UNAVAILABLE", "mss 未安装：pip install -r requirements.txt")
+        raise err("UIA_UNAVAILABLE", "mss 未安装：uv sync（在 tools/jev-desktop/ 下）")
     from PIL import Image
     img = Image.frombytes("RGB", screen.size, screen.rgb)
     buf = io.BytesIO()

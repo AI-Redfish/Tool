@@ -1,0 +1,34 @@
+# jev-desktop —— uv 项目定义（uv sync / uv run；DESIGN §3 依赖锁定）
+#
+# 本项目是「虚拟项目」（无 [build-system]）：不打包安装自身，仅声明依赖并由 uv 管理
+# 工具目录下隔离的 .venv；`uv run cli.py …` / `uv run mcp_server.py` 就地运行，
+# launcher.json 与 MCP 客户端注册同理（uv run 自动发现并复用 .venv）。
+#
+# 说明：
+# - 官方 typesafe-sdk 未采用：bocha/vercel/zen/custom 均为协议同构端点
+#   （POST {baseUrl}/v1/systemone），统一走 core/judge.py 的薄 httpx 适配，
+#   避免为多预设维护两套客户端（DESIGN §6.1 的 P0 备选路径）。
+# - MCP 传输层为标准库手写 JSON-RPC（tools/README 的多语言工具模式），
+#   不依赖 mcp SDK 版本（1.x→2.x 已发生 FastMCP 破坏性改名）。
+[project]
+name = "jev-desktop"
+version = "0.1.0"
+description = "Windows 桌面软件控制工具（UIA 观察 + Jev 判断 + 规划 LLM），MCP + CLI 双入口"
+requires-python = ">=3.9"
+dependencies = [
+    # UIA 语义树与 Pattern 动作（ADR-06 主选）
+    "uiautomation==2.0.29",
+    # 截图（三档观察共用的图像通道）
+    "mss==10.2.0",
+    "Pillow>=10.0",
+    # Jev / 规划器 / VLM 的 HTTP 客户端（薄适配，统一重试收口）
+    "httpx>=0.27,<0.29",
+]
+
+[project.optional-dependencies]
+# OCR 档可选依赖（DESIGN §3：rapidocr v3 统一包；首次使用懒加载模型）。
+# 未启用（uv sync 不带 --extra ocr）时：ocr 档返回 OCR_UNAVAILABLE，
+# auto 档自动跳过 OCR，其余功能不受影响。
+ocr = [
+    "rapidocr>=3.9,<4",
+]

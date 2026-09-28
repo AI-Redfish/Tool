@@ -92,7 +92,7 @@ https://github.com/lahfir/agent-desktop
 ### 5.1 假设（未验证，不阻塞设计但阻塞实现）
 
 1. 用户提供/将申请 Jev key（TYPESAFE_API_KEY 或博查等价物）与规划 LLM 的 OpenAI 兼容端点；具体厂商未知，故全配置化。
-2. 用户在 Windows 原生侧有 Python ≥3.10 环境（`python` 命令可达）；启动器 `setup` 用 `pip install` 直装（无 venv 隔离），若用户环境冲突需自行建 venv 并改 `launcher.json` 的 `command` 为 venv python 绝对路径——该权衡将在 P1 交付说明中写明。
+2. 用户在 Windows 原生侧装有 uv（`uv` 命令可达，https://docs.astral.sh/uv/）；依赖经 `uv sync` 装入工具目录下隔离的 `.venv`（`pyproject.toml` 声明，OCR 为 `--extra ocr`），launcher.json `command` 为 `uv run mcp_server.py` 自动复用该环境——已替代早期“pip 直装无 venv”假设（2026-09 项目化落地）。
 3. jarvis 预设端点的协议同构性以其 README 自述为准；`zen`/`bocha` 的真实请求/响应差异 P0 实测。
 4. 本工具用于用户本人设备与账号的自动化，合规责任在使用者；文档如实声明数据外发边界，不承诺对企业管控环境兼容。
 

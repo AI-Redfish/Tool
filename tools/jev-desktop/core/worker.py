@@ -134,7 +134,7 @@ class UiaWorker:
                 import uiautomation  # noqa: PLC0415
             except Exception as e:  # ImportError 或 comtypes 初始化失败
                 raise err("UIA_UNAVAILABLE",
-                          f"uiautomation 导入失败：{e}。请先安装依赖：pip install -r requirements.txt（含 uiautomation==2.0.29）")
+                          f"uiautomation 导入失败：{e}。请先安装依赖：uv sync（含 uiautomation==2.0.29；在 tools/jev-desktop/ 下）")
             return uiautomation
 
         mod = self.call(_do, 30.0, "导入 uiautomation")
@@ -149,7 +149,7 @@ class UiaWorker:
             try:
                 import mss  # noqa: PLC0415
             except Exception as e:
-                raise err("UIA_UNAVAILABLE", f"mss 导入失败：{e}。请先安装依赖：pip install -r requirements.txt")
+                raise err("UIA_UNAVAILABLE", f"mss 导入失败：{e}。请先安装依赖：uv sync（在 tools/jev-desktop/ 下）")
             return mss
 
         mod = self.call(_do, 30.0, "导入 mss")

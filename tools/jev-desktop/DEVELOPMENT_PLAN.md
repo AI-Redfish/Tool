@@ -132,7 +132,7 @@ P6 基准、文档与发布准备
 
 - [ ] bench：可重置任务集（fixture 优先）×（execute/run）×（uia/ocr 档），记录成功率/耗时/tokens；不宣称通用成功率。
 - [ ] README 定稿（拟议契约 → 实测能力）；RESEARCH/DESIGN 回填实测数据；根索引与 tools/README 更新可用工具表。
-- [ ] `pyproject.toml`（`[project.scripts] jev-desktop-cli`）支持 pipx 安装；launcher.json 最终核对（stdout 纪律、cwd、setup 幂等）。
+- [ ] 发布打包：`pyproject.toml` 已用于 uv 依赖管理（虚拟项目，`uv sync`/`uv run` 就地运行）；仍需补 `[build-system]` 与 `[project.scripts] jev-desktop-cli` 支持 pipx 安装；launcher.json 最终核对（stdout 纪律、cwd、setup 幂等）。
 - [ ] 安全姿态 A 的数据边界声明落文档；动作账本留存期与清理说明。
 
 ### 退出门槛

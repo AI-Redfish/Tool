@@ -50,12 +50,12 @@ def run_doctor(ctx, *, with_network: bool = False) -> dict:
     # UIA
     uia_ok, uia_detail = _check_uia(ctx)
     add("uia", uia_ok, uia_detail,
-        supported=uia_ok, hint=None if uia_ok else "pip install -r requirements.txt")
+        supported=uia_ok, hint=None if uia_ok else "uv sync（在 tools/jev-desktop/ 下）")
 
     # 截图
     shot_ok, shot_detail = _check_screenshot(ctx)
     add("screenshot", shot_ok, shot_detail,
-        supported=shot_ok, hint=None if shot_ok else "pip install -r requirements.txt（mss）")
+        supported=shot_ok, hint=None if shot_ok else "uv sync（mss；在 tools/jev-desktop/ 下）")
 
     # OCR
     try:
@@ -63,7 +63,7 @@ def run_doctor(ctx, *, with_network: bool = False) -> dict:
         avail = ocr_mod.backend_available()
         add("ocr", avail, "rapidocr 可用（首次使用会懒加载模型）" if avail
             else "rapidocr 未安装：ocr 档不可用（可改用 vlm 档）",
-            supported=avail, hint=None if avail else "pip install -r requirements-ocr.txt")
+            supported=avail, hint=None if avail else "uv sync --extra ocr（在 tools/jev-desktop/ 下）")
     except Exception as e:
         add("ocr", False, f"OCR 检查失败: {e}", supported=False)
 

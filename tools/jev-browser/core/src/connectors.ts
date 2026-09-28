@@ -301,22 +301,19 @@ export class PlaywrightConnector implements BrowserConnector {
     if (b.mode === 'attach') {
       const requested = resolveAttachEndpoint(b.attach.endpoint);
       const attempts = requested === 'chrome' ? ['chrome', discoverChromeLoopbackEndpoint() ?? undefined] : [requested];
-      let lastError: unknown;
+      const failures: string[] = [];
       for (const endpoint of attempts) {
         if (!endpoint) continue;
         try {
-          const browser = endpoint === 'chrome'
-            ? await chromium.connectOverCDP('chrome', { noDefaults: b.attach.noDefaults, timeout: b.attach.timeoutMs })
-            : await chromium.connectOverCDP(endpoint, { timeout: b.attach.timeoutMs });
+          const browser = await this.connectAttachWithDeadline(endpoint, b);
           return { browser: new PwBrowserAdapter(browser), ownership: 'borrowed', kind: 'attach' };
         } catch (e) {
-          lastError = e;
+          failures.push(`${endpoint === 'chrome' ? 'chrome(channel)' : endpoint}: ${(e as Error).message.split('\n')[0].slice(0, 160)}`);
         }
       }
-      const msg = (lastError as Error | undefined)?.message.split('\n')[0].slice(0, 200) ?? '未知错误';
       throw err('BROWSER_BUSY',
-        `接管 Chrome 失败（需在 chrome://inspect/#remote-debugging 开启授权，Chrome ≥ 144，或提供已授权的 loopback endpoint）：${msg}`,
-        { details: { endpoint: requested } });
+        `接管 Chrome 失败（需在 chrome://inspect/#remote-debugging 开启授权，Chrome ≥ 144，或提供已授权的 loopback endpoint）；各次尝试：${failures.join(' | ')}`,
+        { details: { endpoint: requested, attempts: failures } });
     }
 
     // launch：本机 Chrome（channel）或 Playwright 管理的 Chromium；独立 profile 目录
@@ -345,6 +342,32 @@ export class PlaywrightConnector implements BrowserConnector {
       }
       throw err('BROWSER_BUSY', `启动浏览器失败: ${msg}`);
     }
+  }
+
+  /**
+   * attach 硬截止：Chrome 144+ 授权模式下，WS 握手会等待用户在 Chrome 内点击
+   * 「允许」授权弹窗，Playwright 自身的 timeout 不能中断该等待（否则永久卡住）。
+   * 这里用 Promise.race 施加外层硬超时；超时后吞掉原 promise 迟到的 rejection
+   * （no-op catch 分支不影响 race 本身），避免 unhandled rejection 崩溃进程。
+   */
+  private connectAttachWithDeadline(
+    endpoint: string,
+    b: JevBrowserConfig['browser'],
+  ): ReturnType<typeof chromium.connectOverCDP> {
+    const connecting = endpoint === 'chrome'
+      ? chromium.connectOverCDP('chrome', { noDefaults: b.attach.noDefaults, timeout: b.attach.timeoutMs })
+      : chromium.connectOverCDP(endpoint, { timeout: b.attach.timeoutMs });
+    connecting.catch(() => undefined); // 硬超时后迟到失败的容错分支
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(err('BROWSER_BUSY',
+          `attach ${endpoint === 'chrome' ? 'chrome(channel)' : endpoint} ${b.attach.timeoutMs}ms 内未完成连接——最常见原因：Chrome 正在等你点击连接授权弹窗（弹窗在 Chrome 窗口内，可能被其他窗口遮挡），或从未开启远程调试授权。` +
+          `请：① 在 Chrome 地址栏打开 chrome://inspect/#remote-debugging 勾选 "Allow remote debugging"，重跑并在弹窗中点「允许」；` +
+          `② 或改用 launch 模式（set JEV_BROWSER_MODE=launch）；③ 缩短本等待可用 set JEV_BROWSER_CONNECT_TIMEOUT_MS=<毫秒>`));
+      }, b.attach.timeoutMs);
+    });
+    return Promise.race([connecting, deadline]).finally(() => clearTimeout(timer)) as ReturnType<typeof chromium.connectOverCDP>;
   }
 }
 
