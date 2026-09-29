@@ -180,6 +180,23 @@ export async function performAction(
         await loc.setInputFiles([resolved], { timeout });
         break;
       }
+      case 'evaluate': {
+        // 用户已放开脚本执行限制：script 字段（或 value/valuesRef）中的 JS 直接在页面执行，无需审批
+        const script = step.script ?? (value !== undefined ? String(value) : '');
+        if (!script.trim()) {
+          throw err('INVALID_INPUT', 'evaluate 需要非空 script（script 字段或 value/valuesRef）');
+        }
+        const result = await page.evaluate(script);
+        let text: string;
+        try {
+          text = JSON.stringify(result) ?? String(result);
+        } catch {
+          text = String(result);
+        }
+        ctx.vars['lastEvaluate'] = text;
+        extraEvidence = { evaluate: text.slice(0, 2000) };
+        break;
+      }
       case 'screenshot': {
         const buf = await page.screenshot({ fullPage: false });
         const art = ctx.artifacts.save(`shot-${Date.now()}.png`, buf);
@@ -247,15 +264,13 @@ export async function performAction(
 }
 
 /** 秘密文件默认拒绝（尽力而为的启发式，DESIGN §10）。 */
-const SECRET_FILE_RE = /(^|[\\/])(\.env|.*\.kdbx)$|secret|password|credential|\.pem$|\.key$/i;
-
 const UPLOAD_ABS_RE = /^[A-Za-z]:[\\/]|^\//;
 
 /**
- * 上传文件安全检查（DESIGN §10 文件部分）：
+ * 上传文件检查（用户已放开目录白名单限制）：
  *  - 必须显式提供绝对路径（调用者显式授权具体文件）；
- *  - realpath 解析 symlink 后必须位于 allowedUploadDirs 之一（防 traversal/软链绕过）；
- *  - 秘密文件名默认拒绝；大小在已知长度时预检。
+ *  - 任意路径均可上传（不再限制 allowedUploadDirs / 秘密文件启发式）；
+ *  - 大小在已知长度时预检。
  * 未通过抛 POLICY_BLOCKED / INVALID_INPUT，动作不派发。
  */
 export async function checkUploadFile(
@@ -265,13 +280,6 @@ export async function checkUploadFile(
   const raw = step.filePath;
   if (!raw || !UPLOAD_ABS_RE.test(raw)) {
     throw err('INVALID_INPUT', `upload 需要绝对路径 filePath: ${String(raw ?? '')}`);
-  }
-  const dirs = ctx.allowedUploadDirs ?? [];
-  if (dirs.length === 0) {
-    throw err('POLICY_BLOCKED', '上传被拒绝：未配置 safety.allowedUploadDirs（默认拒绝一切上传，DESIGN §10）');
-  }
-  if (SECRET_FILE_RE.test(raw)) {
-    throw err('POLICY_BLOCKED', `上传被拒绝：疑似秘密文件（尽力而为的启发式）: ${path.basename(raw)}`);
   }
   let st: fs.Stats;
   let real: string;
@@ -284,18 +292,7 @@ export async function checkUploadFile(
   if (!st.isFile()) throw err('INVALID_INPUT', `upload 目标不是常规文件: ${raw}`);
   const maxBytes = ctx.maxUploadBytes ?? 50 * 1024 * 1024;
   if (st.size > maxBytes) {
-    throw err('POLICY_BLOCKED', `上传被拒绝：文件 ${st.size}B 超过上限 ${maxBytes}B（大小预检，DESIGN §10）`);
-  }
-  const realDirs = dirs.map((d) => {
-    try {
-      return fs.realpathSync(d);
-    } catch {
-      return path.resolve(d);
-    }
-  });
-  const inside = realDirs.some((d) => real === d || real.startsWith(d.endsWith(path.sep) ? d : d + path.sep));
-  if (!inside) {
-    throw err('POLICY_BLOCKED', `上传被拒绝：文件 realpath 不在 allowedUploadDirs 内（防 traversal/symlink 绕过）: ${path.basename(real)}`);
+    throw err('POLICY_BLOCKED', `上传被拒绝：文件 ${st.size}B 超过上限 ${maxBytes}B（大小预检）`);
   }
   return real;
 }

@@ -123,36 +123,48 @@ test('valuesRef 引用 secretRef 未解析值时拒绝', async () => {
   assert.deepEqual(entries, []);
 });
 
-// ---- upload（DESIGN §1.2/§10）：授权目录、秘密拒绝、大小预检、traversal 防护 ----
+// ---- evaluate（已放开限制）：模型脚本直接执行，返回值记入 lastEvaluate ----
 
-test('upload：授权目录内成功派发；目录未配置默认全拒；账本不动', async () => {
+test('evaluate：脚本直接执行，返回值记入 lastEvaluate，账本 verified', async () => {
+  const page = new FakePage({});
+  const { ctx, entries } = makeRecordingCtx();
+  await performAction(page, {
+    id: 'e1', kind: 'action', action: 'evaluate', script: 'document.readyState', expect: [],
+  }, ctx);
+  assert.ok(page.calls.includes('evaluate'));
+  assert.equal(ctx.vars['lastEvaluate'], 'true');
+  assert.deepEqual(entries.map((e) => e.state), ['prepared', 'in_flight', 'verified']);
+});
+
+test('evaluate：空白 script 拒绝', async () => {
+  const page = new FakePage({});
+  const { ctx } = makeRecordingCtx();
+  await assert.rejects(
+    performAction(page, { id: 'e2', kind: 'action', action: 'evaluate', script: '   ', expect: [] }, ctx),
+    /evaluate 需要非空 script/,
+  );
+  assert.equal(ctx.vars['lastEvaluate'], undefined);
+});
+
+// ---- upload（已放开限制）：任意路径可上传；仅保留大小/存在性/绝对路径预检 ----
+
+test('upload：未配置 allowedUploadDirs 也能直接派发（已放开目录白名单）；账本 verified', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'jev-up-'));
   mkdirSync(path.join(dir, 'docs'), { recursive: true });
   const file = path.join(dir, 'docs', 'report.pdf');
   writeFileSync(file, 'pdf-bytes');
 
-  // 未配置目录：POLICY_BLOCKED，账本无写入（动作未派发，DESIGN §10 默认拒绝一切上传）
+  // 不配置 allowedUploadDirs：任意路径直接上传
   {
     const page = new FakePage({ url: 'https://example.com/upload', bodyText: 'x' });
     const { ctx, entries } = makeRecordingCtx();
-    await assert.rejects(
-      performAction(page, { id: 'u1', kind: 'action', action: 'upload', target: { by: 'css', selector: 'input' }, filePath: file, expect: [] } as never, ctx),
-      (e: unknown) => (e as { code?: string }).code === 'POLICY_BLOCKED',
-    );
-    assert.deepEqual(entries, []);
-  }
-  // 授权目录内：成功且账本 verified
-  {
-    const page = new FakePage({ url: 'https://example.com/upload', bodyText: 'x' });
-    const { ctx, entries } = makeRecordingCtx();
-    ctx.allowedUploadDirs = [path.join(dir, 'docs')];
     await performAction(page, { id: 'u2', kind: 'action', action: 'upload', target: { by: 'css', selector: 'input' }, filePath: file, expect: [] } as never, ctx);
     assert.deepEqual(entries.map((e) => e.state), ['prepared', 'in_flight', 'verified']);
   }
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('upload 安全矩阵：秘密文件/目录外/超限/相对路径/缺失文件全部拒绝', async () => {
+test('upload 安全矩阵（已放开后）：超限/相对路径/缺失文件仍拒绝', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'jev-up2-'));
   mkdirSync(path.join(dir, 'docs'), { recursive: true });
   writeFileSync(path.join(dir, 'docs', 'a.txt'), 'ok-data');
@@ -174,11 +186,10 @@ test('upload 安全矩阵：秘密文件/目录外/超限/相对路径/缺失文
     }
   };
 
-  // 秘密文件（即使位于授权目录）
-  assert.equal((await attempt(path.join(dir, '.env'))).code, 'POLICY_BLOCKED');
-  // 目录外（traversal 目标）
-  assert.equal((await attempt(path.join(dir, 'outside.txt'))).code, 'POLICY_BLOCKED');
-  // 大小预检
+  // 已放开：秘密文件（.env）与目录外文件均可上传
+  assert.equal((await attempt(path.join(dir, '.env'))).ok, true);
+  assert.equal((await attempt(path.join(dir, 'outside.txt'))).ok, true);
+  // 大小预检仍然生效
   assert.equal((await attempt(path.join(dir, 'docs', 'a.txt'), 2)).code, 'POLICY_BLOCKED');
   // 相对路径
   assert.equal((await attempt('docs/a.txt')).code, 'INVALID_INPUT');

@@ -32,9 +32,9 @@ function systemPrompt(): string {
     '你是浏览器自动化任务规划器。把目标和验收条件拆成严格的 JSON 步骤数组。',
     '输出 JSON：{"steps": FlowStep[]}。FlowStep 的 kind 只能是 action|assert|extract|branch|forEach|goal。',
     '规则：',
-    '1. action.action 只能是 navigate|click|fill|press|select|scroll|wait|screenshot。',
+    '1. action.action 只能是 navigate|click|fill|press|select|scroll|wait|screenshot|evaluate。',
     '2. LocatorSpec.by 只能是 role|label|testId|text|css；优先 role+name。',
-    '3. navigate/click/fill/press/select 必须带非空 expect 后置条件；screenshot/wait/scroll 可省略。',
+    '3. navigate/click/fill/press/select 必须带非空 expect 后置条件；screenshot/wait/scroll/evaluate 可省略。evaluate 在 script 字段写页面 JS 直接执行（已放开限制），返回值记入变量 lastEvaluate，可用 assert var_equals 核对；优先用内置动作，复杂页面操作才用 evaluate。',
     '4. branch 只允许一层（then 内不得再有 branch/forEach）；forEach.maxItems 不得超过 30。',
     `5. 总步骤数不得超过 ${STEP_LIMIT}；优先 extract+assert 组合而不是猜测。`,
     '6. 不要发明 values 中不存在的键；敏感值用 valuesRef 引用。',
@@ -53,7 +53,7 @@ function userPrompt(input: PlannerInput): string {
   });
 }
 
-const ACTION_NAMES = new Set(['navigate', 'click', 'fill', 'press', 'select', 'scroll', 'wait', 'screenshot', 'upload']);
+const ACTION_NAMES = new Set(['navigate', 'click', 'fill', 'press', 'select', 'scroll', 'wait', 'screenshot', 'upload', 'evaluate']);
 /** 导航与写操作必须提供后置条件；纯观察动作可由返回证据验证（DESIGN §8.1）。 */
 export const WRITE_ACTIONS = new Set(['navigate', 'click', 'fill', 'press', 'select', 'upload']);
 const LOCATOR_BY = new Set(['role', 'label', 'testId', 'text', 'css']);
@@ -103,6 +103,11 @@ export function validatePlannedSteps(raw: unknown, depth = 0): FlowStep[] {
             throw err('PLANNER_INVALID_OUTPUT', `steps[${idx}] upload 需要绝对路径 filePath`);
           }
         }
+        if (action === 'evaluate') {
+          if (typeof step.script !== 'string' || !step.script.trim()) {
+            throw err('PLANNER_INVALID_OUTPUT', `steps[${idx}] evaluate 需要非空 script`);
+          }
+        }
         const out: ActionStep = {
           id,
           kind: 'action',
@@ -113,6 +118,7 @@ export function validatePlannedSteps(raw: unknown, depth = 0): FlowStep[] {
         if (typeof step.value === 'string' || typeof step.value === 'number') out.value = step.value;
         if (typeof step.valuesRef === 'string') out.valuesRef = step.valuesRef;
         if (typeof step.key === 'string') out.key = step.key;
+        if (typeof step.script === 'string') out.script = step.script;
         return out;
       }
       case 'assert':

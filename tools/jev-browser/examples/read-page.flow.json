@@ -9,16 +9,16 @@
       "expect": [{ "kind": "url_contains", "value": "example.com" }]
     },
     {
-      "id": "read-heading",
+      "id": "read-link",
       "kind": "extract",
-      "target": { "by": "role", "role": "heading", "name": "Example Domain", "exact": true },
+      "target": { "by": "role", "role": "link", "name": "Learn more", "exact": true },
       "fields": ["text", "count"],
-      "saveAs": "heading"
+      "saveAs": "link"
     },
     {
-      "id": "verify-heading",
+      "id": "verify-link",
       "kind": "assert",
-      "expect": [{ "kind": "var_equals", "variable": "heading.text", "value": "Example Domain" }]
+      "expect": [{ "kind": "var_equals", "variable": "link.text", "value": "Learn more" }]
     },
     {
       "id": "shot",

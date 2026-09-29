@@ -31,6 +31,12 @@ export type {
 } from './ports.js';
 export { consoleLogger, systemClock, redactUrl } from './ports.js';
 export { resolveAttachEndpoint, discoverChromeLoopbackEndpoint } from './connectors.js';
+export {
+  prepareChromeDebug, probeCdp, findChromeExecutable, chromeExecutableCandidates,
+  defaultChromeDebugUserDataDir, saveAttachEndpointToUserConfig, ensureDebugChromeAt,
+  autoLaunchDebugChromeEnabled, DEFAULT_CHROME_DEBUG_PORT,
+  type ChromeDebugOptions, type ChromeDebugResult, type CdpProbe,
+} from './chromedebug.js';
 export { observePage, diffObservation, waitForSettle, type PageObservation, type ObservedElement } from './observe.js';
 export { resolveLocator, verifyExpects } from './locator.js';
 export { TypeSafeJudge, GOAL_ACTIONS, scopeCandidates, type JudgePort, type RoundDecision, type GoalAction } from './judge.js';

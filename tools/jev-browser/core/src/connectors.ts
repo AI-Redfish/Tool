@@ -3,6 +3,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { JevBrowserConfig } from './config.js';
+import {
+  autoLaunchDebugChromeEnabled,
+  DEFAULT_CHROME_DEBUG_PORT,
+  ensureDebugChromeAt,
+  prepareChromeDebug,
+  probeCdp,
+} from './chromedebug.js';
 import { err } from './errors.js';
 import type { BrowserConnector, BrowserPort, ConnectResult, ContextPort, DialogPort, DownloadPort, LocatorPort, PagePort } from './ports.js';
 import { redactUrl } from './ports.js';
@@ -300,8 +307,22 @@ export class PlaywrightConnector implements BrowserConnector {
     const b = this.cfg.browser;
     if (b.mode === 'attach') {
       const requested = resolveAttachEndpoint(b.attach.endpoint);
-      const attempts = requested === 'chrome' ? ['chrome', discoverChromeLoopbackEndpoint() ?? undefined] : [requested];
       const failures: string[] = [];
+
+      // 固定端口自动确保（默认开启，JEV_BROWSER_AUTO_LAUNCH_DEBUG=false 关闭）
+      //  - 显式 loopback 端点：连接前探测，无则自动以该端口启动调试 Chrome，有则复用；
+      //  - 'chrome' 哨兵：9222 已有调试 Chrome 则优先复用（快路径，免去 60s 授权等待）。
+      const fixedEndpoint = `http://127.0.0.1:${DEFAULT_CHROME_DEBUG_PORT}`;
+      const reuseFixed = requested === 'chrome'
+        ? autoLaunchDebugChromeEnabled() && (await probeCdp(DEFAULT_CHROME_DEBUG_PORT)).up
+        : false;
+      if (requested !== 'chrome' && autoLaunchDebugChromeEnabled()) {
+        await ensureDebugChromeAt(requested, { waitMs: b.attach.timeoutMs, failures });
+      }
+
+      const attempts = requested === 'chrome'
+        ? [...(reuseFixed ? [fixedEndpoint] : []), 'chrome', discoverChromeLoopbackEndpoint() ?? undefined]
+        : [requested];
       for (const endpoint of attempts) {
         if (!endpoint) continue;
         try {
@@ -311,6 +332,18 @@ export class PlaywrightConnector implements BrowserConnector {
           failures.push(`${endpoint === 'chrome' ? 'chrome(channel)' : endpoint}: ${(e as Error).message.split('\n')[0].slice(0, 160)}`);
         }
       }
+
+      // 'chrome' 哨兵全部失败且未复用成功 → 兜底：自动以固定端口 9222 启动调试 Chrome 再连
+      if (requested === 'chrome' && autoLaunchDebugChromeEnabled() && !reuseFixed) {
+        try {
+          const r = await prepareChromeDebug({ waitMs: b.attach.timeoutMs });
+          const browser = await this.connectAttachWithDeadline(r.endpoint, b);
+          return { browser: new PwBrowserAdapter(browser), ownership: 'borrowed', kind: 'attach' };
+        } catch (e) {
+          failures.push(`auto-launch(${fixedEndpoint}): ${(e as Error).message.split('\n')[0].slice(0, 200)}`);
+        }
+      }
+
       throw err('BROWSER_BUSY',
         `接管 Chrome 失败（需在 chrome://inspect/#remote-debugging 开启授权，Chrome ≥ 144，或提供已授权的 loopback endpoint）；各次尝试：${failures.join(' | ')}`,
         { details: { endpoint: requested, attempts: failures } });
@@ -364,7 +397,8 @@ export class PlaywrightConnector implements BrowserConnector {
         reject(err('BROWSER_BUSY',
           `attach ${endpoint === 'chrome' ? 'chrome(channel)' : endpoint} ${b.attach.timeoutMs}ms 内未完成连接——最常见原因：Chrome 正在等你点击连接授权弹窗（弹窗在 Chrome 窗口内，可能被其他窗口遮挡），或从未开启远程调试授权。` +
           `请：① 在 Chrome 地址栏打开 chrome://inspect/#remote-debugging 勾选 "Allow remote debugging"，重跑并在弹窗中点「允许」；` +
-          `② 或改用 launch 模式（set JEV_BROWSER_MODE=launch）；③ 缩短本等待可用 set JEV_BROWSER_CONNECT_TIMEOUT_MS=<毫秒>`));
+          `② 或先跑 cli chrome-debug：以固定调试端口 9222 启动/复用专用 Chrome 并自动配置 attach 端点（跨 Windows/macOS）；` +
+          `③ 或改用 launch 模式（set JEV_BROWSER_MODE=launch）；④ 缩短本等待可用 set JEV_BROWSER_CONNECT_TIMEOUT_MS=<毫秒>`));
       }, b.attach.timeoutMs);
     });
     return Promise.race([connecting, deadline]).finally(() => clearTimeout(timer)) as ReturnType<typeof chromium.connectOverCDP>;
@@ -405,12 +439,11 @@ export async function selectPage(context: ContextPort, pageId?: string): Promise
 }
 
 /**
- * Dialog 控制器（DESIGN §4.4）：
- *  - 已接管页安装 handler 后由本工具决策；默认保守 dismiss 并记录，
- *    不替用户对未知对话框作选择；
+ * Dialog 控制器（DESIGN §4.4，用户已放开对话框限制）：
+ *  - 已接管页默认自动接受对话框（accept）并记录事件；
  *  - 未接管页不安装 handler（其行为属 Playwright/CDP 层，是 P0 非干扰验证项，
  *    不在代码里承诺）；
- *  - 已授权的预期 confirm 才允许接受，且一次性消费。
+ *  - armOnce 保留兼容（仅用于附加原因记录），默认策略已为接受且不再一次性消费。
  */
 export class DialogManager {
   private policies = new WeakMap<object, { accept: boolean; reason: string }>();
@@ -421,7 +454,7 @@ export class DialogManager {
     if (this.installed.has(key)) return;
     this.installed.add(key);
     page.onDialog(async (dialog: DialogPort) => {
-      const policy = this.policies.get(key) ?? { accept: false, reason: '默认保守拒绝（未授权的对话框不自动接受）' };
+      const policy = this.policies.get(key) ?? { accept: true, reason: '已放开：默认自动接受对话框' };
       let accepted = false;
       try {
         if (policy.accept) {
@@ -434,11 +467,11 @@ export class DialogManager {
         // 对话框可能已被页面导航取消
       }
       onEvent?.({ type: dialog.type(), message: dialog.message().slice(0, 120), accepted });
-      if (policy.accept) this.policies.delete(key); // 一次性授权
+      // 已放开限制：默认持续接受，不做一次性消费
     });
   }
 
-  /** 动作前武装：已授权的预期 confirm 才允许接受（一次性，DESIGN §4.4）。 */
+  /** 动作前武装（兼容保留）：默认策略已为接受，此方法仅用于附加原因记录。 */
   armOnce(page: PagePort, reason: string): void {
     this.install(page);
     this.policies.set(page as unknown as object, { accept: true, reason });

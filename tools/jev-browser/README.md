@@ -26,7 +26,7 @@ CLI、MCP、HTTP API 只是三种协议翻译层，行为与输出契约（TaskE
 
 
 
-## 两种入口模式与三个执行器
+## 入口模式与执行器
 
 **入口模式**
 
@@ -74,56 +74,323 @@ core 里的三个类，内部组件。
 
 
 
-## 变量体系（values 与 vars 是两个命名空间）
+## 连接层
 
-| 命名空间 | 来源 | 内容 | 谁能读 |
-|---|---|---|---|
-| `values` | `--values` / API 请求体传入，启动时经 `resolveValues` 解析（secretRef → 环境变量值） | 标量（string/number/boolean/null） | 步骤的 `valuesRef` **优先**读这里 |
-| `vars` | 运行中产生：`extract.saveAs` 存入 `{text?,count?}` 对象；下载成功写 `lastArtifact`（artifactId）；forEach 写 `itemVar` 与 `<itemsVar>.processed/.total` | 对象/标量 | `valuesRef` 查不到 values 时回退读这里；`assert` 的 `var_equals`/`branch` 的 `variable` 也读这里 |
+先分清浏览器是谁的。
 
-引用一律用**点号路径**（如 `heading.text`）；没有 `${name}` 模板插值（那是 jev-desktop 的语法）。
 
-### 连接层：先分清浏览器是谁的
 
-- `attach`（借用，默认）：`connectOverCDP('chrome')` 哨兵走 Playwright 固定版本 channel 发现，失败回退读默认用户目录 `DevToolsActivePort`；`noDefaults:true` 保证绝不 newContext 冒充用户会话、绝不关用户浏览器，`close()` 仅断开 CDP；显式端点只收 loopback（防页面/模型注入远程地址）。需 Chrome ≥ 144 在 `chrome://inspect/#remote-debugging` 人工授权（实操教程见使用步骤 3）。
-- `launch`（自有）：`launchPersistentContext` + 按 engine 独立 profile 目录，可安全关闭；报错区分「未安装」与「profile 被占」。无头仅适用于 launch。
-- 其余层只依赖 `ports.ts` 结构接口，Playwright 类型被隔离在 connectors 一个文件。
+**attach**
 
-由此决定的使用约束：launch 模式下浏览器实例属于启动它的进程——裸 CLI 跨命令复用会话不可行（进程退出浏览器即关），跨命令长会话必须用长驻 API 或 attach。
+默认。
 
-### 状态层：SQLite 单库事务
+通过playwright内置方法或读取用户目录下chrome连接信息，进而连接chrome。
 
-tasks / 会话 / 动作账本 / 幂等记录 / 审批 grant / artifact / 预约锁同库原子提交：
+不会修改和创建用户会话，而是直接复用现有浏览器会话，执行完毕绝不关用户浏览器，`close()` 仅断开 CDP连接。
 
-- **任务状态机**（显式转移表）：`queued → running → done|failed|expired|cancelled`，取消经 `cancelling`；暂停态 `paused`（原因：`likely_done/ambiguous/needs_input/needs_login/needs_confirmation/interrupted`）。崩溃恢复只落 `paused(interrupted)`/`expired`，绝不自动回 running。
-- **动作账本**：每个动作 `prepared→in_flight→verified/failed/unknown`；非幂等动作超时先查证、不确定即隔离（该 profile 新写任务拒绝、只读放行，`rerunConfirmed` 解除）。
-- **幂等**：`Idempotency-Key` 同键同体重放返回原任务、异体冲突报 `IDEMPOTENCY_CONFLICT`（24h 保留）。
-- **乐观锁**：cancel/resume 可带 `expectedRevision`，并发修改报 `REVISION_CONFLICT`。
+ 端点只收 loopback（防页面/模型注入远程地址），避免黑客攻击。
 
-### 安全模型
+ ```
+   工具（Playwright 客户端）──发起 CDP 连接──▶ 浏览器（监听在某个端口上，是服务端）
+           ↑
+           校验发生在这里：
+           你给工具指定一个地址时，工具先检查这个地址
+           是不是 127.0.0.1 / localhost？
+           ├─ 是 → 允许发起连接
+           └─ 不是 → 直接拒绝，根本不连
+ ```
 
-1. **双层 origin**：`allowedOrigins`（会话可碰域）∪ `modelOrigins`（可把页面摘要外发云模型的域，必须 ⊆ 前者）。**默认两者皆空 = 不许可任何网站、禁止任何云外发**；域外导航/动作报 `ORIGIN_NOT_ALLOWED`，外发时报 needs_input 暂停。API/MCP 任务只能从宿主已许可域中选子集，不能自行扩大。
-2. **PolicyGate**：每动作派发前综合判定（动作类型+目标名+域）；命中风险 pattern（支付/删除/发送/pay…）一律 `paused + needs_confirmation`，**不执行**。
-3. **审批 grant**：解锁靠 HMAC 签发的一次性 token——短 TTL、绑定 actionRevision（动作被改即失效）；签发 key（`JEV_BROWSER_APPROVAL_KEY`）是执行 Agent 不持有的凭据，不同源才构成审批边界。
-4. **secretRef**：敏感值 `{"secretRef":"NAME"}` 从 `JEV_BROWSER_SECRET_<NAME>` 环境变量内存解析，不落盘、不进模型请求体/日志。
-5. **其余边界**：下载先注册等待再触发点击（消除竞态）→ saveAs 受管 artifact 区；对话框默认保守 dismiss，仅显式 `armOnce` 的预期 confirm 才接受且一次性；观察脚本内置固定白名单，不执行模型生成的 JS；upload 只允许 `safety.allowedUploadDirs` 内文件（realpath 防穿越）。
 
-### 错误与输出模型
 
-- 所有错误带 `code/message/retryable` 三要素；错误码全集见 `core/src/types.ts`。
-- 统一输出 TaskEnvelope（字段见使用步骤 2.2）；`--json` 输出完整 envelope，人读摘要在 stderr。
-- Jev 判断只做闭集判断（Choice 选候选 / Noul 是否判断），不生成自由文本；候选超 200 先按关键词筛选；阈值映射（done≥0.85、blocked/error≥0.7、中间带需二次确认），歧义即暂停不猜。
+**launch**
 
----
+launchPersistentContext：用指定的磁盘目录作为用户数据目录（等价于真实用户的浏览器配置），登录态、扩展  、站点数据跨会话保留。
 
-## 使用步骤
+按 engine 独立 profile 目录，每个引擎一个独立目录，例如：
 
-### 步骤 0：前置条件与构建
+ ```
+   ~/.jev/chromium/
+   ~/.jev/firefox/
+   ~/.jev/webkit/
+ ```
 
-| 项 | 要求 | 说明 |
-|---|---|---|
-| Node | ≥ 24 | 任务库用 `node:sqlite`（24 起内置），低版本启动即报错 |
-| 浏览器 | 二选一 | launch：Playwright 管理的 Chromium（可自动装）；attach：本机 Chrome ≥ 144 + 人工授权（见步骤 3） |
+无头仅适用于 launch。
+
+launch 模式下浏览器实例属于启动它的进程——裸 CLI 跨命令复用会话不可行（进程退出浏览器即关），跨命令长会话必须用长驻 API 或 attach。
+
+
+
+## 变量体系
+
+ **核心概念**
+
+ 任务执行时有两个独立的变量容器，一进一出：
+
+ ```
+   📦 values 袋 —— 出发前【你】塞给它的（输入参数）
+   📒 vars 本子 —— 干活时【机器人自己】记的（运行数据）
+ ```
+
+ 
+
+📦 values：启动前传入的参数
+
+ - 来源：命令行 --values '{...}' 或 API 请求体
+ - 处理时机：启动时一次性解析，之后只读不写
+ - 内容：只能是标量（string / number / boolean / null）
+ - secretRef 机制：值写成 {"secretRef":"LOGIN_PW"} 时，启动时从环境变量
+   JEV_BROWSER_SECRET_LOGIN_PW 取真值；取不到 → 任务暂停等补，不崩溃；真值只存内存，不落盘
+   不进日志
+
+ 
+
+📒 vars：运行中产生的数据
+
+ 无法预设，只有三种写入者：
+
+ ┌───────────────────────────────┬────────────────────────────────────────────────────────┐
+ │ 写入者                        │ 记入内容                                               │
+ ├───────────────────────────────┼────────────────────────────────────────────────────────┤
+ │ extract 步骤                  │ heading = {text:"...", count:1} 对象                   │
+ │ （saveAs:"heading"）          │                                                        │
+ ├───────────────────────────────┼────────────────────────────────────────────────────────┤
+ │ 下载成功                      │ lastArtifact = 文件编号                                │
+ ├───────────────────────────────┼────────────────────────────────────────────────────────┤
+ │ forEach 循环                  │ item（当前条目）、rows.processed（进度）、rows.total（ │
+ │                               │ 总数，用于断点续跑）                                   │
+ └───────────────────────────────┴────────────────────────────────────────────────────────┘
+
+ 
+
+🔍 查找规则（核心）
+
+ ① 步骤要用值时（valuesRef: "名字"）：
+
+ ```
+   先查 values 袋 → 没有再查 vars 本子 → 都没有就报错停下（不瞎填空值）
+ ```
+
+ 查到的值必须是标量，是数组/未解析的 secretRef 都报错。
+
+ ② 检查类步骤（assert 的 var_equals、branch 的 variable）：只查 vars 本子。
+
+ 引用语法：点号路径，无 ${} 插值
+
+ - 点号路径：heading.text = 先找到 heading，再取它的 text 字段（像"张三.手机号”）
+ - 没有模板插值：不支持 "搜索 ${keyword}" 这种把变量拼进字符串的写法（那是 jev-desktop 的语
+   法）；引用必须独占一个字段，值是什么就整个填什么
+ - 原因（安全）：vars 里的数据来自网页（不可信），只准当纯数据用，不准混进指令文字
+
+
+
+
+
+## 状态层
+
+SQLite 单库事务。
+
+任务、会话、动作账本、幂等记录、审批授权（grant）、文件（artifact）、预约锁——全部存在同一个数据库，每次变更要么全存、要么全不存。
+
+
+
+**任务状态机**
+
+任务的一生只能走规定路线。
+
+ ```
+ queued(排队) → running(执行中) → done(完成) / failed(失败) / expired(过期) / cancelled(已取消)
+                                     ↑ 主动取消要先经过 cancelling(取消中)
+ ```
+
+ 暂停态 paused（附带原因，等人处理）：
+
+```
+ ┌────────────────────┬──────────────┐
+ │ 原因               │ 含义         │
+ ├────────────────────┼──────────────┤
+ │ likely_done        │ 疑似已完成   │
+ ├────────────────────┼──────────────┤
+ │ ambiguous          │ 结果说不清   │
+ ├────────────────────┼──────────────┤
+ │ needs_input        │ 缺信息/密钥  │
+ ├────────────────────┼──────────────┤
+ │ needs_login        │ 需要登录     │
+ ├────────────────────┼──────────────┤
+ │ needs_confirmation │ 需要人工确认 │
+ ├────────────────────┼──────────────┤
+ │ interrupted        │ 被中断       │
+ └────────────────────┴──────────────┘
+```
+
+铁律：崩溃后绝不自动续跑。
+
+即，崩溃前最后那个动作到底成没成（钱付了没？）机器不知道，宁可停下等人确认，也不能赌一把重跑。
+
+
+
+
+
+**动作账本**
+
+ 每个动作像一张记账凭证，三段流转：
+
+ ```
+   prepared(备好未发) → in_flight(执行中) → verified(确认成功) / failed(确认失败) /
+ unknown(结果不明)
+ ```
+
+ 关键规则——非幂等动作超时（非幂等 = 重做会出事的动作：下单、付款、发帖）：
+
+ 1. 超时不能盲目重试
+ 2. 先查证（回页面看实际执行成什么样了）
+ 3. 查完仍不确定 → 隔离：该浏览器 profile 拒收新的写任务、只读放行；人工确认后
+    rerunConfirmed 解除
+
+ │ 人话：不确定钱扣没扣之前，先冻结这张卡的新消费，查清楚再说。
+
+
+
+ **幂等记录**
+
+ 请求头带 Idempotency-Key（防重号），规则：
+
+ - 同 key + 同请求体 → 重放直接返回原来的任务，不新建
+ - 同 key + 不同请求体 → 报 IDEMPOTENCY_CONFLICT（key 疑似被误用）
+ - 记录保留 24 小时
+
+ │ 人话：网络超时客户端自动重发很常见，有防重号就不会下两次单。
+
+
+
+
+
+ **乐观锁**
+
+防两个人同时改一个任务
+
+ cancel / resume 可带 expectedRevision（"我看到的版本是 5"）：
+
+ - 版本还是 5 → 执行
+ - 已被别人改成 6 → 报 REVISION_CONFLICT，重新拉取最新状态再试
+
+ │ 人话：像网盘同步冲突提示——"你编辑期间别人改过了，先刷新再操作"。
+
+
+
+
+
+## 安全模型
+
+ **双层 origin**
+
+两道越收越紧的门禁
+
+ ┌────────┬────────────────┬───────────────────────────────────────────────────────┐
+ │ 层     │ 名字           │ 管什么                                                │
+ ├────────┼────────────────┼───────────────────────────────────────────────────────┤
+ │ 第一道 │ allowedOrigins │ 本会话能访问哪些域                                    │
+ ├────────┼────────────────┼───────────────────────────────────────────────────────┤
+ │ 第二道 │ modelOrigins   │ 哪些域的页面摘要能外发给云模型（必须 ⊆ 第一道的子集） │
+ └────────┴────────────────┴───────────────────────────────────────────────────────┘
+
+ - 默认两者皆空 = 不许可任何网站、禁止任何云外发
+ - 域外导航/动作 → 报 ORIGIN_NOT_ALLOWED
+ - 域外内容要外发 → needs_input 暂停
+ - API/MCP 任务只能从宿主已许可的域里选子集，不能自行扩权
+
+
+
+**PolicyGate**
+
+动作派发前的安检机
+
+ 每个动作执行前综合判定（动作类型 + 目标名 + 域）：
+ - 命中风险 pattern（支付/删除/发送/pay…）→ 一律 paused + needs_confirmation
+ - 只拦不执行，等人工批准
+
+
+
+**审批 grant**
+
+一次性短时效通行令牌
+
+ 解锁危险动作靠 HMAC 签发的 token，三个特点：
+
+ 1. 一次性：用过即废
+ 2. 短 TTL：活得不久
+ 3. 绑定 actionRevision：动作内容被改 → 令牌立即失效（防偷梁换柱）
+
+ 最关键设计：签发钥匙 JEV_BROWSER_APPROVAL_KEY 不在执行 Agent 手里——它自己签不了，所以无法
+ 自己批准自己。
+
+
+
+**secretRef**
+
+密码只存暗号，不存明文
+
+ - 任务里写 {"secretRef":"NAME"}（暗号），运行时从环境变量 JEV_BROWSER_SECRET_<NAME> 兑出真
+   值
+ - 全程只在内存中：不落盘、不进模型请求体、不进日志
+
+
+
+
+
+## 错误与输出模型
+
+**错误三要素**
+
+code / message / retryable
+
+ 规则：任何错误都必须带这三个字段，一个不能少。
+
+ ┌───────────┬────────────┬──────────────────────────────────────────────────────────┐
+ │ 字段      │ 给谁看     │ 作用                                                     │
+ ├───────────┼────────────┼──────────────────────────────────────────────────────────┤
+ │ code      │ 给程序看   │ 机器可读的错误编号，调用方可以 switch(code) 精确分支处理 │
+ ├───────────┼────────────┼──────────────────────────────────────────────────────────┤
+ │ message   │ 给人看     │ 一句话说清楚发生了什么                                   │
+ ├───────────┼────────────┼──────────────────────────────────────────────────────────┤
+ │ retryable │ 给自动化看 │ 这个错重试有没有意义？                                   │
+ └───────────┴────────────┴──────────────────────────────────────────────────────────┘
+
+ 为什么 retryable 重要——错误分两类：
+
+ - ✅ 可重试：网络抖了一下、浏览器没响应 → 等一会再试就行
+ - ❌ 不可重试：浏览器没安装、参数写错了 → 重试 100 次也没用，只会浪费资源
+
+ 没有这个标志，自动化脚本就得「无脑重试所有错误」或「一律不重试」，两头都吃亏。
+
+ 错误码全集集中在 core/src/types.ts → 单一事实来源，新增错误只能在这里登记，不会散落各处各自发明。
+
+
+
+**统一输出 TaskEnvelope + 双通道**
+
+ 规则：不管命令执行什么，输出都包在同一个「信封」里（TaskEnvelope），内部包含状态、结果、错误、元数据等固定字段。
+
+ 关键设计是两个输出通道分离：
+
+ ```
+   stdout（正门）──→ --json 时的完整 envelope → 给程序消费
+   stderr（侧门）──→ 人读的摘要文案        → 给坐在屏幕前的人看
+ ```
+
+ 为什么这么分？
+
+ - stdout 保持纯净：jev-browser xxx --json | jq '.result' 这样的管道操作永远可靠，不会被「正在启动浏览器…」这种
+   提示语污染
+ - 人也不委屈：摘要写到 stderr，终端上照样能看到，但不会混进数据流
+
+
+
+# 前置条件与构建
+
+| 项     | 要求   | 说明                                                         |
+| ------ | ------ | ------------------------------------------------------------ |
+| Node   | ≥ 24   | 任务库用 `node:sqlite`（24 起内置），低版本启动即报错        |
+| 浏览器 | 二选一 | attach（默认）：本机 Chrome ≥ 144 + 人工授权（见「Chrome配置attach」）；launch：Playwright 管理的 Chromium（可自动装，仅显式 `JEV_BROWSER_MODE=launch` 时使用） |
 
 ```powershell
 cd tools/jev-browser
@@ -132,93 +399,600 @@ node cli/dist/index.js help        # 打印命令帮助 → 构建成功
 npm test                           # 62 个离线测试，无需浏览器/key
 ```
 
-Chromium 运行时（launch 模式首次需要，约 115MB，国内可加镜像）：
+（可选）Chromium 运行时：默认 attach 模式**不需要**安装；仅显式切换 launch + chromium 时首次需要（约 115MB，国内可加镜像）：
 
 ```powershell
 $env:PLAYWRIGHT_DOWNLOAD_HOST = "https://cdn.npmmirror.com/binaries/playwright"
 npx playwright install chromium
 ```
 
-**doctor 自检与输出逐行解读**：
+
+
+**配置模型信息**
+
+ PowerShell（Windows，永久·写入用户环境变量）
+
+ ```powershell
+ setx TYPESAFE_API_KEY "apikey_22520acff6f35a0a466db7e645627695e33b_bcb07a31362051ad3ec0c6d07b0c5a75f1995927de97367d85f15bcf11aad0d6"
+ setx JEV_BROWSER_PLANNER_ENABLED  "true"
+ setx JEV_BROWSER_PLANNER_PROVIDER "openai-compatible"
+ setx JEV_BROWSER_PLANNER_BASE_URL "https://open.bigmodel.cn"
+ setx JEV_BROWSER_PLANNER_MODEL    "deepseek-chat"
+ setx JEV_BROWSER_PLANNER_API_KEY  "<规划模型 key>"
+ ```
+
+# Chrome配置attach
+
+attach = 借用你**已打开、已登录**的日常 Chrome（不新开实例、不复制 Cookie、断开时绝不关你的浏览器）。
+
+
+
+**一次性开启授权**
+
+1. 确认 Chrome ≥ 144（地址栏 `chrome://version` 看 major 版本）；
+2. 地址栏打开 `chrome://inspect/#remote-debugging`；
+3. 勾选 **"Allow remote debugging for this browser instance"**。
+
+
+
+**固定端口调试（自动，无需手动步骤）**
+
+CLI / MCP / API 的 attach 连接已内置「固定端口自动确保」逻辑，连接前探测 `127.0.0.1:9222`：
+
+```powershell
+# 直接执行（首次会自动拉起 9222 调试 Chrome）：
+node cli/dist/index.js execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com"
+node cli/dist/index.js doctor --connect
+```
+
+
+
+等价的手动做法（仅 Windows，供理解原理）：
+
+```powershell
+# 以指定debug端口启动谷歌浏览器，不然谷歌浏览器启动会随机调试端口（先检查 9222 是否已在监听，在跑就不重复启动）。
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir=D:\chrome-debug-profile
+
+# 设置attach连接谷歌浏览器的地址。
+$env:JEV_BROWSER_CDP_ENDPOINT = "http://127.0.0.1:9222"
+
+# macOS 等价写法：
+# "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222 --user-data-dir="$HOME/Library/Application Support/AI-Redfish/jev-browser/chrome-debug-profile"
+# export JEV_BROWSER_CDP_ENDPOINT="http://127.0.0.1:9222"
+```
+
+**注意：自动拉起的是独立 profile 的调试 Chrome**——登录态与日常浏览器不共享；需要借用已登录的日常 Chrome 时，按上面「一次性开启授权」操作，或在日
+
+常 Chrome 已运行时让哨兵路径优先接管它。
+
+
+
+**环境变量**
+
+```powershell
+# 清掉 launch 相关覆盖（attach 是默认 mode，不要设 MODE/ENGINE/HEADLESS）
+Remove-Item Env:JEV_BROWSER_MODE, Env:JEV_BROWSER_ENGINE, Env:JEV_BROWSER_HEADLESS -ErrorAction SilentlyContinue
+
+# 每次 attach 尝试有“硬超时”保护（默认 60s，超时报 `BROWSER_BUSY` 并附指引），可用环境变量调整：
+$env:JEV_BROWSER_CONNECT_TIMEOUT_MS = "60000" 
+```
+
+
+
+**验证**
+
+```
+# 先单独验证：成功输出 [connect] OK: ...
+node cli/dist/index.js doctor --connect
+
+# 验证
+node cli/dist/index.js execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com"
+```
+
+# CLI 方式
+
+**参数书写规则**
+
+- 取值参数两种写法等价：`--origin https://a.com` 与 `--origin=https://a.com`；值本身以 `--` 开头时必须用等号形式。
+- 可重复参数（`--origin`、`--model-origin`）传多次会自动累积为数组。
+- 旗标（布尔开关，后面不跟值）：`--json`、`--connect`、`--for-model`、`--detach-task`、`--rerun-confirm`、`--replan`、`--no-save`。
+- JSON 参数（`--file`/`--steps`/`--values`/`--step`）三种等价写法：内联 JSON 字符串、已存在的文件路径、`-`（从 stdin 读）。
+
+
+
+## 全局参数
+
+所有子命令可用。
+
+**`--config <path>`** —— 显式指定配置文件（文件必须存在且合法）；默认自动搜索（`--config` > 环境变量 `JEV_BROWSER_CONFIG` > 用户配置目录）。实际生效的文件与 `JEV_BROWSER_*` 环境变量覆盖可用 `doctor` 查看。
+
+```powershell
+node cli/dist/index.js doctor --config examples/config.attach-chrome.json
+```
+
+**`--json`** —— stdout 输出完整 envelope / 结构化 JSON（供程序消费）；不带时任务类命令只在 stderr 打印人读摘要，stdout 保持纯净便于管道。
+
+```powershell
+node cli/dist/index.js execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com" --json | jq ".status"
+```
+
+**`--api <url>`** —— API 转发模式：命令转发到长驻 API（如 `http://127.0.0.1:3737`），Bearer token 取环境变量 `JEV_BROWSER_API_TOKEN`。该模式下 execute/run/act/snapshot 必须先 `connect` 再传 `--session`（不支持一次性 `--url`/`--page`）；`chrome-debug` 是本机操作，不支持转发。
+
+```powershell
+node cli/dist/index.js doctor --api http://127.0.0.1:3737
+node cli/dist/index.js pages --api http://127.0.0.1:3737 --session sXX
+```
+
+**`--principal <name>`** —— 调用者身份标识（默认 `local`），记入会话/任务/动作账本用于权限校验；仅本地模式生效（`--api` 模式下身份由 token 代表）。
+
+```powershell
+node cli/dist/index.js --principal alice connect --url "https://example.com" --origin "https://example.com"
+```
+
+**`--help`** —— 向 stderr 打印命令速览，退出码 0；等价于不带参数运行或 `help` 子命令（注意：`-h` 单横线不是本 CLI 的旗标）。
+
+```powershell
+node cli/dist/index.js execute --help
+```
+
+
+
+## 子命令详解
+
+按分类组织：环境与诊断 → 一次性执行 → 长会话交互 → 任务治理 → 审批签发（建议按此顺序上手；分场景教程见 2.1～2.8）。
+
+### 环境与诊断
+
+#### help —— 帮助速览
+
+无参数。向 stderr 打印全部命令与参数速览，退出码 0。三种等价触发方式：
+
+```powershell
+node cli/dist/index.js
+node cli/dist/index.js help
+node cli/dist/index.js execute --help
+```
+
+#### doctor —— 环境与配置诊断
+
+静态检查 Node 版本、数据目录、配置文件、环境变量覆盖、凭据与浏览器能力，逐项输出 `[OK]/[FAIL]`；不带 `--connect` 时退出码 0。
 
 ```powershell
 node cli/dist/index.js doctor
 ```
 
-```text
-配置文件: C:\Users\you\AppData\Local\AI-Redfish\jev-browser\config.json（或 "(未使用，默认值)"）
-环境变量覆盖: JEV_BROWSER_MODE, JEV_BROWSER_ENGINE          ← 本次生效的 env 覆盖列表（没有则省略）
-[OK] node: node 24.12.0（本工具需要 ≥ 24：node:sqlite）      ← 版本检查
-[OK] dataDir: C:\Users\you\AppData\Local\AI-Redfish\jev-browser ← 数据目录可写（不可写会 [FAIL]）
-[OK] launchProfile: ...profiles\chromium\default             ← launch profile 目录状态
-[OK] chromiumInstall: 未自动检查；显式执行 npx playwright install chromium ← 提示性，非失败
-[OK] credentials: jev(TYPESAFE_API_KEY)=未配置（纯确定性 execute 不需要）; planner=未配置（run 需要）; api token=未配置（启动 API 需要）
-[capability] attach-chrome-cdp: unverified — ...             ← 能力表：未实测项标 unverified，不冒充 supported
-```
-
-要点：`credentials` 行的「未配置」是**正常**的——纯确定性 execute 不需要任何 key；只有 `run`（要 planner）和 `goal` 步骤（要 Jev）才需要。加 `--connect` 会多一行 `[connect] OK/FAIL: ...`（尝试接管 Chrome，见步骤 3）。
-
-工作区 npm scripts：`build` / `clean` / `test` / `smoke`（端到端冒烟，输出 `"result": "go"` 即就绪）/ `start:mcp` / `start:cli` / `start:api`。
-
-### 步骤 1：配置与数据目录
-
-优先级：CLI 参数 > 环境变量（`JEV_BROWSER_*`）> JSON 配置文件 > 默认值；严格合并，未知字段/类型错直接拒绝。
-
-```jsonc
-// 默认（接管日常 Chrome）；完整字段见 DESIGN §5.2，可复制示例在 examples/
-{
-  "schemaVersion": 1,
-  "browser": { "mode": "attach", "engine": "chrome", "headless": false,
-               "attach": { "endpoint": "chrome", "noDefaults": true } },
-  "planner": { "enabled": false }
-}
-// 切换为工具管理的无头 Chromium：
-{ "schemaVersion": 1, "browser": { "mode": "launch", "engine": "chromium", "headless": true } }
-```
+**`--connect`** —— 在静态检查之上额外尝试真实接管浏览器（attach），输出 `[connect] OK/FAIL: ...`；失败退出码 4。
 
 ```powershell
-# 环境变量等价覆盖（未激活的 attach 子对象保留但不使用；不会隐式把 attach 变 launch）
-$env:JEV_BROWSER_MODE = "launch"; $env:JEV_BROWSER_ENGINE = "chromium"; $env:JEV_BROWSER_HEADLESS = "true"
+node cli/dist/index.js doctor --connect
 ```
 
-| 项 | 位置 |
-|---|---|
-| 配置文件默认位置 | `%LOCALAPPDATA%\AI-Redfish\jev-browser\config.json`（`--config` 指定） |
-| 高频环境变量 | `JEV_BROWSER_MODE/ENGINE/HEADLESS`、`JEV_BROWSER_CDP_ENDPOINT`、`JEV_BROWSER_CONNECT_TIMEOUT_MS`、`JEV_BROWSER_DATA_DIR`、`JEV_BROWSER_API_TOKEN`、`JEV_BROWSER_APPROVAL_KEY`、`JEV_BROWSER_SECRET_<NAME>` |
+#### chrome-debug —— 固定调试端口启动/复用 Chrome
 
-**数据目录结构**（默认 `%LOCALAPPDATA%\AI-Redfish\jev-browser\`，`JEV_BROWSER_DATA_DIR` 可改）：
+attach 连接已自动确保固定端口（见「Chrome配置attach」），本命令是手动预热/预配置入口。不带参数时探测 9222，有则复用、无则拉起，并把 attach 端点写入用户配置。
 
-```text
-jev-browser\
-├── tasks.db                    # SQLite 单库：任务/会话/动作账本/幂等记录/审批 grant/artifact 元数据
-├── config.json                 # （可选）用户配置
-├── artifacts\<taskId>\         # 每个任务一个目录：截图/下载文件（文件名 = <artifactId>-<原文件名>）
-└── profiles\<engine>\default\  # launch 模式的浏览器 profile（chrome / chromium 各自独立，互不混用）
+```powershell
+node cli/dist/index.js chrome-debug
 ```
 
-- `tasks.db` 可安全删除（会丢历史任务/账本/幂等记录，正在运行的任务会失联）；`artifacts\` 按任务目录删，不影响库外数据；`profiles\` 删除后下次 launch 重建（登录态等会丢）。
-- artifact 的权威信息在 `tasks.db`（artifactId ↔ 文件名 ↔ 大小），手动挪文件会与库不一致——清理请按任务整体删。
+**`--port <n>`** —— 固定调试端口（默认 9222）；先探测该端口，已有调试 Chrome 在跑就复用（不重复启动）。
 
-### 步骤 2：CLI 使用
+```powershell
+node cli/dist/index.js chrome-debug --port 9223
+```
 
-入口：`node cli/dist/index.js <命令>`（下称 `cli`）。
+**`--user-data-dir <目录>`** —— 调试专用 profile 目录（绝不用日常默认目录，Chrome 136+ 会拒绝在默认目录开调试端口）。默认按平台选取，见「Chrome配置attach」。
 
-**全局参数**（所有命令可用）：
+```powershell
+node cli/dist/index.js chrome-debug --port 9223 --user-data-dir "D:\chrome-debug-9223"
+```
 
-| 参数 | 类型 | 默认 | 作用 |
-|---|---|---|---|
-| `--config <path>` | string | — | 配置文件路径 |
-| `--json` | 旗标 | 关 | stdout 输出完整 envelope JSON |
-| `--api <url>` | string | — | API 转发模式：转发到长驻 API（token 取 `JEV_BROWSER_API_TOKEN`） |
-| `--principal <name>` | string | `local` | 调用者身份标识 |
-| `-h` / `--help` | 旗标 | — | 帮助（退出码 0） |
+**`--executable <路径>`** —— Chrome 可执行文件路径（默认按平台自动探测）；也可用环境变量 `JEV_BROWSER_CHROME_EXECUTABLE`。
 
-JSON 参数（`--file`/`--steps`/`--values`/`--step`）三种等价写法：内联 JSON、已存在的文件路径、`-`（stdin）。
+```powershell
+node cli/dist/index.js chrome-debug --executable "C:\Users\me\AppData\Local\Google\Chrome\Application\chrome.exe"
+```
+
+**`--wait-ms <n>`** —— 启动后等待 CDP 端点就绪的毫秒数（默认 15000）。
+
+```powershell
+node cli/dist/index.js chrome-debug --wait-ms 30000
+```
+
+**`--no-save`** —— 跳过「把 attach 端点写入用户配置」（默认写入，后续命令免设环境变量）。
+
+```powershell
+node cli/dist/index.js chrome-debug --no-save
+```
+
+### 一次性执行
+
+#### execute —— 确定性步骤（零模型调用）
+
+执行 FlowStep 数组（action/assert/extract/branch/forEach），不调用任何模型；步骤契约见 2.6。任务落定后按状态退出：0 done / 3 paused / 4 failed / 130 cancelled。
+
+**`--file <path>`** —— FlowStep 数组文件；也接受完整 flow 对象 `{schemaVersion, steps}`，自动拆包取 steps。与 `--steps` 二选一，同时给时 `--file` 优先。
+
+```powershell
+node cli/dist/index.js execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com"
+```
+
+**`--steps <json>`** —— 直接给 FlowStep 数组。三种等价写法：内联 JSON 字符串、已存在的文件路径、`-`（从 stdin 读）。
+
+```powershell
+node cli/dist/index.js execute --steps '[{"id":"go","kind":"action","action":"navigate","value":"https://example.com","expect":[{"kind":"url_contains","value":"example.com"}]}]' --url "https://example.com" --origin "https://example.com"
+echo '[{"id":"go","kind":"action","action":"navigate","value":"https://example.com","expect":[{"kind":"url_contains","value":"example.com"}]}]' | node cli/dist/index.js execute --steps - --url "https://example.com" --origin "https://example.com"
+```
+
+**`--url <url>`** —— 目标页三选一（`--url`/`--page`/`--session`）：一次性会话，自动新开页、跑完自动断开（需配 `--origin`）。
+
+```powershell
+node cli/dist/index.js execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com"
+```
+
+**`--page <id>`** —— 目标页三选一：绑定既有标签页的一次性会话（pageId 来自 `pages` 输出，如 `p0`）。
+
+```powershell
+node cli/dist/index.js execute --file examples/read-page.flow.json --page p0 --origin "https://example.com"
+```
+
+**`--session <id>`** —— 目标页三选一：复用长会话（跨命令场景，先见 `connect`）。
+
+```powershell
+node cli/dist/index.js execute --file bili-open4.flow.json --session sXX
+```
+
+**`--origin <o>`** —— 会话授权域（可重复传；一次性会话必填*）。默认空 = 不许可任何网站，首个域外动作报 `ORIGIN_NOT_ALLOWED`（*CLI 不强制校验，MCP 侧为硬必填）。搜索页/详情页常是两个域，都要声明。
+
+```powershell
+node cli/dist/index.js execute --file search.flow.json --url "https://www.bilibili.com" --origin "https://www.bilibili.com" --origin "https://search.bilibili.com"
+```
+
+**`--model-origin <o>`** —— 允许页面摘要外发云模型的域（可重复，必须 ⊆ origin）；默认空 = 禁止外发。flow 含 goal 语义步骤时必须声明。
+
+```powershell
+node cli/dist/index.js execute --file with-goal.flow.json --url "https://example.com" --origin "https://example.com" --model-origin "https://example.com"
+```
+
+**`--values <json>`** —— 变量初值（标量字典），供步骤 `valuesRef` 引用（三大用法见 2.3）。
+
+```powershell
+node cli/dist/index.js execute --file search.flow.json --url "https://www.bilibili.com" --origin "https://www.bilibili.com" --origin "https://search.bilibili.com" --values '{"startUrl":"https://www.bilibili.com","keyword":"虎皮鹦鹉"}'
+```
+
+**`--idempotency-key <k>`** —— 幂等键：同 key + 同请求体重放返回原任务；同 key + 不同请求体报 `IDEMPOTENCY_CONFLICT`（防网络超时重发重复下单）。
+
+```powershell
+node cli/dist/index.js execute --file order.flow.json --session sXX --idempotency-key order-20260101-001
+```
+
+#### snapshot —— 只读快照
+
+stdout 总是输出快照 JSON（不受 `--json` 影响）；`elements` 含 role/name/text，供写 flow 定位。
+
+**`--url <url>`** —— 快照目标三选一（`--url`/`--page`/`--session`）：自动建临时会话、快照后自动断开（需配 `--origin`）。
+
+```powershell
+node cli/dist/index.js snapshot --url "https://example.com" --origin "https://example.com"
+```
+
+**`--page <id>`** —— 快照目标三选一：绑定既有标签页的一次性快照。
+
+```powershell
+node cli/dist/index.js snapshot --page p0 --origin "https://example.com"
+```
+
+**`--session <id>`** —— 快照目标三选一：长会话方式，快照当前绑定页。
+
+```powershell
+node cli/dist/index.js snapshot --session sXX
+```
+
+**`--origin <o>`** —— 一次性方式（`--url`/`--page`）必填*的临时会话授权域（规则同 execute）。
+
+```powershell
+node cli/dist/index.js snapshot --url "https://example.com" --origin "https://example.com"
+```
+
+**`--model-origin <o>`** —— 同 execute：允许外发云模型的域（⊆ origin）。
+
+```powershell
+node cli/dist/index.js snapshot --url "https://example.com" --origin "https://example.com" --model-origin "https://example.com"
+```
+
+**`--for-model`** —— 声明快照将发云模型：要求当前页 origin ∈ modelOrigins，否则拒绝（默认禁止外发）。
+
+```powershell
+node cli/dist/index.js snapshot --session sXX --for-model
+```
+
+#### run —— 自主任务（规划 + 执行）
+
+前置（一次性配置；规划器与 Jev 是两份独立凭据）：
+
+```powershell
+$env:JEV_BROWSER_PLANNER_ENABLED = "true"
+$env:JEV_BROWSER_PLANNER_BASE_URL = "https://api.deepseek.com/v1"
+$env:JEV_BROWSER_PLANNER_MODEL = "deepseek-chat"
+$env:JEV_BROWSER_PLANNER_API_KEY = "<规划模型 key>"
+$env:TYPESAFE_API_KEY = "<Jev key>"
+```
+
+**`--goal <文本>`** —— 自然语言目标（必填）。
+
+```powershell
+node cli/dist/index.js run --url "https://search.bilibili.com/all?keyword=%E8%99%8E%E7%9A%AE%E9%B9%A6%E9%B9%89" --goal "在当前B站搜索结果页，按顺序找到第4条视频结果并打开它" --success "当前页是 bilibili 视频播放页（URL 含 /video/BV），且视频标题与搜索结果第4条一致" --origin "https://search.bilibili.com" --origin "https://www.bilibili.com"
+```
+
+**`--success <文本>`** —— 人类可读验收条件（必填）；任务级验收由引擎执行，规划器不能自证完成（两层验收见技术原理）。
+
+```powershell
+node cli/dist/index.js run --url "https://example.com" --goal "打开页面并确认标题" --success "页面标题为 Example Domain" --origin "https://example.com"
+```
+
+**`--url <url>`** —— 目标页三选一（`--url`/`--page`/`--session`）：一次性会话（语义同 execute）。
+
+```powershell
+node cli/dist/index.js run --url "https://example.com" --goal "..." --success "..." --origin "https://example.com"
+```
+
+**`--page <id>`** —— 目标页三选一：绑定既有标签页。
+
+```powershell
+node cli/dist/index.js run --page p0 --goal "..." --success "..." --origin "https://example.com"
+```
+
+**`--session <id>`** —— 目标页三选一：复用长会话。
+
+```powershell
+node cli/dist/index.js run --session sXX --goal "..." --success "..."
+```
+
+**`--origin <o>`** —— 一次性会话必填*的授权域（规则同 execute，可重复）。
+
+```powershell
+node cli/dist/index.js run --url "https://search.bilibili.com/all?keyword=虎皮鹦鹉" --goal "..." --success "..." --origin "https://search.bilibili.com" --origin "https://www.bilibili.com"
+```
+
+**`--model-origin <o>`** —— 可外发域（⊆ origin）；run 的任务级验收本身也要外发，不给会暂停 `likely_done`。
+
+```powershell
+node cli/dist/index.js run --url "https://search.bilibili.com/all?keyword=虎皮鹦鹉" --goal "..." --success "..." --origin "https://search.bilibili.com" --origin "https://www.bilibili.com" --model-origin "https://search.bilibili.com" --model-origin "https://www.bilibili.com"
+```
+
+**`--values <json>`** —— 变量初值（供规划产物的 `valuesRef` 使用）。
+
+```powershell
+node cli/dist/index.js run --session sXX --goal "..." --success "..." --values '{"keyword":"虎皮鹦鹉"}'
+```
+
+**`--idempotency-key <k>`** —— 幂等键（语义同 execute）。
+
+```powershell
+node cli/dist/index.js run --session sXX --goal "..." --success "..." --idempotency-key run-001
+```
+
+### 长会话交互
+
+一次性会话「跑完即断」；要在同一页面上多轮交互（观察 → 操作 → 再观察），先 `connect` 建会话，后续命令都传 `--session`：
+
+```powershell
+node cli/dist/index.js snapshot --session sXX                               # 观察当前绑定页
+node cli/dist/index.js execute --session sXX --file bili-open4.flow.json    # 在会话上跑确定性步骤
+node cli/dist/index.js run --session sXX --goal "..." --success "..."       # 在会话上跑自主任务
+```
+
+#### connect —— 建会话
+
+**`--url <url>`** —— 会话目标二选一（`--url`/`--page`）：新开标签页。stdout 打印会话 JSON（取 `sessionId`）。
+
+```powershell
+node cli/dist/index.js connect --url "https://www.bilibili.com" --origin "https://www.bilibili.com" --origin "https://search.bilibili.com"
+```
+
+**`--page <id>`** —— 会话目标二选一：绑定既有标签页（id 来自 `pages` 输出或 `awaiting_page` 候选清单）。
+
+```powershell
+node cli/dist/index.js connect --page p0 --origin "https://example.com"
+```
+
+**`--origin <o>`** —— 建议必填*的会话授权域（可重复）；默认空 = 不许可任何网站。目标页不唯一时返回 `awaiting_page` + 候选清单，按清单改用 `--page` 重试。
+
+```powershell
+node cli/dist/index.js connect --url "https://example.com" --origin "https://example.com"
+```
+
+**`--model-origin <o>`** —— 允许外发云模型的域（⊆ origin）；run / goal / `--for-model` 需要。
+
+```powershell
+node cli/dist/index.js connect --url "https://example.com" --origin "https://example.com" --model-origin "https://example.com"
+```
+
+#### pages —— 列标签页
+
+**`--session <id>`** —— 会话 id（必填）。列出会话可见标签页（按授权域过滤、URL 脱敏）；典型用途：找 `target=_blank` 新开页的 pageId。
+
+```powershell
+node cli/dist/index.js pages --session sXX
+```
+
+#### select-page —— 切换绑定页
+
+**`--session <id>`** —— 会话 id（必填）。
+
+```powershell
+node cli/dist/index.js select-page --session sXX --page p2
+```
+
+**`--page <id>`** —— 要切换到的标签页 id（必填，来自 `pages` 输出）。
+
+```powershell
+node cli/dist/index.js select-page --session sXX --page p2
+```
+
+#### act —— 单步动作
+
+在既有会话上执行一个动作并等待任务落定；适合「snapshot 观察 → act 操作」交互循环。
+
+**`--session <id>`** —— 长会话 id（必填；无一次性形态，必须先 `connect`）。
+
+```powershell
+node cli/dist/index.js act --session sXX --step click.step.json
+```
+
+**`--step <json>`** —— 单个 ActionStep（必填；结构见 2.6 的 `action` 行）；三种写法：内联 JSON / 文件路径 / `-` stdin。
+
+```powershell
+node cli/dist/index.js act --session sXX --step '{"id":"click-search","kind":"action","action":"click","target":{"by":"role","role":"button","name":"搜索"},"expect":[{"kind":"url_contains","value":"search"}]}'
+Get-Content click.step.json | node cli/dist/index.js act --session sXX --step -
+```
+
+**`--values <json>`** —— 给该步 `valuesRef` 供值。
+
+```powershell
+node cli/dist/index.js act --session sXX --step fill.step.json --values '{"keyword":"虎皮鹦鹉"}'
+```
+
+#### disconnect —— 断开会话
+
+**`--session <id>`** —— 会话 id（必填）。attach 模式仅断开 CDP 连接，绝不关用户浏览器。
+
+```powershell
+node cli/dist/index.js disconnect --session sXX
+```
+
+**`--detach-task`** —— 会话下还有暂停任务时仍强制断开（默认拒绝并提示）。
+
+```powershell
+node cli/dist/index.js disconnect --session sXX --detach-task
+```
+
+### 任务治理
+
+#### task —— 任务管理
+
+用法：`node cli/dist/index.js task <get|cancel|resume|approve> <taskId>`（taskId 位置式，或用 `--task <id>` 代替）。
+
+**`task get <taskId>`** —— 查询并打印 envelope；`revision` 字段供乐观锁用。
+
+```powershell
+node cli/dist/index.js task get tmumiwtkqa4474d0
+node cli/dist/index.js task get --task tmumiwtkqa4474d0 --json
+```
+
+**`task cancel <taskId>`** —— 取消任务；先经 `cancelling`，幂等 + 乐观锁。
+
+```powershell
+node cli/dist/index.js task cancel tmumiwtkqa4474d0 --request-id r1
+```
+
+**`--request-id <id>`** —— cancel/resume 的幂等请求号（缺省自动生成；重试安全）。
+
+```powershell
+node cli/dist/index.js task cancel tmumiwtkqa4474d0 --request-id r1
+```
+
+**`--expected-revision <n>`** —— 乐观锁版本号；版本落后报 `REVISION_CONFLICT`，重新 `task get` 拿最新 revision 再试。
+
+```powershell
+node cli/dist/index.js task cancel tmumiwtkqa4474d0 --request-id r1 --expected-revision 5
+```
+
+**`task resume <taskId>`** —— 恢复暂停任务（补 values/密钥、审批通过后）；参数同 cancel（`--request-id`/`--expected-revision`），另加下面两个旗标。
+
+```powershell
+node cli/dist/index.js task resume tmumiwtkqa4474d0 --request-id r2
+```
+
+**`--rerun-confirm`** —— 动作结果未证实（`ACTION_OUTCOME_UNKNOWN` 隔离）时，人工确认后允许重跑。
+
+```powershell
+node cli/dist/index.js task resume tmumiwtkqa4474d0 --request-id r2 --rerun-confirm
+```
+
+**`--replan`** —— run 任务允许规划器重规划未完成后缀（受 maxReplans 限制）。
+
+```powershell
+node cli/dist/index.js task resume tmumiwtkqa4474d0 --request-id r2 --replan
+```
+
+**`task approve <taskId>`** —— 注入审批令牌（配合 `grant create`；之后通常还要 resume）。
+
+```powershell
+node cli/dist/index.js task approve tmumiwtkqa4474d0 --grant eyJhbGciOi...
+```
+
+**`--grant <token>`** —— 审批令牌（必填；一次性、短 TTL、绑定 actionRevision）。
+
+```powershell
+node cli/dist/index.js task approve tmumiwtkqa4474d0 --grant eyJhbGciOi...
+```
+
+#### artifact —— 产物管理
+
+截图/下载文件都在受管 artifact 区：`<数据目录>\artifacts\<taskId>\`。
+
+**`artifact list`** —— 列出任务产物（artifactId/文件名/大小），stdout JSON。
+
+```powershell
+node cli/dist/index.js artifact list --task tmumiwtkqa4474d0
+```
+
+**`--task <id>`** —— 任务 id（list 与 get 均必填）。
+
+```powershell
+node cli/dist/index.js artifact list --task tmumiwtkqa4474d0
+```
+
+**`artifact get`** —— 把产物保存到本地（本地直拷；`--api` 模式走下载接口）。
+
+```powershell
+node cli/dist/index.js artifact get --task tmumiwtkqa4474d0 --artifact aXyz --out .\report.xlsx
+```
+
+**`--artifact <id>`** —— 产物 id（get 必填；来自 list 输出）。
+
+```powershell
+node cli/dist/index.js artifact get --task tmumiwtkqa4474d0 --artifact aXyz --out .\report.xlsx
+```
+
+**`--out <path>`** —— 本地保存路径（get 必填）；stderr 打印 `已保存: <path>`。
+
+```powershell
+node cli/dist/index.js artifact get --task tmumiwtkqa4474d0 --artifact aXyz --out .\report.xlsx
+```
+
+### 审批签发
+
+#### grant —— 签发审批令牌
+
+用法：`node cli/dist/index.js grant create --task <id> --action-revision <n>`。前置：环境变量 `JEV_BROWSER_APPROVAL_KEY`（独立审批凭据，与执行侧不同源才构成安全边界）；TTL 取配置 `safety.approvalTtlMs`（默认 120s）。
+
+```powershell
+$env:JEV_BROWSER_APPROVAL_KEY = "<审批密钥>"
+node cli/dist/index.js grant create --task tmumiwtkqa4474d0 --action-revision 7
+```
+
+**`--task <id>`** —— 待批准动作所属任务（必填）。
+
+```powershell
+node cli/dist/index.js grant create --task tmumiwtkqa4474d0 --action-revision 7
+```
+
+**`--action-revision <n>`** —— 待批准动作版本号（必填；取自 envelope 的 `pendingApproval.actionRevision`）；绑定 revision，动作内容被改即失效。
+
+```powershell
+node cli/dist/index.js grant create --task tmumiwtkqa4474d0 --action-revision 7 --json
+```
+
+---
+
+以下 2.1～2.8 为分场景教程与契约速查。
 
 #### 2.1 第一条命令与 flow 逐字段精讲
 
 ```powershell
-cli execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com"
+node cli/dist/index.js execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com"
 ```
 
 `examples/read-page.flow.json` 全文与逐字段讲解：
@@ -237,46 +1011,37 @@ cli execute --file examples/read-page.flow.json --url "https://example.com" --or
       ]
     },
     {
-      "id": "read-heading",
+      "id": "read-link",
       "kind": "extract",       // 提取步骤：读页面数据存入流程变量
       "target": {              // LocatorSpec 白名单定位（模型不得生成任意 XPath/JS）
-        "by": "role", "role": "heading", "name": "Example Domain", "exact": true
+        "by": "role", "role": "link", "name": "Learn more", "exact": true   // example.com 已改版：无 h1，改提取页内链接
       },
       "fields": ["text", "count"],   // 要提取的字段：text=首个匹配的innerText；count=匹配元素数
-      "saveAs": "heading"      // 存入 vars["heading"] = { text, count } → 后续用点号引用 "heading.text"
+      "saveAs": "link"        // 存入 vars["link"] = { text, count } → 后续用点号引用 "link.text"
     },
     {
-      "id": "verify-heading",
+      "id": "verify-link",
       "kind": "assert",        // 纯断言步骤（不动页面）
       "expect": [
-        { "kind": "var_equals", "variable": "heading.text", "value": "Example Domain" }
+        { "kind": "var_equals", "variable": "link.text", "value": "Learn more" }
         // var_equals/var_contains/var_exists 引用变量用 variable 字段（点号路径）
       ]
     },
     { "id": "shot", "kind": "action", "action": "screenshot" }   // 截图存 artifact（只读动作可不带 expect）
   ],
-  "values": {}                 // flow 文件内也可带 values（命令行 --values 会与之合并使用）
+  "values": {}                 // CLI 只读取 steps；变量一律用 --values 传（此处 values 字段不被 CLI 读取）
 }
 ```
 
-`execute` 参数全表：
-
-| 参数 | 类型 | 必填 | 作用 |
-|---|---|---|---|
-| `--file <path>` / `--steps <json>` | string | 二选一 | FlowStep 数组（文件也接受完整 flow 对象 `{schemaVersion, steps}`，自动拆包） |
-| `--url <url>` / `--page <id>` / `--session <id>` | string | 三选一 | 新开页 / 绑定既有页 / 复用会话（不指定 session 的一次性会话跑完自动断开） |
-| `--origin <o>` | string[] | 是* | 会话授权域（可重复传）；*CLI 不强制校验，漏传在首个域外动作报 `ORIGIN_NOT_ALLOWED`；MCP 侧为硬必填 |
-| `--model-origin <o>` | string[] | 否 | 允许外发云模型的域（⊆ origin）；不给 = 禁止外发 |
-| `--values <json>` | string | 否 | 变量初值（详见 2.3） |
-| `--idempotency-key <k>` | string | 否 | 幂等键 |
+execute 各参数的逐一说明与案例见「子命令详解 → 一次性执行 → execute」。
 
 预期输出（stderr 摘要，退出码 0）：
 
 ```text
 status=done taskId=a1b2c3 revision=5
   step goto [action] done
-  step read-heading [extract] done
-  step verify-heading [assert] done
+  step read-link [extract] done
+  step verify-link [assert] done
   step shot [action] done
 artifacts: aXyz(screenshot.png,12345B)
 ```
@@ -295,7 +1060,7 @@ artifacts: aXyz(screenshot.png,12345B)
   "status": "done",               // queued/running/paused/cancelling/done/failed/expired/cancelled
   "stepResults": [                // 每步结果
     { "id": "goto", "kind": "action", "status": "done" },
-    { "id": "read-heading", "kind": "extract", "status": "done", "savedAs": "heading" }
+    { "id": "read-link", "kind": "extract", "status": "done", "savedAs": "link" }
   ],
   "artifacts": [                  // 产物（artifact get / API 下载用）
     { "artifactId": "aXyz", "filename": "screenshot.png", "size": 12345 }
@@ -337,7 +1102,7 @@ artifacts: aXyz(screenshot.png,12345B)
 ```
 
 ```powershell
-cli execute --file search.flow.json `
+node cli/dist/index.js execute --file search.flow.json `
   --url "https://www.bilibili.com" --origin "https://www.bilibili.com" --origin "https://search.bilibili.com" `
   --values '{"startUrl":"https://www.bilibili.com","keyword":"虎皮鹦鹉"}'
 # 换词重跑只改 --values：..."keyword":"玄凤鹦鹉"...，flow 一个字不动
@@ -349,7 +1114,7 @@ cli execute --file search.flow.json `
 
 ```powershell
 $env:JEV_BROWSER_SECRET_LOGIN_PW = "真实密码"     # ① 密码只放环境变量（名字任意，前缀固定）
-cli execute --file login.flow.json `
+node cli/dist/index.js execute --file login.flow.json `
   --url "https://example.com/login" --origin "https://example.com" `
   --values '{"user":"zly","password":{"secretRef":"LOGIN_PW"}}'   # ② 命令行只写引用
 ```
@@ -380,43 +1145,34 @@ cli execute --file login.flow.json `
 
 > ⚠️ launch 模式下浏览器属于启动进程：**裸 CLI 跨命令复用会话不可行**（旧会话报 `SESSION_NOT_READY`）。跨命令长会话二选一：`--api` 长驻模式（步骤 5）或 attach（步骤 3）。
 
-会话命令参数表：
-
-| 命令 | 参数 | 作用 |
-|---|---|---|
-| `connect` | `--url` 或 `--page`（必填）、`--origin`（必填*同 2.1）、`--model-origin`（可重复） | 建会话；多候选页时返回 `awaiting_page` + 候选清单（退出码 3） |
-| `pages` | `--session`（必填） | 列标签页（按授权域过滤、URL 脱敏） |
-| `select-page` | `--session` `--page`（必填） | 切换绑定页 |
-| `snapshot` | `--session`（或一次性 `--url`/`--page`+`--origin`）；`--for-model` 旗标 | 只读快照；`--for-model` 表示要发云模型，要求当前页 origin ∈ modelOrigins |
-| `act` | `--session` `--step`（必填）、`--values` | 单步动作（ActionStep JSON/文件/`-`） |
-| `disconnect` | `--session`（必填）；`--detach-task` 旗标 | 断开；有暂停任务需显式 detach |
+本节用到的命令（connect / pages / select-page / snapshot / act / disconnect）参数逐一说明与案例见「子命令详解 → 长会话交互」。
 
 实测示例（无 key 可照抄，用 `--api` 长驻模式；B 站搜索并打开第 4 条结果）：
 
 ```powershell
-# 终端 1：起长驻 API（浏览器归它持有）
+# 终端 1：起长驻 API（attach 默认模式：接管日常 Chrome，连接时自动探测/拉起 9222 调试 Chrome，见「Chrome配置attach」）
 $env:JEV_BROWSER_API_TOKEN = "<随机长串>"
-$env:JEV_BROWSER_MODE = "launch"; $env:JEV_BROWSER_ENGINE = "chromium"; $env:JEV_BROWSER_HEADLESS = "true"
+# attach 是默认 mode，勿设 JEV_BROWSER_MODE/ENGINE/HEADLESS（设过就先清掉：见「Chrome配置attach → 环境变量」）
 node api/dist/index.js
 
 # 终端 2：以下命令都带 --api 与同一 token；$api = "--api http://127.0.0.1:3737"
 # ① 建会话（搜索页与视频页是两个 origin，都要声明）
-cli connect $api --url "https://search.bilibili.com/all?keyword=%E8%99%8E%E7%9A%AE%E9%B9%A6%E9%B9%89" --origin "https://search.bilibili.com" --origin "https://www.bilibili.com"
+node cli/dist/index.js connect $api --url "https://search.bilibili.com/all?keyword=%E8%99%8E%E7%9A%AE%E9%B9%A6%E9%B9%89" --origin "https://search.bilibili.com" --origin "https://www.bilibili.com"
 # ② 快照观察结果列表（确认渲染、看清标题与顺序）
-cli snapshot $api --session <sessionId> --json
+node cli/dist/index.js snapshot $api --session <sessionId> --json
 # ③ 点击第 4 条（推荐按②里看到的完整标题精确文本点击；flow 示例）
 #    [ { "id":"wait", "kind":"action", "action":"wait", "target":{"by":"css","selector":".bili-video-card"}, "value":2000 },
 #      { "id":"open", "kind":"action", "action":"click",
 #        "target":{"by":"text","text":"<第4条完整标题>","exact":true},
 #        "expect":[{"kind":"url_contains","value":"search.bilibili.com"}] },
 #      { "id":"shot", "kind":"action", "action":"screenshot" } ]
-cli execute $api --session <sessionId> --file bili-open4.flow.json
+node cli/dist/index.js execute $api --session <sessionId> --file bili-open4.flow.json
 # ④⑤ 查看/切换 target=_blank 新开的视频页并验证
-cli pages $api --session <sessionId>
-cli select-page $api --session <sessionId> --page <新页id>
-cli snapshot $api --session <sessionId>
+node cli/dist/index.js pages $api --session <sessionId>
+node cli/dist/index.js select-page $api --session <sessionId> --page <新页id>
+node cli/dist/index.js snapshot $api --session <sessionId>
 # ⑥ 断开
-cli disconnect $api --session <sessionId>
+node cli/dist/index.js disconnect $api --session <sessionId>
 ```
 
 #### 2.5 场景教程：下载文件并保存
@@ -439,12 +1195,12 @@ cli disconnect $api --session <sessionId>
 下载成功后 artifactId 会写入流程变量 `lastArtifact`，后续步骤可用 `valuesRef: "lastArtifact"` 引用（如填入表单、branch 判断）；可用断言 op 只有 `var_equals`（引用变量用 `variable` 字段，点号路径）。
 
 ```powershell
-cli execute --file download.flow.json --url "https://example.com/report" --origin "https://example.com"
+node cli/dist/index.js execute --file download.flow.json --url "https://example.com/report" --origin "https://example.com"
 # 摘要输出 artifacts: aXyz(report-2026.xlsx,20480B) —— 文件在 <数据目录>\artifacts\<taskId>\
 
 # 取回本地：
-cli artifact list --task <taskId>
-cli artifact get --task <taskId> --artifact aXyz --out .\report.xlsx
+node cli/dist/index.js artifact list --task <taskId>
+node cli/dist/index.js artifact get --task <taskId> --artifact aXyz --out .\report.xlsx
 ```
 
 #### 2.6 FlowStep 契约速查（execute/act 的 steps 字段）
@@ -475,19 +1231,10 @@ $env:JEV_BROWSER_PLANNER_API_KEY = "<规划模型 key>"     # 规划器与 Jev �
 $env:TYPESAFE_API_KEY = "<Jev key>"
 ```
 
-`run` 参数全表：
-
-| 参数 | 类型 | 必填 | 作用 |
-|---|---|---|---|
-| `--goal <文本>` | string | 是 | 自然语言目标 |
-| `--success <文本>` | string | 是 | 人类可读验收条件（引擎校验，规划器不能自证完成） |
-| `--url` / `--page` / `--session` | string | 三选一 | 目标页 |
-| `--origin <o>` | string[] | 是（一次性会话） | 授权域 |
-| `--model-origin <o>` | string[] | 否 | 可外发域（⊆ origin）；run 的任务级验收也要外发，不给会暂停 |
-| `--values` / `--idempotency-key` | — | 否 | 变量 / 幂等键 |
+run 各参数的逐一说明与案例见「子命令详解 → 一次性执行 → run」。
 
 ```powershell
-cli run `
+node cli/dist/index.js run `
   --url "https://search.bilibili.com/all?keyword=%E8%99%8E%E7%9A%AE%E9%B9%A6%E9%B9%89" `
   --goal "在当前B站搜索结果页，按顺序找到第4条视频结果并打开它" `
   --success "当前页是 bilibili 视频播放页（URL 含 /video/BV），且视频标题与搜索结果第4条一致" `
@@ -500,11 +1247,11 @@ cli run `
 ```powershell
 # ① 签发一次性 grant（需环境变量 JEV_BROWSER_APPROVAL_KEY，与执行侧隔离保管）
 $env:JEV_BROWSER_APPROVAL_KEY = "<审批密钥>"
-cli grant create --task <taskId> --action-revision 7      # → 输出 grant token（--json 时输出 {grant, ttlMs}）
+node cli/dist/index.js grant create --task <taskId> --action-revision 7      # → 输出 grant token（--json 时输出 {grant, ttlMs}）
 # ② 注入批准（grant 一次性、短 TTL、绑定 actionRevision，动作被改即失效）
-cli task approve <taskId> --grant <token>
+node cli/dist/index.js task approve <taskId> --grant <token>
 # ③ 恢复任务（request-id 幂等，重试安全）
-cli task resume <taskId> --request-id r1
+node cli/dist/index.js task resume <taskId> --request-id r1
 ```
 
 任务管理命令参数表（`<taskId>` 可位置式或 `--task`）：
@@ -544,46 +1291,9 @@ cli task resume <taskId> --request-id r1
 
 使用注意：iframe、开放 Shadow DOM 为受限能力（观察脚本不穿透闭合 Shadow DOM）；高风险动作放行后站点弹出的 confirm 仍按保守策略 dismiss。
 
-### 步骤 3：attach 接管日常 Chrome 实战教程
 
-attach = 借用你**已打开、已登录**的日常 Chrome（不新开实例、不复制 Cookie、断开时绝不关你的浏览器）。Chrome 144+ 采用授权式远程调试，完整流程：
 
-**① 一次性开启授权**（每台机器一次）：
-
-1. 确认 Chrome ≥ 144（地址栏 `chrome://version` 看 major 版本）；
-2. 地址栏打开 `chrome://inspect/#remote-debugging`；
-3. 勾选 **"Allow remote debugging for this browser instance"**。
-
-**② 跑命令时盯住 Chrome 窗口点“允许”**：
-
-```powershell
-# 清掉 launch 相关覆盖（attach 是默认 mode，不要设 MODE/ENGINE/HEADLESS）
-Remove-Item Env:JEV_BROWSER_MODE, Env:JEV_BROWSER_ENGINE, Env:JEV_BROWSER_HEADLESS -ErrorAction SilentlyContinue
-
-cli doctor --connect        # 先单独验证：成功输出 [connect] OK: ...
-cli execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com"
-```
-
-连接发起后，**Chrome 窗口内会弹出一个连接确认框**——常见坑是它被其他窗口挡住：屏幕上看不到任何反应、命令像“卡住”，其实是在等你点「允许」。授权一次后，该来源的后续连接不再弹窗。
-
-**③ 超时与调参**：每次 attach 尝试有**硬超时**保护（默认 60s，超时报 `BROWSER_BUSY` 并附指引），可用环境变量调整：
-
-```powershell
-$env:JEV_BROWSER_CONNECT_TIMEOUT_MS = "120000"   # 给自己更长时间找弹窗；或调小快速失败
-```
-
-**④ 故障特征速查**：
-
-| 现象 | 含义 |
-|---|---|
-| 60s 超时 + 提示“等授权弹窗” | 弹窗没点（被遮挡）或从未开启授权 → 回 ①② |
-| `Unexpected status 404 .../json/version` | Chrome 调试服务在、但本客户端未授权 → 回 ①② |
-| `DevToolsActivePort file not found` | Chrome 没开远程调试（或用的不是默认用户数据目录）→ 回 ① |
-| 授权后仍连不上 | `chrome://version` 确认 ≥144；重启 Chrome 后重试 |
-
-> attach 路径在本仓库的实机验证仍在推进（P0），结论出来前不要把 attach 模式加入生产 MCP 配置；日常求稳用 launch 模式。
-
-### 步骤 4：MCP 使用（Agent 宿主）
+# 步骤 4：MCP 使用（Agent 宿主）
 
 ① 注册（嵌入模式：MCP 进程内直接跑 Runtime；路径必须绝对且指向构建产物）：
 
@@ -632,7 +1342,20 @@ browser_disconnect { sessionId }                           → 收尾（暂停�
 
 ⑤ MCP 进程环境变量：所有 `JEV_BROWSER_*` 覆盖均生效；转发模式加 `JEV_BROWSER_API_URL/TOKEN`；身份 `JEV_BROWSER_MCP_PRINCIPAL`（默认 `mcp`）。
 
-### 步骤 5：长驻 HTTP API 使用（多客户端共享 / 跨语言集成）
+
+
+### 步骤 6：仓库启动器（统一 MCP 入口）
+
+```powershell
+cd D:\develop\GitNote\Redfish-AI\Tool
+node bin/tool-launcher.js list                # 应列出 jev-browser
+node bin/tool-launcher.js build jev-browser   # 只装依赖并构建
+node bin/tool-launcher.js jev-browser         # 以 MCP stdio 拉起（缺 dist 自动构建）
+```
+
+
+
+# 步骤 5：长驻 HTTP API 使用（多客户端共享 / 跨语言集成）
 
 ① 启动（token 必须设置，否则拒绝启动）：
 
@@ -679,11 +1402,3 @@ curl http://127.0.0.1:3737/v1/tasks/<taskId> -H "Authorization: Bearer <token>" 
 
 CLI 侧等价：任何命令加 `--api http://127.0.0.1:3737` 即自动走转发路径。
 
-### 步骤 6：仓库启动器（统一 MCP 入口）
-
-```powershell
-cd D:\develop\GitNote\Redfish-AI\Tool
-node bin/tool-launcher.js list                # 应列出 jev-browser
-node bin/tool-launcher.js build jev-browser   # 只装依赖并构建
-node bin/tool-launcher.js jev-browser         # 以 MCP stdio 拉起（缺 dist 自动构建）
-```

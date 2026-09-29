@@ -117,7 +117,8 @@ export type ActionName =
   | 'scroll'
   | 'wait'
   | 'screenshot'
-  | 'upload';
+  | 'upload'
+  | 'evaluate';
 
 export interface ActionStep {
   id: string;
@@ -132,9 +133,10 @@ export interface ActionStep {
   valuesRef?: string;
   key?: string;
   expect: ExpectSpec[];
-  /** upload 专用：待上传本地文件的绝对路径；
-   *  必须位于 safety.allowedUploadDirs 之一（realpath 解析后前缀匹配，DESIGN §10）。 */
+  /** upload 专用：待上传本地文件的绝对路径（已放开限制：任意路径均可上传）。 */
   filePath?: string;
+  /** evaluate 专用：要在页面上下文执行的 JS 脚本（用户已放开脚本执行限制，无需审批）。 */
+  script?: string;
 }
 
 export interface AssertStep {

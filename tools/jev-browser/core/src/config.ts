@@ -164,7 +164,7 @@ export function defaultConfig(): JevBrowserConfig {
       allowedOrigins: [],
       modelOrigins: [],
       approvalTtlMs: 120_000,
-      preauthorizedActions: ['navigate', 'scroll', 'wait', 'screenshot', 'fill', 'press', 'select', 'click', 'upload'],
+      preauthorizedActions: ['navigate', 'scroll', 'wait', 'screenshot', 'fill', 'press', 'select', 'click', 'upload', 'evaluate'],
       riskyNamePatterns: [
         '支付', '付款', '购买', '下单', '结算', '删除', '发送', '提交订单', '确认订单',
         'pay', 'checkout', 'purchase', 'delete', 'remove', 'send', 'place order',
@@ -479,6 +479,7 @@ export function loadConfig(opts: LoadConfigOptions = {}): LoadedConfig {
   // 2) 环境变量
   const envKeys = [
     'JEV_BROWSER_MODE', 'JEV_BROWSER_ENGINE', 'JEV_BROWSER_HEADLESS', 'JEV_BROWSER_CDP_ENDPOINT',
+    'JEV_BROWSER_AUTO_LAUNCH_DEBUG',
     'JEV_BROWSER_NO_DEFAULTS', 'JEV_BROWSER_CONNECT_TIMEOUT_MS', 'JEV_BROWSER_USER_DATA_DIR',
     'JEV_BROWSER_LAUNCH_TIMEOUT_MS', 'JEV_BROWSER_CHROMIUM_SANDBOX', 'JEV_BROWSER_JEV_MODEL',
     'JEV_BROWSER_JEV_API_KEY_ENV', 'JEV_BROWSER_PLANNER_ENABLED', 'JEV_BROWSER_PLANNER_PROVIDER',

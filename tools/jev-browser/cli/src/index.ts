@@ -13,6 +13,10 @@ import {
   runDoctor,
   signGrant,
   validateExecuteSteps,
+  prepareChromeDebug,
+  saveAttachEndpointToUserConfig,
+  DEFAULT_CHROME_DEBUG_PORT,
+  defaultChromeDebugUserDataDir,
   type ActionStep,
   type TaskEnvelope,
   type ValueInput,
@@ -60,6 +64,11 @@ const HELP = `jev-browser-cli —— 浏览器控制（Playwright + Jev；方案
 
 命令：
   doctor [--connect]                          诊断配置/环境；--connect 尝试接管（需 Chrome 授权）
+  chrome-debug [--port 9222] [--user-data-dir <目录>] [--executable <chrome路径>]
+                                              手动预热：以固定调试端口启动/复用 Chrome（跨 Windows/macOS；已启动则跳过），
+                                              并把 attach 端点写入用户配置（--no-save 跳过）。
+                                              注：attach 连接时已自动探测/拉起固定端口 Chrome（无需先跑本命令）；
+                                              设 JEV_BROWSER_AUTO_LAUNCH_DEBUG=false 可关闭自动拉起
   connect (--url <url> | --page <id>) --origin <origin> [...]
                                               创建会话（origin 默认不许可任何网站）
   pages --session <id>                        列出标签页
@@ -213,6 +222,38 @@ async function main(): Promise<void> {
       }
       const connectFail = result.connect && !result.connect.ok;
       process.exit(connectFail ? 4 : 0);
+      return;
+    }
+
+    case 'chrome-debug': {
+      if (api) fail('chrome-debug 是本机操作（启动/复用本机 Chrome），不支持 --api 转发模式');
+      const port = str(args.flags, 'port') !== undefined ? Number(str(args.flags, 'port')) : DEFAULT_CHROME_DEBUG_PORT;
+      const userDataDir = str(args.flags, 'user-data-dir') ?? defaultChromeDebugUserDataDir();
+      const executable = str(args.flags, 'executable');
+      const waitMs = str(args.flags, 'wait-ms') !== undefined ? Number(str(args.flags, 'wait-ms')) : 15_000;
+      const save = args.flags['no-save'] !== true;
+      const result = await prepareChromeDebug({ port, userDataDir, executable, waitMs });
+      let savedFile: string | undefined;
+      if (save) savedFile = saveAttachEndpointToUserConfig(result.endpoint).file;
+      const lines: string[] = [
+        result.alreadyRunning
+          ? `[chrome-debug] 端口 ${result.port} 已有调试 Chrome 在运行${result.browserVersion ? `（${result.browserVersion}）` : ''}，跳过启动`
+          : `[chrome-debug] 已启动 Chrome（固定调试端口 ${result.port}）：${result.chromePath}`,
+        `  user-data-dir: ${result.userDataDir}`,
+        `  CDP endpoint:  ${result.endpoint}`,
+      ];
+      if (savedFile) lines.push(`  已写入 attach 端点到配置: ${savedFile}（后续命令无需再设环境变量）`);
+      if (process.env.JEV_BROWSER_MODE === 'launch') {
+        lines.push(`  ⚠ 当前环境变量 JEV_BROWSER_MODE=launch，attach 端点不会生效；请 Remove-Item Env:JEV_BROWSER_MODE / unset JEV_BROWSER_MODE`);
+      }
+      lines.push(`  手动设环境变量（可选）：${process.platform === 'win32' ? 'PowerShell: $env:JEV_BROWSER_CDP_ENDPOINT = "' + result.endpoint + '"' : 'bash/zsh: export JEV_BROWSER_CDP_ENDPOINT="' + result.endpoint + '"'}`);
+      lines.push(`  验证：node cli/dist/index.js doctor --connect`);
+      if (json) {
+        console.log(JSON.stringify({ ...result, savedConfigFile: savedFile ?? null }, null, 2));
+      } else {
+        console.error(lines.join('\n'));
+      }
+      process.exit(0);
       return;
     }
 
