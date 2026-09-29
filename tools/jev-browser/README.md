@@ -413,12 +413,12 @@ npx playwright install chromium
  PowerShell（Windows，永久·写入用户环境变量）
 
  ```powershell
- setx TYPESAFE_API_KEY "apikey_22520acff6f35a0a466db7e645627695e33b_bcb07a31362051ad3ec0c6d07b0c5a75f1995927de97367d85f15bcf11aad0d6"
+ setx TYPESAFE_API_KEY "XXX"
  setx JEV_BROWSER_PLANNER_ENABLED  "true"
  setx JEV_BROWSER_PLANNER_PROVIDER "openai-compatible"
- setx JEV_BROWSER_PLANNER_BASE_URL "https://open.bigmodel.cn"
- setx JEV_BROWSER_PLANNER_MODEL    "deepseek-chat"
- setx JEV_BROWSER_PLANNER_API_KEY  "<规划模型 key>"
+ setx JEV_BROWSER_PLANNER_BASE_URL "https://open.bigmodel.cn/api/coding/paas/v4"
+ setx JEV_BROWSER_PLANNER_MODEL "glm-5.3-flash"
+ setx JEV_BROWSER_PLANNER_API_KEY  "XXX"
  ```
 
 # Chrome配置attach
