@@ -55,7 +55,7 @@ export async function runDoctor(opts: LoadConfigOptions & { attemptConnect?: boo
       detail: found.length ? `${udd} 似乎被占用（${found.join(',')}）；若确认无实例运行可删除后重试` : udd,
     });
     if (config.browser.engine === 'chromium') {
-      checks.push({ name: 'chromiumInstall', ok: true, detail: '未自动检查；显式执行 npx playwright install chromium（浏览器下载是显式 setup，DESIGN §3）' });
+      checks.push({ name: 'chromiumInstall', ok: true, detail: '未自动检查；在 core 目录下执行 pnpm exec playwright install chromium（浏览器下载是显式 setup，DESIGN §3）' });
     }
   }
 

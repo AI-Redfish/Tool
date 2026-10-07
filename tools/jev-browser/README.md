@@ -396,15 +396,19 @@ code / message / retryable
 cd tools/jev-browser
 npm install && npm run build
 node cli/dist/index.js help        # 打印命令帮助 → 构建成功
-npm test                           # 62 个离线测试，无需浏览器/key
+npm test                           # 64 个离线测试，无需浏览器/key
 ```
 
 （可选）Chromium 运行时：默认 attach 模式**不需要**安装；仅显式切换 launch + chromium 时首次需要（约 115MB，国内可加镜像）：
 
 ```powershell
-$env:PLAYWRIGHT_DOWNLOAD_HOST = "https://cdn.npmmirror.com/binaries/playwright"
-npx playwright install chromium
+cd tools\jev-browser\core   # 在 core 包内执行，避免解析到系统里其他语言的 playwright
+pnpm exec playwright install chromium
 ```
+
+> 注意：不要在仓库根目录裸敲 `npx playwright install chromium`——Playwright 是 `core` 包的依赖，
+> 根目录没有它的 bin shim，`npx` 会回退到 PATH 查找，若系统装有 Python 版 playwright
+> （如 conda 环境）会命中那个损坏的脚本（报 `No module named 'playwright.__main__'`）。
 
 
 
@@ -1281,7 +1285,7 @@ node cli/dist/index.js task resume <taskId> --request-id r1
 | `ORIGIN_NOT_ALLOWED` | 目标域没进授权 | `--origin` 补声明该域（注意搜索页/详情页常是两个 origin） |
 | `CONFIG_INVALID` | 配置非法 | 看消息指名的字段；常见：attach+headless、attach+chromium（想无头/用 Chromium 就显式 `JEV_BROWSER_MODE=launch`） |
 | `BROWSER_BUSY` | 连不上/起不来浏览器 | attach：见步骤 3 的授权教程；launch：profile 被占（另一实例在用）或 Chromium 未装（步骤 0） |
-| `CAPABILITY_UNSUPPORTED` | 能力缺失 | 按提示执行 `npx playwright install chromium` 等 |
+| `CAPABILITY_UNSUPPORTED` | 能力缺失 | 按提示执行 `pnpm exec playwright install chromium`（core 目录下）等 |
 | `ACTION_FAILED`（后置条件未通过） | expect 没满足 | 看 `details.failures`：选择器不对/页面没跳转/文本不符；`snapshot` 先看页面实际结构 |
 | `ACTION_OUTCOME_UNKNOWN` | 动作超时且无法证实结果 | 该 profile 被隔离（新写任务拒绝、只读放行）；人工核查页面后 `task resume --rerun-confirm` |
 | `IDEMPOTENCY_CONFLICT` | 同幂等键不同请求体 | 换键或核对请求体；同体重放会返回原任务（这是特性不是错误） |

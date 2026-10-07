@@ -368,7 +368,7 @@ export class PlaywrightConnector implements BrowserConnector {
     } catch (e) {
       const msg = (e as Error).message.split('\n')[0].slice(0, 200);
       if (/Executable doesn't exist/i.test(msg)) {
-        throw err('CAPABILITY_UNSUPPORTED', 'Playwright 管理的 Chromium 未安装。显式执行: npx playwright install chromium');
+        throw err('CAPABILITY_UNSUPPORTED', 'Playwright 管理的 Chromium 未安装。在本工具 core 目录下执行: pnpm exec playwright install chromium（勿用裸 npx，可能命中系统里其他语言的 playwright）');
       }
       if (/ProcessSingleton|Failed to create|SingletonLock/i.test(msg)) {
         throw err('BROWSER_BUSY', `启动失败：profile 目录可能已被占用（另一个 Chrome 实例正在使用）: ${userDataDir}`);

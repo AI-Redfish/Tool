@@ -32,7 +32,8 @@ export interface PageObservation {
 const SNAPSHOT_SCRIPT = `
 (() => {
   const MAX = 400;
-  const sel = 'a[href], button, input, select, textarea, [role], label, summary, option';
+  // h1–h6 有隐式 ARIA 角色 heading（DESIGN §6.2：按 role/name 枚举交互元素）
+  const sel = 'a[href], button, input, select, textarea, [role], label, summary, option, h1, h2, h3, h4, h5, h6';
   const nodes = Array.from(document.querySelectorAll(sel));
   const out = [];
   const roleOf = (el) => {
@@ -53,6 +54,7 @@ const SNAPSHOT_SCRIPT = `
     if (tag === 'option') return 'option';
     if (tag === 'label') return 'label';
     if (tag === 'summary') return 'summary';
+    if (/^h[1-6]$/.test(tag)) return 'heading';
     return tag;
   };
   const visible = (el) => {

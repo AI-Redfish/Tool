@@ -633,6 +633,8 @@ export class Runtime {
         },
         goalRunner,
         onProgress: (r) => {
+          // 步骤结果必须进入 results（envelope.stepResults / cursor 计算 / 崩溃恢复都依赖它）
+          results.push(r);
           if (r.kind === 'action' && r.status === 'done') metrics.actions = (metrics.actions ?? 0) + 1;
         },
       };

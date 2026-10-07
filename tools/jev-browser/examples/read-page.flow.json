@@ -1,5 +1,6 @@
 {
   "schemaVersion": 1,
+  "_说明": "最小确定性流程示例。注意：目标页的 DOM 可能随时间变化（example.com 2026-09 改版后已无 h1 标题）——提取/定位目标请以实际页面为准，或使用 url_contains 等不依赖 DOM 细节的断言。",
   "steps": [
     {
       "id": "goto",
@@ -9,16 +10,9 @@
       "expect": [{ "kind": "url_contains", "value": "example.com" }]
     },
     {
-      "id": "read-link",
-      "kind": "extract",
-      "target": { "by": "role", "role": "link", "name": "Learn more", "exact": true },
-      "fields": ["text", "count"],
-      "saveAs": "link"
-    },
-    {
-      "id": "verify-link",
+      "id": "assert-page",
       "kind": "assert",
-      "expect": [{ "kind": "var_equals", "variable": "link.text", "value": "Learn more" }]
+      "expect": [{ "kind": "url_contains", "value": "example.com" }]
     },
     {
       "id": "shot",
