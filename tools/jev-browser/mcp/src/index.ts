@@ -22,7 +22,6 @@ import {
   type TaskEnvelope,
 } from '@ai-redfish/jev-browser-core';
 
-const PRINCIPAL = process.env.JEV_BROWSER_MCP_PRINCIPAL ?? 'mcp';
 const apiMode = Boolean(process.env.JEV_BROWSER_API_URL && process.env.JEV_BROWSER_API_TOKEN);
 
 const api = apiMode
@@ -76,7 +75,7 @@ server.tool('browser_connect', desc(1), {
 }, async ({ url, pageId, allowedOrigins, modelOrigins }) => {
   try {
     const input = { target: url ? { kind: 'new', url } : { kind: 'existing', pageId }, allowedOrigins, modelOrigins: modelOrigins ?? [] };
-    const result = api ? await api.createSession(input) : await (await rt()).createSession(PRINCIPAL, input as never);
+    const result = api ? await api.createSession(input) : await (await rt()).createSession(input as never);
     return text(result);
   } catch (e) {
     return textErr(e);
@@ -85,7 +84,7 @@ server.tool('browser_connect', desc(1), {
 
 server.tool('browser_pages', desc(2), { sessionId: z.string() }, async ({ sessionId }) => {
   try {
-    const result = api ? await api.pages(sessionId) : await (await rt()).listPages(PRINCIPAL, sessionId);
+    const result = api ? await api.pages(sessionId) : await (await rt()).listPages(sessionId);
     return text(result);
   } catch (e) {
     return textErr(e);
@@ -94,7 +93,7 @@ server.tool('browser_pages', desc(2), { sessionId: z.string() }, async ({ sessio
 
 server.tool('browser_select_page', desc(3), { sessionId: z.string(), pageId: z.string() }, async ({ sessionId, pageId }) => {
   try {
-    const result = api ? await api.selectPage(sessionId, pageId) : await (await rt()).selectPage(PRINCIPAL, sessionId, pageId);
+    const result = api ? await api.selectPage(sessionId, pageId) : await (await rt()).selectPage(sessionId, pageId);
     return text(result);
   } catch (e) {
     return textErr(e);
@@ -103,7 +102,7 @@ server.tool('browser_select_page', desc(3), { sessionId: z.string(), pageId: z.s
 
 server.tool('browser_snapshot', desc(6), { sessionId: z.string(), forModel: z.boolean().optional().describe('true = 打算发给云模型，要求 origin ∈ modelOrigins') }, async ({ sessionId, forModel }) => {
   try {
-    const obs = api ? await api.snapshot(sessionId, forModel) : await (await rt()).snapshot(PRINCIPAL, sessionId, { forModel });
+    const obs = api ? await api.snapshot(sessionId, forModel) : await (await rt()).snapshot(sessionId, { forModel });
     return text(obs);
   } catch (e) {
     return textErr(e);
@@ -119,7 +118,7 @@ server.tool('browser_execute', desc(4), {
     const input = { sessionId, steps, values: (values ?? {}) as Record<string, import('@ai-redfish/jev-browser-core').ValueInput> };
     const queued = api
       ? (await api.execute(input)) as unknown as TaskEnvelope
-      : await (await rt()).execute(PRINCIPAL, sessionId, input as never);
+      : await (await rt()).execute(sessionId, input as never);
     const env = api ? await pollUntilSettled(api, queued.taskId) : await (await rt()).waitEnvelope(queued.taskId);
     return text(env);
   } catch (e) {
@@ -137,7 +136,7 @@ server.tool('browser_run', desc(5), {
     const input = { sessionId, goal, successCriteria, values: values ?? {} };
     const queued = api
       ? (await api.run(input)) as unknown as TaskEnvelope
-      : await (await rt()).run(PRINCIPAL, sessionId, input as never);
+      : await (await rt()).run(sessionId, input as never);
     const env = api ? await pollUntilSettled(api, queued.taskId) : await (await rt()).waitEnvelope(queued.taskId);
     return text(env);
   } catch (e) {
@@ -154,7 +153,7 @@ server.tool('browser_act', desc(7), {
     const input = { step, values: values ?? {} };
     const queued = api
       ? (await api.act(sessionId, input)) as unknown as TaskEnvelope
-      : await (await rt()).act(PRINCIPAL, sessionId, { sessionId, step: step as never, values: (values ?? {}) as Record<string, import('@ai-redfish/jev-browser-core').ValueInput> });
+      : await (await rt()).act(sessionId, { sessionId, step: step as never, values: (values ?? {}) as Record<string, import('@ai-redfish/jev-browser-core').ValueInput> });
     const env = api ? await pollUntilSettled(api, queued.taskId) : await (await rt()).waitEnvelope(queued.taskId);
     return text(env);
   } catch (e) {
@@ -164,7 +163,7 @@ server.tool('browser_act', desc(7), {
 
 server.tool('browser_task_get', desc(8), { taskId: z.string() }, async ({ taskId }) => {
   try {
-    const env = api ? (await api.getTask(taskId)).envelope : (await rt()).getTask(PRINCIPAL, taskId);
+    const env = api ? (await api.getTask(taskId)).envelope : (await rt()).getTask(taskId);
     return text(env);
   } catch (e) {
     return textErr(e);
@@ -177,7 +176,7 @@ server.tool('browser_task_cancel', desc(9), {
   expectedRevision: z.number().optional(),
 }, async ({ taskId, requestId, expectedRevision }) => {
   try {
-    const env = api ? (await api.cancelTask(taskId, { requestId, expectedRevision })).envelope : await (await rt()).cancelTask(PRINCIPAL, taskId, { requestId, expectedRevision });
+    const env = api ? (await api.cancelTask(taskId, { requestId, expectedRevision })).envelope : await (await rt()).cancelTask(taskId, { requestId, expectedRevision });
     return text(env);
   } catch (e) {
     return textErr(e);
@@ -193,7 +192,7 @@ server.tool('browser_task_resume', desc(10), {
 }, async ({ taskId, requestId, expectedRevision, rerunConfirmed, allowReplan }) => {
   try {
     const opts = { requestId, expectedRevision, rerunConfirmed, allowReplan };
-    const env = api ? (await api.resumeTask(taskId, opts)).envelope : await (await rt()).resumeTask(PRINCIPAL, taskId, opts);
+    const env = api ? (await api.resumeTask(taskId, opts)).envelope : await (await rt()).resumeTask(taskId, opts);
     return text(env);
   } catch (e) {
     return textErr(e);
@@ -205,7 +204,7 @@ server.tool('browser_task_approve', desc(11), {
   grant: z.string().describe('HMAC grant token（独立签发，不注入执行 Agent）'),
 }, async ({ taskId, grant }) => {
   try {
-    const env = api ? (await api.approveTask(taskId, { grant })).envelope : (await rt()).approveTask(PRINCIPAL, taskId, grant);
+    const env = api ? (await api.approveTask(taskId, { grant })).envelope : (await rt()).approveTask(taskId, grant);
     return text(env);
   } catch (e) {
     return textErr(e);
@@ -214,7 +213,7 @@ server.tool('browser_task_approve', desc(11), {
 
 server.tool('browser_artifact_get', desc(12), { taskId: z.string() }, async ({ taskId }) => {
   try {
-    const arts = api ? (await api.listArtifacts(taskId)).artifacts : (await rt()).listArtifacts(PRINCIPAL, taskId);
+    const arts = api ? (await api.listArtifacts(taskId)).artifacts : (await rt()).listArtifacts(taskId);
     return text({ taskId, artifacts: arts });
   } catch (e) {
     return textErr(e);
@@ -226,7 +225,7 @@ server.tool('browser_disconnect', desc(13), {
   detachTask: z.boolean().optional().describe('有暂停任务时，显式 detach 才允许断开'),
 }, async ({ sessionId, detachTask }) => {
   try {
-    const result = api ? await api.disconnect(sessionId, detachTask) : await (await rt()).disconnect(PRINCIPAL, sessionId, { detachTask });
+    const result = api ? await api.disconnect(sessionId, detachTask) : await (await rt()).disconnect(sessionId, { detachTask });
     return text(result);
   } catch (e) {
     return textErr(e);

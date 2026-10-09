@@ -21,7 +21,7 @@ test('attach + headless=true 被拒绝（不能隐式换实例）', () => {
 
 test('未知字段被拒绝', () => {
   assert.throws(
-    () => loadConfig({ env: {}, overrides: { browser: { cdpEndpoint: 'http://127.0.0.1:9222' } } }),
+    () => loadConfig({ env: {}, overrides: { browser: { cdpEndpoint: 'http://127.0.0.1:9223' } } }),
     /未知字段/,
   );
 });

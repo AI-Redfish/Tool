@@ -394,10 +394,14 @@ code / message / retryable
 
 ```powershell
 cd tools/jev-browser
-npm install && npm run build
+pnpm install && pnpm build         # 首选 pnpm（托管 pnpm-lock.yaml，安装可复现）
 node cli/dist/index.js help        # 打印命令帮助 → 构建成功
-npm test                           # 64 个离线测试，无需浏览器/key
+pnpm test                          # 64 个离线测试，无需浏览器/key
 ```
+
+> 未装 pnpm 时可用 npm 回退：`npm install && npm run build`。但 npm 与 pnpm 的
+> `node_modules` 布局互不兼容，切换包管理器前必须先删除 `node_modules`，否则 npm 会报
+> `Cannot read properties of null (reading 'matches')`（详见 `.npmrc` 内注释）。
 
 （可选）Chromium 运行时：默认 attach 模式**不需要**安装；仅显式切换 launch + chromium 时首次需要（约 115MB，国内可加镜像）：
 
@@ -437,37 +441,10 @@ attach = 借用你**已打开、已登录**的日常 Chrome（不新开实例、
 2. 地址栏打开 `chrome://inspect/#remote-debugging`；
 3. 勾选 **"Allow remote debugging for this browser instance"**。
 
-
-
-**固定端口调试（自动，无需手动步骤）**
-
-CLI / MCP / API 的 attach 连接已内置「固定端口自动确保」逻辑，连接前探测 `127.0.0.1:9222`：
-
-```powershell
-# 直接执行（首次会自动拉起 9222 调试 Chrome）：
-node cli/dist/index.js execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com"
-node cli/dist/index.js doctor --connect
-```
-
-
-
-等价的手动做法（仅 Windows，供理解原理）：
-
-```powershell
-# 以指定debug端口启动谷歌浏览器，不然谷歌浏览器启动会随机调试端口（先检查 9222 是否已在监听，在跑就不重复启动）。
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir=D:\chrome-debug-profile
-
-# 设置attach连接谷歌浏览器的地址。
-$env:JEV_BROWSER_CDP_ENDPOINT = "http://127.0.0.1:9222"
-
-# macOS 等价写法：
-# "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222 --user-data-dir="$HOME/Library/Application Support/AI-Redfish/jev-browser/chrome-debug-profile"
-# export JEV_BROWSER_CDP_ENDPOINT="http://127.0.0.1:9222"
-```
-
-**注意：自动拉起的是独立 profile 的调试 Chrome**——登录态与日常浏览器不共享；需要借用已登录的日常 Chrome 时，按上面「一次性开启授权」操作，或在日
-
-常 Chrome 已运行时让哨兵路径优先接管它。
+> 为什么每次连接都弹「允许」？这是 Chrome 144+ 对**日常浏览器**的安全设计（授权通道逐次批准），无法关闭。
+> **想免弹窗**：改用固定端口调试 Chrome（独立 profile，固定端口连接永不弹窗）：
+> `node cli/dist/index.js chrome-debug --port 9223`（端点自动写入用户配置，之后免环境变量、免点击；
+> 调试 Chrome 被关闭时，下次连接会自动以同端口同 profile 重新拉起）。日常 Chrome 无需关闭。
 
 
 
@@ -479,6 +456,17 @@ Remove-Item Env:JEV_BROWSER_MODE, Env:JEV_BROWSER_ENGINE, Env:JEV_BROWSER_HEADLE
 
 # 每次 attach 尝试有“硬超时”保护（默认 60s，超时报 `BROWSER_BUSY` 并附指引），可用环境变量调整：
 $env:JEV_BROWSER_CONNECT_TIMEOUT_MS = "60000" 
+```
+
+
+
+**固定端口调试（自动，无需手动步骤）**
+
+CLI / MCP / API 的 attach 连接已内置「固定端口自动确保」逻辑，连接前探测 `127.0.0.1:9223`：
+
+```powershell
+node cli/dist/index.js execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com"
+node cli/dist/index.js doctor --connect
 ```
 
 
@@ -495,7 +483,7 @@ node cli/dist/index.js execute --file examples/read-page.flow.json --url "https:
 
 # CLI 方式
 
-**参数书写规则**
+## **参数书写规则**
 
 - 取值参数两种写法等价：`--origin https://a.com` 与 `--origin=https://a.com`；值本身以 `--` 开头时必须用等号形式。
 - 可重复参数（`--origin`、`--model-origin`）传多次会自动累积为数组。
@@ -508,32 +496,52 @@ node cli/dist/index.js execute --file examples/read-page.flow.json --url "https:
 
 所有子命令可用。
 
-**`--config <path>`** —— 显式指定配置文件（文件必须存在且合法）；默认自动搜索（`--config` > 环境变量 `JEV_BROWSER_CONFIG` > 用户配置目录）。实际生效的文件与 `JEV_BROWSER_*` 环境变量覆盖可用 `doctor` 查看。
+### **`--config <path>`** 
+
+显式指定配置文件（文件必须存在且合法）；优先级：`--config` > 环境变量 `JEV_BROWSER_CONFIG` > 用户配置目录。
 
 ```powershell
 node cli/dist/index.js doctor --config examples/config.attach-chrome.json
 ```
 
-**`--json`** —— stdout 输出完整 envelope / 结构化 JSON（供程序消费）；不带时任务类命令只在 stderr 打印人读摘要，stdout 保持纯净便于管道。
+
+
+### **`--json`**
+
+stdout 输出完整 envelope / 结构化 JSON（供程序消费）；不带时任务类命令只在 stderr 打印人读摘要，stdout 保持纯净便于管道。
 
 ```powershell
 node cli/dist/index.js execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com" --json | jq ".status"
 ```
 
-**`--api <url>`** —— API 转发模式：命令转发到长驻 API（如 `http://127.0.0.1:3737`），Bearer token 取环境变量 `JEV_BROWSER_API_TOKEN`。该模式下 execute/run/act/snapshot 必须先 `connect` 再传 `--session`（不支持一次性 `--url`/`--page`）；`chrome-debug` 是本机操作，不支持转发。
+
+
+### **`--api <url>`**
+
+API 转发模式：命令转发到长驻 API（如 `http://127.0.0.1:3737`），Bearer token 取环境变量 `JEV_BROWSER_API_TOKEN`。
+
+该模式下 execute/run/act/snapshot 必须先 `connect` 拿到sessionId，后续操作传 `--session`。
 
 ```powershell
-node cli/dist/index.js doctor --api http://127.0.0.1:3737
-node cli/dist/index.js pages --api http://127.0.0.1:3737 --session sXX
+node cli/dist/index.js connect    --api http://127.0.0.1:3737 --url "..." --origin
+ "..."   # ① 建会话，返回 sessionId
+   node cli/dist/index.js snapshot   --api http://127.0.0.1:3737 --session sXX --json
+             # ② 观察
+   node cli/dist/index.js execute    --api http://127.0.0.1:3737 --session sXX --file
+ bili.flow.json  # ③ 操作
+   node cli/dist/index.js pages      --api http://127.0.0.1:3737 --session sXX
+ # ④ 看新开的标签页
+   node cli/dist/index.js disconnect --api http://127.0.0.1:3737 --session sXX
+ # ⑤ 结束
 ```
 
-**`--principal <name>`** —— 调用者身份标识（默认 `local`），记入会话/任务/动作账本用于权限校验；仅本地模式生效（`--api` 模式下身份由 token 代表）。
 
-```powershell
-node cli/dist/index.js --principal alice connect --url "https://example.com" --origin "https://example.com"
-```
 
-**`--help`** —— 向 stderr 打印命令速览，退出码 0；等价于不带参数运行或 `help` 子命令（注意：`-h` 单横线不是本 CLI 的旗标）。
+
+
+### **`--help`**
+
+向 stderr 打印命令速览，退出码 0；等价于不带参数运行或 `help` 子命令（注意：`-h` 单横线不是本 CLI 的旗标）。
 
 ```powershell
 node cli/dist/index.js execute --help
@@ -541,13 +549,11 @@ node cli/dist/index.js execute --help
 
 
 
-## 子命令详解
+## 环境与诊断
 
-按分类组织：环境与诊断 → 一次性执行 → 长会话交互 → 任务治理 → 审批签发（建议按此顺序上手；分场景教程见 2.1～2.8）。
+### help
 
-### 环境与诊断
-
-#### help —— 帮助速览
+帮助速览
 
 无参数。向 stderr 打印全部命令与参数速览，退出码 0。三种等价触发方式：
 
@@ -557,7 +563,11 @@ node cli/dist/index.js help
 node cli/dist/index.js execute --help
 ```
 
-#### doctor —— 环境与配置诊断
+
+
+### doctor
+
+ 环境与配置诊断
 
 静态检查 Node 版本、数据目录、配置文件、环境变量覆盖、凭据与浏览器能力，逐项输出 `[OK]/[FAIL]`；不带 `--connect` 时退出码 0。
 
@@ -571,21 +581,44 @@ node cli/dist/index.js doctor
 node cli/dist/index.js doctor --connect
 ```
 
-#### chrome-debug —— 固定调试端口启动/复用 Chrome
 
-attach 连接已自动确保固定端口（见「Chrome配置attach」），本命令是手动预热/预配置入口。不带参数时探测 9222，有则复用、无则拉起，并把 attach 端点写入用户配置。
+
+### chrome-debug 
+
+ chrome-debug 是一个手动预热/预配置命令：确保「固定端口的专用调试 Chrome」在运行，并把
+ 连接地址写进配置。它做三件事（幂等，跑多少次都安全）：
+
+ 它做的三件事
+
+ ```
+   node cli/dist/index.js chrome-debug
+           │
+           ├─ ① 探测 127.0.0.1:9223 ──→ 已有调试 Chrome 在跑？──→ 是：直接复用，什么都
+ 不做（秒回）
+           │                                    │否
+           ├─ ② 拉起专用 Chrome 实例
+           │     chrome --remote-debugging-port=9223
+           │            --user-data-dir=C:\Users\<你
+ >\AppData\Local\AI-Redfish\jev-browser\chrome-debug-profile
+           │     （detached 独立进程：CLI 退出后浏览器继续活着）
+           │
+           └─ ③ 把端点 http://127.0.0.1:9223 写入用户配置 config.json
+                 → 之后所有 CLI/MCP/API 命令自动知道连哪，免设环境变量
+ ```
+
+案例
 
 ```powershell
 node cli/dist/index.js chrome-debug
 ```
 
-**`--port <n>`** —— 固定调试端口（默认 9222）；先探测该端口，已有调试 Chrome 在跑就复用（不重复启动）。
+**`--port <n>`** —— 固定调试端口（默认 9223）；先探测该端口，已有调试 Chrome 在跑就复用（不重复启动）。若端口被**无 CDP 能力的进程**占用（如日常 Chrome，`/json/version` 404），秒级报 `BROWSER_BUSY` 并指出占用者 PID 与命令行（不会拉起后白等超时），换端口重试即可。
 
 ```powershell
 node cli/dist/index.js chrome-debug --port 9223
 ```
 
-**`--user-data-dir <目录>`** —— 调试专用 profile 目录（绝不用日常默认目录，Chrome 136+ 会拒绝在默认目录开调试端口）。默认按平台选取，见「Chrome配置attach」。
+**`--user-data-dir <目录>`** —— 调试专用 profile 目录，不要用日常默认目录。
 
 ```powershell
 node cli/dist/index.js chrome-debug --port 9223 --user-data-dir "D:\chrome-debug-9223"
@@ -609,24 +642,37 @@ node cli/dist/index.js chrome-debug --wait-ms 30000
 node cli/dist/index.js chrome-debug --no-save
 ```
 
-### 一次性执行
 
-#### execute —— 确定性步骤（零模型调用）
 
-执行 FlowStep 数组（action/assert/extract/branch/forEach），不调用任何模型；步骤契约见 2.6。任务落定后按状态退出：0 done / 3 paused / 4 failed / 130 cancelled。
+## 一次性执行
 
-**`--file <path>`** —— FlowStep 数组文件；也接受完整 flow 对象 `{schemaVersion, steps}`，自动拆包取 steps。与 `--steps` 二选一，同时给时 `--file` 优先。
+### execute
+
+确定性步骤（零模型调用）。
+
+执行 FlowStep 数组（action/assert/extract/branch/forEach），不调用任何模型。
+
+任务落定后按状态退出：0 done / 3 paused / 4 failed / 130 cancelled。
+
+
+
+**`--file <path>`** —— FlowStep 数组文件。自动拆包取 steps。
+
+与 `--steps` 二选一，同时给时 `--file` 优先。
 
 ```powershell
 node cli/dist/index.js execute --file examples/read-page.flow.json --url "https://example.com" --origin "https://example.com"
 ```
 
-**`--steps <json>`** —— 直接给 FlowStep 数组。三种等价写法：内联 JSON 字符串、已存在的文件路径、`-`（从 stdin 读）。
+
+
+**`--steps <json>`** —— 直接给 FlowStep 数组。
 
 ```powershell
-node cli/dist/index.js execute --steps '[{"id":"go","kind":"action","action":"navigate","value":"https://example.com","expect":[{"kind":"url_contains","value":"example.com"}]}]' --url "https://example.com" --origin "https://example.com"
-echo '[{"id":"go","kind":"action","action":"navigate","value":"https://example.com","expect":[{"kind":"url_contains","value":"example.com"}]}]' | node cli/dist/index.js execute --steps - --url "https://example.com" --origin "https://example.com"
+
 ```
+
+
 
 **`--url <url>`** —— 目标页三选一（`--url`/`--page`/`--session`）：一次性会话，自动新开页、跑完自动断开（需配 `--origin`）。
 
@@ -646,17 +692,23 @@ node cli/dist/index.js execute --file examples/read-page.flow.json --page p0 --o
 node cli/dist/index.js execute --file bili-open4.flow.json --session sXX
 ```
 
+
+
 **`--origin <o>`** —— 会话授权域（可重复传；一次性会话必填*）。默认空 = 不许可任何网站，首个域外动作报 `ORIGIN_NOT_ALLOWED`（*CLI 不强制校验，MCP 侧为硬必填）。搜索页/详情页常是两个域，都要声明。
 
 ```powershell
 node cli/dist/index.js execute --file search.flow.json --url "https://www.bilibili.com" --origin "https://www.bilibili.com" --origin "https://search.bilibili.com"
 ```
 
+
+
 **`--model-origin <o>`** —— 允许页面摘要外发云模型的域（可重复，必须 ⊆ origin）；默认空 = 禁止外发。flow 含 goal 语义步骤时必须声明。
 
 ```powershell
 node cli/dist/index.js execute --file with-goal.flow.json --url "https://example.com" --origin "https://example.com" --model-origin "https://example.com"
 ```
+
+
 
 **`--values <json>`** —— 变量初值（标量字典），供步骤 `valuesRef` 引用（三大用法见 2.3）。
 
@@ -670,7 +722,11 @@ node cli/dist/index.js execute --file search.flow.json --url "https://www.bilibi
 node cli/dist/index.js execute --file order.flow.json --session sXX --idempotency-key order-20260101-001
 ```
 
-#### snapshot —— 只读快照
+
+
+### snapshot 
+
+只读快照
 
 stdout 总是输出快照 JSON（不受 `--json` 影响）；`elements` 含 role/name/text，供写 flow 定位。
 
@@ -710,7 +766,9 @@ node cli/dist/index.js snapshot --url "https://example.com" --origin "https://ex
 node cli/dist/index.js snapshot --session sXX --for-model
 ```
 
-#### run —— 自主任务（规划 + 执行）
+### run 
+
+自主任务（规划 + 执行）。
 
 前置（一次性配置；规划器与 Jev 是两份独立凭据）：
 
@@ -1154,7 +1212,7 @@ node cli/dist/index.js execute --file login.flow.json `
 实测示例（无 key 可照抄，用 `--api` 长驻模式；B 站搜索并打开第 4 条结果）：
 
 ```powershell
-# 终端 1：起长驻 API（attach 默认模式：接管日常 Chrome，连接时自动探测/拉起 9222 调试 Chrome，见「Chrome配置attach」）
+# 终端 1：起长驻 API（attach 默认模式：接管日常 Chrome，连接时自动探测/拉起 9223 调试 Chrome，见「Chrome配置attach」）
 $env:JEV_BROWSER_API_TOKEN = "<随机长串>"
 # attach 是默认 mode，勿设 JEV_BROWSER_MODE/ENGINE/HEADLESS（设过就先清掉：见「Chrome配置attach → 环境变量」）
 node api/dist/index.js
@@ -1284,7 +1342,7 @@ node cli/dist/index.js task resume <taskId> --request-id r1
 |---|---|---|
 | `ORIGIN_NOT_ALLOWED` | 目标域没进授权 | `--origin` 补声明该域（注意搜索页/详情页常是两个 origin） |
 | `CONFIG_INVALID` | 配置非法 | 看消息指名的字段；常见：attach+headless、attach+chromium（想无头/用 Chromium 就显式 `JEV_BROWSER_MODE=launch`） |
-| `BROWSER_BUSY` | 连不上/起不来浏览器 | attach：见步骤 3 的授权教程；launch：profile 被占（另一实例在用）或 Chromium 未装（步骤 0） |
+| `BROWSER_BUSY` | 连不上/起不来浏览器 | attach：见步骤 3 的授权教程；固定端口以 `JEV_BROWSER_CDP_ENDPOINT`（默认 9223）为准，被占时不漂移端口，秒级报错并给出占用者 PID 与命令行（换端口需同步改环境变量，或结束占用进程）；launch：profile 被占（另一实例在用）或 Chromium 未装（步骤 0） |
 | `CAPABILITY_UNSUPPORTED` | 能力缺失 | 按提示执行 `pnpm exec playwright install chromium`（core 目录下）等 |
 | `ACTION_FAILED`（后置条件未通过） | expect 没满足 | 看 `details.failures`：选择器不对/页面没跳转/文本不符；`snapshot` 先看页面实际结构 |
 | `ACTION_OUTCOME_UNKNOWN` | 动作超时且无法证实结果 | 该 profile 被隔离（新写任务拒绝、只读放行）；人工核查页面后 `task resume --rerun-confirm` |
@@ -1344,7 +1402,7 @@ browser_artifact_get { taskId }                            → 列产物
 browser_disconnect { sessionId }                           → 收尾（暂停任务需 detachTask:true）
 ```
 
-⑤ MCP 进程环境变量：所有 `JEV_BROWSER_*` 覆盖均生效；转发模式加 `JEV_BROWSER_API_URL/TOKEN`；身份 `JEV_BROWSER_MCP_PRINCIPAL`（默认 `mcp`）。
+⑤ MCP 进程环境变量：所有 `JEV_BROWSER_*` 覆盖均生效；转发模式加 `JEV_BROWSER_API_URL/TOKEN`。
 
 
 

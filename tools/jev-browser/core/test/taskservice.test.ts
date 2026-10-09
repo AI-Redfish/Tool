@@ -61,13 +61,13 @@ test('execute：确定性流程完成，模型调用为 0', async () => {
   const page = new FakePage({ url: 'https://example.com/page', bodyText: 'Example Domain' });
   const judge = new FakeJudge({ decisions: [] });
   const rt = makeRuntime(testConfig(), [page], judge);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
   });
   assert.equal(session.status, 'ready');
-  const env = await rt.execute('p1', session.sessionId, {
+  const env = await rt.execute(session.sessionId, {
     sessionId: session.sessionId,
     steps: flow([
       { id: 's1', kind: 'extract', target: { by: 'css', selector: 'h1' }, fields: ['text'], saveAs: 'h' },
@@ -85,13 +85,13 @@ test('execute：确定性流程完成，模型调用为 0', async () => {
 test('execute：写操作缺 expect 被拒绝；非授权 origin 被策略拦截', async () => {
   const page = new FakePage({ url: 'https://example.com/' });
   const rt = makeRuntime(testConfig(), [page]);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
   });
   await assert.rejects(
-    rt.execute('p1', session.sessionId, {
+    rt.execute(session.sessionId, {
       sessionId: session.sessionId,
       // 故意缺少 expect：由 validateExecuteSteps 在提交时拒绝（类型层用 as 绕过以表达非法输入）
       steps: [{ id: 'w1', kind: 'action', action: 'fill', target: { by: 'css', selector: '#q' }, value: 'x' }] as unknown as FlowStep[],
@@ -100,7 +100,7 @@ test('execute：写操作缺 expect 被拒绝；非授权 origin 被策略拦截
     /expect 后置条件/,
   );
   // navigate 到未授权 origin → ORIGIN_NOT_ALLOWED → failed
-  const env = await rt.execute('p1', session.sessionId, {
+  const env = await rt.execute(session.sessionId, {
     sessionId: session.sessionId,
     steps: flow([{ id: 'nav', kind: 'action', action: 'navigate', value: 'https://evil.com/', expect: [{ kind: 'url_contains', value: 'evil' }] }]),
     values: {},
@@ -114,7 +114,7 @@ test('execute：写操作缺 expect 被拒绝；非授权 origin 被策略拦截
 test('幂等：同键同体返回原任务；同键不同体冲突', async () => {
   const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
   const rt = makeRuntime(testConfig(), [page]);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
@@ -124,11 +124,11 @@ test('幂等：同键同体返回原任务；同键不同体冲突', async () =>
     steps: flow([{ id: 'a', kind: 'assert', expect: [] }]),
     values: {},
   };
-  const e1 = await rt.execute('p1', session.sessionId, input as never, { idempotencyKey: 'k1' });
-  const e2 = await rt.execute('p1', session.sessionId, input as never, { idempotencyKey: 'k1' });
+  const e1 = await rt.execute(session.sessionId, input as never, { idempotencyKey: 'k1' });
+  const e2 = await rt.execute(session.sessionId, input as never, { idempotencyKey: 'k1' });
   assert.equal(e1.taskId, e2.taskId);
   await assert.rejects(
-    rt.execute('p1', session.sessionId, { ...input, steps: flow([{ id: 'b', kind: 'assert', expect: [] }]) } as never, { idempotencyKey: 'k1' }),
+    rt.execute(session.sessionId, { ...input, steps: flow([{ id: 'b', kind: 'assert', expect: [] }]) } as never, { idempotencyKey: 'k1' }),
     (e: unknown) => (e as { code?: string }).code === 'IDEMPOTENCY_CONFLICT',
   );
   await rt.close();
@@ -142,7 +142,7 @@ test('高风险目标暂停 needs_confirmation；approve + resume 后完成', as
   process.env.JEV_BROWSER_APPROVAL_KEY = 'secret-key';
   const page = new FakePage({ url: 'https://example.com/cart', bodyText: 'ok' });
   const rt = makeRuntime(testConfig(), [page]);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
@@ -150,7 +150,7 @@ test('高风险目标暂停 needs_confirmation；approve + resume 后完成', as
   const steps = flow([
     { id: 'risk', kind: 'action', action: 'click', target: { by: 'role', role: 'button', name: '确认支付' }, expect: [{ kind: 'text_present', value: 'ok' }] },
   ]);
-  const env = await rt.execute('p1', session.sessionId, { sessionId: session.sessionId, steps: steps as never, values: {} });
+  const env = await rt.execute(session.sessionId, { sessionId: session.sessionId, steps: steps as never, values: {} });
   const paused = await rt.waitEnvelope(env.taskId);
   assert.equal(paused.status, 'paused');
   assert.equal(paused.pauseReason, 'needs_confirmation');
@@ -159,7 +159,7 @@ test('高风险目标暂停 needs_confirmation；approve + resume 后完成', as
 
   // 无 grant 的 resume 被拒绝
   await assert.rejects(
-    rt.resumeTask('p1', paused.taskId, { requestId: 'r1' }),
+    rt.resumeTask(paused.taskId, { requestId: 'r1' }),
     (e: unknown) => (e as { code?: string }).code === 'NEEDS_CONFIRMATION',
   );
   // 用执行 Agent 的身份伪造 approved: true 没有任何通道 —— 只能凭 grant
@@ -167,19 +167,19 @@ test('高风险目标暂停 needs_confirmation；approve + resume 后完成', as
     { grantId: 'g1', taskId: paused.taskId, actionRevision: paused.pendingApproval!.actionRevision, action: 'click', issuedAt: Date.now(), expiresAt: Date.now() + 60_000 },
     'secret-key',
   );
-  const approved = rt.approveTask('p1', paused.taskId, signature);
+  const approved = rt.approveTask(paused.taskId, signature);
   assert.equal(approved.status, 'paused'); // approve 只登记，不执行
 
-  const resumed = await rt.resumeTask('p1', paused.taskId, { requestId: 'r2' });
+  const resumed = await rt.resumeTask(paused.taskId, { requestId: 'r2' });
   const final = await rt.waitEnvelope(resumed.taskId);
   assert.equal(final.status, 'done');
   // 取消任务1释放 profile 预约；grant 一次性：新任务（新 actionRevision/新 taskId）不能复用旧 grant
-  await rt.cancelTask('p1', paused.taskId, { requestId: 'r3' });
-  const env2 = await rt.execute('p1', session.sessionId, { sessionId: session.sessionId, steps: steps as never, values: {} });
+  await rt.cancelTask(paused.taskId, { requestId: 'r3' });
+  const env2 = await rt.execute(session.sessionId, { sessionId: session.sessionId, steps: steps as never, values: {} });
   const paused2 = await rt.waitEnvelope(env2.taskId);
   assert.equal(paused2.status, 'paused');
   assert.throws(
-    () => rt.approveTask('p1', paused2.taskId, signature),
+    () => rt.approveTask(paused2.taskId, signature),
     (e: unknown) => (e as { code?: string }).code === 'GRANT_INVALID',
   );
   await rt.close();
@@ -192,7 +192,7 @@ test('高风险目标暂停 needs_confirmation；approve + resume 后完成', as
 test('cancel：queued 立即取消；同 requestId 重放返回原结果', async () => {
   const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
   const rt = makeRuntime(testConfig(), [page]);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
@@ -201,21 +201,21 @@ test('cancel：queued 立即取消；同 requestId 重放返回原结果', async
   let release!: () => void;
   const gate = new Promise<void>((r) => { release = r; });
   (page as unknown as { waitForTimeout: () => Promise<void> }).waitForTimeout = () => gate;
-  const blocker = await rt.execute('p1', session.sessionId, {
+  const blocker = await rt.execute(session.sessionId, {
     sessionId: session.sessionId,
     steps: flow([{ id: 'slow', kind: 'action', action: 'wait', value: 100, expect: [] }]),
     values: {},
   });
   await new Promise((r) => setTimeout(r, 50)); // 让 blocker 进入 running
-  const queued = await rt.execute('p1', session.sessionId, {
+  const queued = await rt.execute(session.sessionId, {
     sessionId: session.sessionId,
     steps: flow([{ id: 'a', kind: 'assert', expect: [] }]),
     values: {},
   });
   assert.equal(queued.status, 'queued');
-  const cancelled = await rt.cancelTask('p1', queued.taskId, { requestId: 'c1' });
+  const cancelled = await rt.cancelTask(queued.taskId, { requestId: 'c1' });
   assert.equal(cancelled.status, 'cancelled');
-  const replay = await rt.cancelTask('p1', queued.taskId, { requestId: 'c1' });
+  const replay = await rt.cancelTask(queued.taskId, { requestId: 'c1' });
   assert.equal(replay.taskId, queued.taskId);
   assert.equal(replay.status, 'cancelled');
   release(); // 放行 blocker，避免悬挂
@@ -227,33 +227,33 @@ test('disconnect：有活动任务拒绝；暂停任务需显式 detach；断开
   process.env.JEV_BROWSER_APPROVAL_KEY = 'k';
   const page = new FakePage({ url: 'https://example.com/', bodyText: 'ok' });
   const rt = makeRuntime(testConfig(), [page]);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
   });
-  const env = await rt.execute('p1', session.sessionId, {
+  const env = await rt.execute(session.sessionId, {
     sessionId: session.sessionId,
     steps: flow([{ id: 'risk', kind: 'action', action: 'click', target: { by: 'role', role: 'button', name: '确认支付' }, expect: [{ kind: 'text_present', value: 'ok' }] }]),
     values: {},
   });
   const paused = await rt.waitEnvelope(env.taskId);
   assert.equal(paused.status, 'paused');
-  await assert.rejects(rt.disconnect('p1', session.sessionId), /detachTask/);
-  await rt.disconnect('p1', session.sessionId, { detachTask: true });
+  await assert.rejects(rt.disconnect(session.sessionId), /detachTask/);
+  await rt.disconnect(session.sessionId, { detachTask: true });
   const after = store.getSession(session.sessionId);
   assert.equal(after?.status, 'disconnected');
   // 断开后 resume：needs_confirmation 需 grant；重绑页面后继续
   await assert.rejects(
-    rt.resumeTask('p1', paused.taskId, { requestId: 'r8' }),
+    rt.resumeTask(paused.taskId, { requestId: 'r8' }),
     (e: unknown) => (e as { code?: string }).code === 'NEEDS_CONFIRMATION',
   );
   const { signature } = signGrant(
     { grantId: 'g9', taskId: paused.taskId, actionRevision: paused.pendingApproval!.actionRevision, action: 'click', issuedAt: Date.now(), expiresAt: Date.now() + 60_000 },
     'k',
   );
-  rt.approveTask('p1', paused.taskId, signature);
-  const resumed = await rt.resumeTask('p1', paused.taskId, { requestId: 'r9' });
+  rt.approveTask(paused.taskId, signature);
+  const resumed = await rt.resumeTask(paused.taskId, { requestId: 'r9' });
   const final = await rt.waitEnvelope(resumed.taskId);
   assert.equal(final.status, 'done');
   await rt.close();
@@ -266,17 +266,17 @@ test('disconnect：有活动任务拒绝；暂停任务需显式 detach；断开
 test('run：planner 未配置快速失败；successCriteria 缺失拒绝', async () => {
   const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
   const rt = makeRuntime(testConfig(), [page]); // planner = null
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: ['https://example.com'],
   });
   await assert.rejects(
-    rt.run('p1', session.sessionId, { sessionId: session.sessionId, goal: 'g', successCriteria: 's', values: {} }),
+    rt.run(session.sessionId, { sessionId: session.sessionId, goal: 'g', successCriteria: 's', values: {} }),
     (e: unknown) => (e as { code?: string }).code === 'PLANNER_NOT_CONFIGURED',
   );
   await assert.rejects(
-    rt.run('p1', session.sessionId, { sessionId: session.sessionId, goal: 'g', successCriteria: ' ', values: {} }),
+    rt.run(session.sessionId, { sessionId: session.sessionId, goal: 'g', successCriteria: ' ', values: {} }),
     (e: unknown) => (e as { code?: string }).code === 'INVALID_INPUT',
   );
   await rt.close();
@@ -294,12 +294,12 @@ test('run：规划器产出步骤 → 执行 → Jev 任务级验收 → done', 
     usage: () => ({ requests: 1, inputTokens: 50, outputTokens: 20 }),
   };
   const rt = makeRuntime(testConfig(), [page], judge, planner as never);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: ['https://example.com'],
   });
-  const env = await rt.run('p1', session.sessionId, {
+  const env = await rt.run(session.sessionId, {
     sessionId: session.sessionId,
     goal: '搜索并打开结果页',
     successCriteria: '结果页已打开且包含 result-page',
@@ -322,12 +322,12 @@ test('run：Jev 验收证据不足 → likely_done 暂停，不计 done', async 
   const judge = new FakeJudge({ decisions: [], checkP: 0.4 });
   const planner = { plan: async () => [{ id: 'a', kind: 'assert', expect: [] }] as FlowStep[] };
   const rt = makeRuntime(testConfig(), [page], judge, planner as never);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: ['https://example.com'],
   });
-  const env = await rt.run('p1', session.sessionId, {
+  const env = await rt.run(session.sessionId, {
     sessionId: session.sessionId,
     goal: 'g',
     successCriteria: '页面应显示完成标志',
@@ -346,7 +346,7 @@ test('候选页按授权域过滤；kind:new 的 pageId 基于真实下标', asy
   ];
   const rt = makeRuntime(testConfig(), pages);
   // 多页且只授权 example.com：单页可自动绑定（唯一候选）
-  const s = await rt.createSession('p1', {
+  const s = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
@@ -354,10 +354,10 @@ test('候选页按授权域过滤；kind:new 的 pageId 基于真实下标', asy
   assert.equal(s.status, 'ready');
   assert.equal(s.pageId, 'p0');
   // 列表只包含授权域：other.com 被过滤
-  const listed = await rt.listPages('p1', s.sessionId);
+  const listed = await rt.listPages(s.sessionId);
   assert.deepEqual(listed.map((c) => c.pageId), ['p0']);
   // kind:new：新页追加到末尾（index 2），pageId 必须是真实下标（修复 indexOf 同一性 bug）
-  const s2 = await rt.createSession('p1', {
+  const s2 = await rt.createSession({
     target: { kind: 'new', url: 'https://example.com/new' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
@@ -365,11 +365,11 @@ test('候选页按授权域过滤；kind:new 的 pageId 基于真实下标', asy
   assert.equal(s2.pageId, 'p2');
   // target 非法输入被拒绝
   await assert.rejects(
-    rt.createSession('p1', { target: { kind: 'new', url: 'ftp://x' } as never, allowedOrigins: ['https://example.com'], modelOrigins: [] }),
+    rt.createSession({ target: { kind: 'new', url: 'ftp://x' } as never, allowedOrigins: ['https://example.com'], modelOrigins: [] }),
     (e: unknown) => (e as { code?: string }).code === 'INVALID_INPUT',
   );
   await assert.rejects(
-    rt.createSession('p1', { target: { kind: 'existing', pageId: 'tab-9' } as never, allowedOrigins: ['https://example.com'], modelOrigins: [] }),
+    rt.createSession({ target: { kind: 'existing', pageId: 'tab-9' } as never, allowedOrigins: ['https://example.com'], modelOrigins: [] }),
     (e: unknown) => (e as { code?: string }).code === 'INVALID_INPUT',
   );
   await rt.close();
@@ -378,7 +378,7 @@ test('候选页按授权域过滤；kind:new 的 pageId 基于真实下标', asy
 test('artifact 24h 保留期：终态任务的过期产物被清理（文件 + 元数据）', async () => {
   const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
   const rt = makeRuntime(testConfig(), [page]);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
@@ -389,7 +389,6 @@ test('artifact 24h 保留期：终态任务的过期产物被清理（文件 + �
   store.insertTask({
     taskId: oldTaskId,
     sessionId: session.sessionId,
-    principal: 'p1',
     mode: 'execute',
     status: 'done',
     pauseReason: null,
@@ -422,12 +421,12 @@ test('grant 重复 approve 幂等（同 token 二次登记不崩溃）', async (
   process.env.JEV_BROWSER_APPROVAL_KEY = 'k2';
   const page = new FakePage({ url: 'https://example.com/', bodyText: 'ok' });
   const rt = makeRuntime(testConfig(), [page]);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
   });
-  const env = await rt.execute('p1', session.sessionId, {
+  const env = await rt.execute(session.sessionId, {
     sessionId: session.sessionId,
     steps: flow([{ id: 'risk', kind: 'action', action: 'click', target: { by: 'role', role: 'button', name: '确认支付' }, expect: [{ kind: 'text_present', value: 'ok' }] }]),
     values: {},
@@ -438,9 +437,9 @@ test('grant 重复 approve 幂等（同 token 二次登记不崩溃）', async (
     { grantId: 'gdup', taskId: paused.taskId, actionRevision: paused.pendingApproval!.actionRevision, action: 'click', issuedAt: Date.now(), expiresAt: Date.now() + 60_000 },
     'k2',
   );
-  rt.approveTask('p1', paused.taskId, signature);
-  rt.approveTask('p1', paused.taskId, signature); // 重复登记：INSERT OR IGNORE
-  const resumed = await rt.resumeTask('p1', paused.taskId, { requestId: 'rd1' });
+  rt.approveTask(paused.taskId, signature);
+  rt.approveTask(paused.taskId, signature); // 重复登记：INSERT OR IGNORE
+  const resumed = await rt.resumeTask(paused.taskId, { requestId: 'rd1' });
   const final = await rt.waitEnvelope(resumed.taskId);
   assert.equal(final.status, 'done');
   await rt.close();
@@ -484,12 +483,12 @@ test('run 恢复 + allowReplan：未完成后缀重规划受 maxReplans 预算',
   const cfg = testConfig();
   cfg.runtime.maxReplans = 1;
   const rt = makeRuntime(cfg, [page], judge, planner as never);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: ['https://example.com'],
   });
-  const env = await rt.run('p1', session.sessionId, {
+  const env = await rt.run(session.sessionId, {
     sessionId: session.sessionId,
     goal: 'g',
     successCriteria: '完成',
@@ -500,11 +499,11 @@ test('run 恢复 + allowReplan：未完成后缀重规划受 maxReplans 预算',
   assert.equal(paused.pauseReason, 'ambiguous');
   // allowReplan 不能绕过 ambiguous 暂停的人工确认要求（安全语义）
   await assert.rejects(
-    rt.resumeTask('p1', env.taskId, { requestId: 'w1', allowReplan: true }),
+    rt.resumeTask(env.taskId, { requestId: 'w1', allowReplan: true }),
     (e: unknown) => (e as { code?: string }).code === 'TASK_NOT_RESUMABLE',
   );
   // 重规划：后缀替换为 assert，验收通过 → done
-  const resumed = await rt.resumeTask('p1', env.taskId, { requestId: 'r1', allowReplan: true, rerunConfirmed: true });
+  const resumed = await rt.resumeTask(env.taskId, { requestId: 'r1', allowReplan: true, rerunConfirmed: true });
   const final = await rt.waitEnvelope(resumed.taskId);
   assert.equal(final.status, 'done');
   assert.equal(final.metrics.replans, 1);
@@ -516,19 +515,19 @@ test('run 恢复 + allowReplan：未完成后缀重规划受 maxReplans 预算',
 test('snapshot：跨会话窃读被预约拦截；本会话暂停任务期间允许只读', async () => {
   const page = new FakePage({ url: 'https://example.com/', bodyText: 'x', clickError: new Error('TimeoutError: 30000ms exceeded') });
   const rt = makeRuntime(testConfig(), [page]);
-  const s1 = await rt.createSession('p1', {
+  const s1 = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
   });
   // 用另一个会话绑定同一 profile 页面（同宿主多会话场景）
-  const s2 = await rt.createSession('p2', {
+  const s2 = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
   });
   // s1 产生未知在途动作 → 隔离 + profile 预约（paused）
-  const env = await rt.execute('p1', s1.sessionId, {
+  const env = await rt.execute(s1.sessionId, {
     sessionId: s1.sessionId,
     steps: flow([{ id: 't', kind: 'action', action: 'click', target: { by: 'css', selector: '#x' }, expect: [{ kind: 'url_contains', value: 'never' }] }]),
     values: {},
@@ -536,11 +535,11 @@ test('snapshot：跨会话窃读被预约拦截；本会话暂停任务期间允
   await rt.waitEnvelope(env.taskId);
   // s2 的快照被预约拦截（防窃读）
   await assert.rejects(
-    rt.snapshot('p2', s2.sessionId),
+    rt.snapshot(s2.sessionId),
     (e: unknown) => (e as { code?: string }).code === 'SESSION_BUSY',
   );
   // s1 自身（预约任务所属会话）允许只读
-  const obs = await rt.snapshot('p1', s1.sessionId);
+  const obs = await rt.snapshot(s1.sessionId);
   assert.ok(obs);
   await rt.close();
 });
@@ -548,12 +547,12 @@ test('snapshot：跨会话窃读被预约拦截；本会话暂停任务期间允
 test('evidence：断言失败进入 envelope.evidence（DESIGN §8.2）', async () => {
   const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
   const rt = makeRuntime(testConfig(), [page]);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
   });
-  const env = await rt.execute('p1', session.sessionId, {
+  const env = await rt.execute(session.sessionId, {
     sessionId: session.sessionId,
     steps: flow([{ id: 'bad', kind: 'assert', expect: [{ kind: 'text_present', value: 'absent-text' }] }]),
     values: {},
@@ -565,34 +564,15 @@ test('evidence：断言失败进入 envelope.evidence（DESIGN §8.2）', async 
   await rt.close();
 });
 
-test('跨主体访问：任务与会话按 principal 隔离', async () => {
-  const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
-  const rt = makeRuntime(testConfig(), [page]);
-  const session = await rt.createSession('p1', {
-    target: { kind: 'existing' },
-    allowedOrigins: ['https://example.com'],
-    modelOrigins: [],
-  });
-  const env = await rt.execute('p1', session.sessionId, {
-    sessionId: session.sessionId,
-    steps: flow([{ id: 'a', kind: 'assert', expect: [] }]),
-    values: {},
-  });
-  await rt.waitEnvelope(env.taskId);
-  assert.throws(() => rt.getTask('p2', env.taskId), (e: unknown) => (e as { code?: string }).code === 'NOT_FOUND');
-  await assert.rejects(rt.disconnect('p2', session.sessionId), (e: unknown) => (e as { code?: string }).code === 'NOT_FOUND');
-  await rt.close();
-});
-
 test('unknown 隔离：超时未知动作后，新写任务被拒绝、只读放行', async () => {
   const page = new FakePage({ url: 'https://example.com/', bodyText: 'x', clickError: new Error('TimeoutError: 30000ms exceeded') });
   const rt = makeRuntime(testConfig(), [page]);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
   });
-  const env = await rt.execute('p1', session.sessionId, {
+  const env = await rt.execute(session.sessionId, {
     sessionId: session.sessionId,
     steps: flow([{ id: 't1', kind: 'action', action: 'click', target: { by: 'css', selector: '#x' }, expect: [{ kind: 'url_contains', value: 'never' }] }]),
     values: {},
@@ -602,7 +582,7 @@ test('unknown 隔离：超时未知动作后，新写任务被拒绝、只读放
   assert.equal(paused.error?.code, 'ACTION_OUTCOME_UNKNOWN');
 
   // 新写任务（fill 是写动作）被隔离拒绝
-  const writeEnv = await rt.execute('p1', session.sessionId, {
+  const writeEnv = await rt.execute(session.sessionId, {
     sessionId: session.sessionId,
     steps: flow([{ id: 'w', kind: 'action', action: 'fill', target: { by: 'css', selector: '#y' }, value: 'v', expect: [{ kind: 'text_present', value: 'v' }] }]),
     values: {},
@@ -612,8 +592,8 @@ test('unknown 隔离：超时未知动作后，新写任务被拒绝、只读放
   assert.equal(writeFinal.error?.code, 'BROWSER_BUSY');
 
   // 取消隔离中的任务（释放预约；隔离记录仍在），只读任务放行
-  await rt.cancelTask('p1', paused.taskId, { requestId: 'cx' });
-  const readEnv = await rt.execute('p1', session.sessionId, {
+  await rt.cancelTask(paused.taskId, { requestId: 'cx' });
+  const readEnv = await rt.execute(session.sessionId, {
     sessionId: session.sessionId,
     steps: flow([{ id: 'r', kind: 'assert', expect: [] }]),
     values: {},
@@ -626,7 +606,7 @@ test('unknown 隔离：超时未知动作后，新写任务被拒绝、只读放
 test('崩溃恢复：遗留 running → paused(interrupted)；需 rerunConfirmed 才能恢复', async () => {
   const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
   const rt = makeRuntime(testConfig(), [page]);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
@@ -637,7 +617,6 @@ test('崩溃恢复：遗留 running → paused(interrupted)；需 rerunConfirmed
   store.insertTask({
     taskId,
     sessionId: session.sessionId,
-    principal: 'p1',
     mode: 'execute',
     status: 'running',
     pauseReason: null,
@@ -665,11 +644,11 @@ test('崩溃恢复：遗留 running → paused(interrupted)；需 rerunConfirmed
   assert.ok(rec.recovered >= 1);
   // 未确认的 resume 拒绝
   await assert.rejects(
-    rt.resumeTask('p1', taskId, { requestId: 'x1' }),
+    rt.resumeTask(taskId, { requestId: 'x1' }),
     /rerunConfirmed/,
   );
   // 显式确认后恢复（wait 目标在 FakePage 中可见 → done，状态机路径完整）
-  const resumed = await rt.resumeTask('p1', taskId, { requestId: 'x2', rerunConfirmed: true });
+  const resumed = await rt.resumeTask(taskId, { requestId: 'x2', rerunConfirmed: true });
   assert.equal(resumed.status, 'queued');
   const final = await rt.waitEnvelope(taskId);
   assert.equal(final.status, 'done');
@@ -679,12 +658,12 @@ test('崩溃恢复：遗留 running → paused(interrupted)；需 rerunConfirmed
 test('secretRef：缺环境变量暂停 needs_input；补齐后恢复成功', async () => {
   const page = new FakePage({ url: 'https://example.com/login', bodyText: 'welcome' });
   const rt = makeRuntime(testConfig(), [page]);
-  const session = await rt.createSession('p1', {
+  const session = await rt.createSession({
     target: { kind: 'existing' },
     allowedOrigins: ['https://example.com'],
     modelOrigins: [],
   });
-  const env = await rt.execute('p1', session.sessionId, {
+  const env = await rt.execute(session.sessionId, {
     sessionId: session.sessionId,
     steps: flow([
       { id: 'fill', kind: 'action', action: 'fill', target: { by: 'css', selector: '#pw' }, valuesRef: 'pw', expect: [{ kind: 'text_present', value: 'welcome' }] },
@@ -696,7 +675,7 @@ test('secretRef：缺环境变量暂停 needs_input；补齐后恢复成功', as
   assert.equal(paused.pauseReason, 'needs_input');
   // 补齐 secret 后恢复
   process.env.JEV_BROWSER_SECRET_PW = 's3cret';
-  const resumed = await rt.resumeTask('p1', paused.taskId, { requestId: 's1' });
+  const resumed = await rt.resumeTask(paused.taskId, { requestId: 's1' });
   const final = await rt.waitEnvelope(resumed.taskId);
   assert.equal(final.status, 'done');
   // secret 不落盘：vars 中只应有解析后的引用在内存，库里的 varsJson 不含请求 values

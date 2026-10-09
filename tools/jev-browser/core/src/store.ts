@@ -12,7 +12,6 @@ import { err } from './errors.js';
 export interface TaskRow {
   taskId: string;
   sessionId: string;
-  principal: string;
   mode: string;
   status: string;
   pauseReason: string | null;
@@ -32,7 +31,6 @@ export interface TaskRow {
 
 export interface SessionRow {
   sessionId: string;
-  principal: string;
   status: string;
   pageId: string | null;
   allowedJson: string;
@@ -51,7 +49,7 @@ export interface ArtifactRow {
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
-  task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, principal TEXT NOT NULL,
+  task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
   mode TEXT NOT NULL, status TEXT NOT NULL, pause_reason TEXT, revision INTEGER NOT NULL DEFAULT 0,
   request_json TEXT NOT NULL, cursor INTEGER NOT NULL DEFAULT 0,
   vars_json TEXT NOT NULL DEFAULT '{}', results_json TEXT NOT NULL DEFAULT '[]',
@@ -72,7 +70,7 @@ CREATE TABLE IF NOT EXISTS grants (
   token TEXT NOT NULL, consumed INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
-  session_id TEXT PRIMARY KEY, principal TEXT NOT NULL, status TEXT NOT NULL,
+  session_id TEXT PRIMARY KEY, status TEXT NOT NULL,
   page_id TEXT, allowed_json TEXT NOT NULL, model_json TEXT NOT NULL,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
@@ -93,11 +91,16 @@ export class TaskStore {
     this.migrate();
   }
 
-  /** 轻量迁移：为早期库补齐后增列（新库由 DDL 直接包含）。 */
+  /** 轻量迁移：为早期库补齐后增列/移除已废弃列（新库由 DDL 直接体现）。 */
   private migrate(): void {
     const cols = (this.db.prepare("PRAGMA table_info('tasks')").all() as Array<{ name: string }>).map((c) => c.name);
     if (!cols.includes('plan_json')) {
       this.db.exec('ALTER TABLE tasks ADD COLUMN plan_json TEXT');
+    }
+    // principal 列随 --principal 参数移除而废弃；历史库中安全删除（SQLite ≥ 3.35）
+    for (const table of ['tasks', 'sessions'] as const) {
+      const tcols = (this.db.prepare(`PRAGMA table_info('${table}')`).all() as Array<{ name: string }>).map((c) => c.name);
+      if (tcols.includes('principal')) this.db.exec(`ALTER TABLE ${table} DROP COLUMN principal`);
     }
   }
 
@@ -125,11 +128,11 @@ export class TaskStore {
   // ---- sessions ----
   upsertSession(s: SessionRow): void {
     this.db.prepare(
-      `INSERT INTO sessions (session_id, principal, status, page_id, allowed_json, model_json, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO sessions (session_id, status, page_id, allowed_json, model_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id) DO UPDATE SET status=excluded.status, page_id=excluded.page_id,
          allowed_json=excluded.allowed_json, model_json=excluded.model_json, updated_at=excluded.updated_at`,
-    ).run(s.sessionId, s.principal, s.status, s.pageId, s.allowedJson, s.modelJson, Date.now(), Date.now());
+    ).run(s.sessionId, s.status, s.pageId, s.allowedJson, s.modelJson, Date.now(), Date.now());
   }
 
   getSession(sessionId: string): SessionRow | undefined {
@@ -145,10 +148,10 @@ export class TaskStore {
   // ---- tasks ----
   insertTask(t: TaskRow): void {
     this.db.prepare(
-      `INSERT INTO tasks (task_id, session_id, principal, mode, status, pause_reason, revision, request_json,
+      `INSERT INTO tasks (task_id, session_id, mode, status, pause_reason, revision, request_json,
         cursor, vars_json, results_json, metrics_json, error_json, goal_json, plan_json, created_at, updated_at, deadline_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(t.taskId, t.sessionId, t.principal, t.mode, t.status, t.pauseReason, t.revision, t.requestJson,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(t.taskId, t.sessionId, t.mode, t.status, t.pauseReason, t.revision, t.requestJson,
       t.cursor, t.varsJson, t.resultsJson, t.metricsJson, t.errorJson, t.goalJson, t.planJson, t.createdAt, t.updatedAt, t.deadlineAt);
   }
 
@@ -348,7 +351,6 @@ function rowToTask(r: Record<string, unknown>): TaskRow {
   return {
     taskId: String(r.task_id),
     sessionId: String(r.session_id),
-    principal: String(r.principal),
     mode: String(r.mode),
     status: String(r.status),
     pauseReason: (r.pause_reason as string) ?? null,
@@ -370,7 +372,6 @@ function rowToTask(r: Record<string, unknown>): TaskRow {
 function rowToSession(r: Record<string, unknown>): SessionRow {
   return {
     sessionId: String(r.session_id),
-    principal: String(r.principal),
     status: String(r.status),
     pageId: (r.page_id as string) ?? null,
     allowedJson: String(r.allowed_json),

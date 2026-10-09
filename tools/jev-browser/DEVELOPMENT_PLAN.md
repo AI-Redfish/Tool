@@ -162,7 +162,7 @@ P6 安全、基准与发布准备
 - [ ] session disconnect 遇 running/queued/cancelling 拒绝；paused 仅显式 detachTask 才允许断开并保留预约/审批需求。最后引用才断共享连接，API 请求连接中断不自动 cancel。
 - [ ] 确认 token 单次消费、短有效期、动作/参数/页面指纹绑定；拒绝重放和跨主体使用。
 - [ ] 独立可信确认通道的签发端使用 Agent 不持有的凭据/用户在场验证；同 OS 用户可任意调用的裸 CLI 不算隔离。approve 只消费 grant，缺可信签发端则受限预授权或暂停。
-- [ ] HTTP 幂等记录使用 principal + endpoint + key 索引，并原子保存请求体摘要与 taskId；覆盖同键不同输入、进程重启和过期情况。
+- [ ] HTTP 幂等记录使用 endpoint + key 索引，并原子保存请求体摘要与 taskId；覆盖同键不同输入、进程重启和过期情况。
 - [ ] 验证 requestId 重试先于 expectedRevision 校验，grant 绑定 actionRevision，派发前才原子消费；取消/过期/重启不能释放 unknown 动作的隔离记录。
 
 审批签发通道可作为后续受控写操作里程碑，不阻塞首版只读/下载交付；未通过独立审批验收前，高风险动作始终暂停，不以假 grant 或执行 Agent 自批替代。

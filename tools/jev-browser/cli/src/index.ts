@@ -64,7 +64,7 @@ const HELP = `jev-browser-cli —— 浏览器控制（Playwright + Jev；方案
 
 命令：
   doctor [--connect]                          诊断配置/环境；--connect 尝试接管（需 Chrome 授权）
-  chrome-debug [--port 9222] [--user-data-dir <目录>] [--executable <chrome路径>]
+  chrome-debug [--port 9223] [--user-data-dir <目录>] [--executable <chrome路径>]
                                               手动预热：以固定调试端口启动/复用 Chrome（跨 Windows/macOS；已启动则跳过），
                                               并把 attach 端点写入用户配置（--no-save 跳过）。
                                               注：attach 连接时已自动探测/拉起固定端口 Chrome（无需先跑本命令）；
@@ -86,7 +86,7 @@ const HELP = `jev-browser-cli —— 浏览器控制（Playwright + Jev；方案
   artifact get --task <id> --artifact <id> --out <path>
   disconnect --session <id> [--detach-task]
 
-全局：--config <path>  --json  --api <http://127.0.0.1:3737>  --principal <name>
+全局：--config <path>  --json  --api <http://127.0.0.1:3737>
 环境：JEV_BROWSER_*（见 DESIGN §5.2）；JEV_BROWSER_API_TOKEN；JEV_BROWSER_APPROVAL_KEY；JEV_BROWSER_SECRET_<NAME>
 `;
 
@@ -156,7 +156,6 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const json = args.flags['json'] === true;
   const apiBase = str(args.flags, 'api');
-  const principal = str(args.flags, 'principal') ?? 'local';
 
   if (args.command === 'help' || args.flags['h'] === true || args.flags['help'] === true) {
     console.error(HELP);
@@ -195,7 +194,7 @@ async function main(): Promise<void> {
     const modelOrigins = originsOf(args.flags, 'model-origin');
     if (!url && !pageId) fail('需要 --url 或 --page 指定目标标签页');
     const target = url ? { kind: 'new' as const, url } : { kind: 'existing' as const, pageId };
-    const s = await rt.createSession(principal, { target, allowedOrigins: allowed, modelOrigins });
+    const s = await rt.createSession({ target, allowedOrigins: allowed, modelOrigins });
     if (s.status === 'awaiting_page') {
       console.error(`[jev-browser-cli] 存在多个候选标签页，请用 --page 指定：${JSON.stringify(s.candidates)}`);
       process.exit(3);
@@ -266,7 +265,7 @@ async function main(): Promise<void> {
         allowedOrigins: originsOf(args.flags, 'origin'),
         modelOrigins: originsOf(args.flags, 'model-origin'),
       };
-      const result = api ? await api.createSession(input) : await (await runtimeOf()).createSession(principal, input as never);
+      const result = api ? await api.createSession(input) : await (await runtimeOf()).createSession(input as never);
       console.log(JSON.stringify(result, null, 2));
       return;
     }
@@ -274,7 +273,7 @@ async function main(): Promise<void> {
     case 'pages': {
       const sessionId = str(args.flags, 'session');
       if (!sessionId) fail('pages 需要 --session');
-      const result = api ? await api.pages(sessionId) : await (await runtimeOf()).listPages(principal, sessionId);
+      const result = api ? await api.pages(sessionId) : await (await runtimeOf()).listPages(sessionId);
       console.log(JSON.stringify(result, null, 2));
       return;
     }
@@ -283,7 +282,7 @@ async function main(): Promise<void> {
       const sessionId = str(args.flags, 'session');
       const pageId = str(args.flags, 'page');
       if (!sessionId || !pageId) fail('select-page 需要 --session 与 --page');
-      const result = api ? await api.selectPage(sessionId, pageId) : await (await runtimeOf()).selectPage(principal, sessionId, pageId);
+      const result = api ? await api.selectPage(sessionId, pageId) : await (await runtimeOf()).selectPage(sessionId, pageId);
       console.log(JSON.stringify(result, null, 2));
       return;
     }
@@ -298,9 +297,9 @@ async function main(): Promise<void> {
       }
       const rt = await runtimeOf();
       const sid = sessionId ?? (await ensureOneShotSession(rt));
-      const obs = await rt.snapshot(principal, sid, { forModel: args.flags['for-model'] === true });
+      const obs = await rt.snapshot(sid, { forModel: args.flags['for-model'] === true });
       console.log(JSON.stringify(obs, null, 2));
-      if (!sessionId) await rt.disconnect(principal, sid).catch(() => undefined);
+      if (!sessionId) await rt.disconnect(sid).catch(() => undefined);
       await rt.close();
       return;
     }
@@ -325,9 +324,9 @@ async function main(): Promise<void> {
       }
       const rt = await runtimeOf();
       const sid = str(args.flags, 'session') ?? (await ensureOneShotSession(rt));
-      const env = await rt.execute(principal, sid, input as never, { idempotencyKey: str(args.flags, 'idempotency-key') });
+      const env = await rt.execute(sid, input as never, { idempotencyKey: str(args.flags, 'idempotency-key') });
       const finalEnv = await rt.waitEnvelope(env.taskId);
-      if (!str(args.flags, 'session')) await rt.disconnect(principal, sid).catch(() => undefined);
+      if (!str(args.flags, 'session')) await rt.disconnect(sid).catch(() => undefined);
       await rt.close();
       finish(finalEnv, json);
       return;
@@ -348,9 +347,9 @@ async function main(): Promise<void> {
       }
       const rt = await runtimeOf();
       const sid = str(args.flags, 'session') ?? (await ensureOneShotSession(rt));
-      const env = await rt.run(principal, sid, input as never, { idempotencyKey: str(args.flags, 'idempotency-key') });
+      const env = await rt.run(sid, input as never, { idempotencyKey: str(args.flags, 'idempotency-key') });
       const finalEnv = await rt.waitEnvelope(env.taskId);
-      if (!str(args.flags, 'session')) await rt.disconnect(principal, sid).catch(() => undefined);
+      if (!str(args.flags, 'session')) await rt.disconnect(sid).catch(() => undefined);
       await rt.close();
       finish(finalEnv, json);
       return;
@@ -367,7 +366,7 @@ async function main(): Promise<void> {
         finish(env, json);
       }
       const rt = await runtimeOf();
-      const env = await rt.act(principal, sessionId, { sessionId, step, values });
+      const env = await rt.act(sessionId, { sessionId, step, values });
       const finalEnv = await rt.waitEnvelope(env.taskId);
       await rt.close();
       finish(finalEnv, json);
@@ -380,14 +379,14 @@ async function main(): Promise<void> {
       if (!sub || !taskId) fail('task 需要 get|cancel|resume|approve <taskId>');
       const rtPromise = api ? null : runtimeOf();
       if (sub === 'get') {
-        const env = api ? (await api.getTask(taskId)).envelope : (await rtPromise!).getTask(principal, taskId);
+        const env = api ? (await api.getTask(taskId)).envelope : (await rtPromise!).getTask(taskId);
         finish(env, json);
       }
       const requestId = str(args.flags, 'request-id') ?? newIdFromTime();
       const expectedRevision = str(args.flags, 'expected-revision');
       const opts = { requestId, expectedRevision: expectedRevision !== undefined ? Number(expectedRevision) : undefined };
       if (sub === 'cancel') {
-        const env = api ? (await api.cancelTask(taskId, opts)).envelope : await (await rtPromise!).cancelTask(principal, taskId, opts);
+        const env = api ? (await api.cancelTask(taskId, opts)).envelope : await (await rtPromise!).cancelTask(taskId, opts);
         finish(env, json);
       }
       if (sub === 'resume') {
@@ -402,7 +401,7 @@ async function main(): Promise<void> {
           finish(finalEnv, json);
         }
         const rt = await rtPromise!;
-        const env = await rt.resumeTask(principal, taskId, resumeOpts);
+        const env = await rt.resumeTask(taskId, resumeOpts);
         const finalEnv = ['queued', 'running', 'cancelling'].includes(env.status) ? await rt.waitEnvelope(taskId) : env;
         await rt.close().catch(() => undefined);
         finish(finalEnv, json);
@@ -410,7 +409,7 @@ async function main(): Promise<void> {
       if (sub === 'approve') {
         const grant = str(args.flags, 'grant');
         if (!grant) fail('approve 需要 --grant <token>（由 grant create 签发）');
-        const env = api ? (await api.approveTask(taskId, { grant })).envelope : (await rtPromise!).approveTask(principal, taskId, grant);
+        const env = api ? (await api.approveTask(taskId, { grant })).envelope : (await rtPromise!).approveTask(taskId, grant);
         finish(env, json);
       }
       fail(`未知 task 子命令: ${sub}`);
@@ -440,7 +439,7 @@ async function main(): Promise<void> {
       const taskId = str(args.flags, 'task');
       if (sub === 'list') {
         if (!taskId) fail('artifact list 需要 --task');
-        const arts = api ? (await api.listArtifacts(taskId)).artifacts : (await runtimeOf()).listArtifacts(principal, taskId);
+        const arts = api ? (await api.listArtifacts(taskId)).artifacts : (await runtimeOf()).listArtifacts(taskId);
         console.log(JSON.stringify({ taskId, artifacts: arts }, null, 2));
         return;
       }
@@ -452,7 +451,7 @@ async function main(): Promise<void> {
           await api.saveArtifact(taskId, artifactId, out);
         } else {
           const rt = await runtimeOf();
-          const { path: src } = rt.artifactPath(principal, taskId, artifactId);
+          const { path: src } = rt.artifactPath(taskId, artifactId);
           fs.copyFileSync(src, out);
           await rt.close();
         }
@@ -467,7 +466,7 @@ async function main(): Promise<void> {
       const sessionId = str(args.flags, 'session');
       if (!sessionId) fail('disconnect 需要 --session');
       const detach = args.flags['detach-task'] === true;
-      const result = api ? await api.disconnect(sessionId, detach) : await (await runtimeOf()).disconnect(principal, sessionId, { detachTask: detach });
+      const result = api ? await api.disconnect(sessionId, detach) : await (await runtimeOf()).disconnect(sessionId, { detachTask: detach });
       console.log(JSON.stringify(result, null, 2));
       return;
     }

@@ -55,7 +55,7 @@
 
 | 项 | 阻塞原因 |
 | --- | --- |
-| attach 接管日常 Chrome（原生授权流、登录态可见、未选页对话框非干扰、断开保真） | 需要用户在 Chrome `chrome://inspect/#remote-debugging` 界面人工授权；本机 9222 端口探测到 404（非 CDP 服务占用），channel 发现与 DevToolsActivePort 备用路径均待真实授权后复核 |
+| attach 接管日常 Chrome（原生授权流、登录态可见、未选页对话框非干扰、断开保真） | 需要用户在 Chrome `chrome://inspect/#remote-debugging` 界面人工授权；本机 9223 端口探测到 404（非 CDP 服务占用），channel 发现与 DevToolsActivePort 备用路径均待真实授权后复核 |
 | 断连保护矩阵（任务中途 Chrome 被关/崩溃/授权撤销） | 依赖 attach 接管成立 |
 | download 断开后 artifact 完整性（attach 语义） | 同上 |
 | 真实模型（Jev/规划器）联调与 P6 基准 | 需要真实 key 与预算，属显式授权测试 |

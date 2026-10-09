@@ -311,7 +311,7 @@ export class PlaywrightConnector implements BrowserConnector {
 
       // 固定端口自动确保（默认开启，JEV_BROWSER_AUTO_LAUNCH_DEBUG=false 关闭）
       //  - 显式 loopback 端点：连接前探测，无则自动以该端口启动调试 Chrome，有则复用；
-      //  - 'chrome' 哨兵：9222 已有调试 Chrome 则优先复用（快路径，免去 60s 授权等待）。
+      //  - 'chrome' 哨兵：9223 已有调试 Chrome 则优先复用（快路径，免去 60s 授权等待）。
       const fixedEndpoint = `http://127.0.0.1:${DEFAULT_CHROME_DEBUG_PORT}`;
       const reuseFixed = requested === 'chrome'
         ? autoLaunchDebugChromeEnabled() && (await probeCdp(DEFAULT_CHROME_DEBUG_PORT)).up
@@ -333,7 +333,8 @@ export class PlaywrightConnector implements BrowserConnector {
         }
       }
 
-      // 'chrome' 哨兵全部失败且未复用成功 → 兜底：自动以固定端口 9222 启动调试 Chrome 再连
+      // 'chrome' 哨兵全部失败且未复用成功 → 兜底：自动以固定端口 9223 启动调试 Chrome 再连
+      //（端口被无 CDP 进程占用时快速失败，不擅自漂移端口——端点固定，以 JEV_BROWSER_CDP_ENDPOINT 为准）
       if (requested === 'chrome' && autoLaunchDebugChromeEnabled() && !reuseFixed) {
         try {
           const r = await prepareChromeDebug({ waitMs: b.attach.timeoutMs });
@@ -397,7 +398,7 @@ export class PlaywrightConnector implements BrowserConnector {
         reject(err('BROWSER_BUSY',
           `attach ${endpoint === 'chrome' ? 'chrome(channel)' : endpoint} ${b.attach.timeoutMs}ms 内未完成连接——最常见原因：Chrome 正在等你点击连接授权弹窗（弹窗在 Chrome 窗口内，可能被其他窗口遮挡），或从未开启远程调试授权。` +
           `请：① 在 Chrome 地址栏打开 chrome://inspect/#remote-debugging 勾选 "Allow remote debugging"，重跑并在弹窗中点「允许」；` +
-          `② 或先跑 cli chrome-debug：以固定调试端口 9222 启动/复用专用 Chrome 并自动配置 attach 端点（跨 Windows/macOS）；` +
+          `② 或先跑 cli chrome-debug：以固定调试端口 9223 启动/复用专用 Chrome 并自动配置 attach 端点（跨 Windows/macOS）；` +
           `③ 或改用 launch 模式（set JEV_BROWSER_MODE=launch）；④ 缩短本等待可用 set JEV_BROWSER_CONNECT_TIMEOUT_MS=<毫秒>`));
       }, b.attach.timeoutMs);
     });

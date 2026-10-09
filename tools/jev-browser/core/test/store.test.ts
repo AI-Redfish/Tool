@@ -14,7 +14,6 @@ function taskRow(taskId: string): Parameters<TaskStore['insertTask']>[0] {
   return {
     taskId,
     sessionId: 's1',
-    principal: 'p',
     mode: 'execute',
     status: 'queued',
     pauseReason: null,

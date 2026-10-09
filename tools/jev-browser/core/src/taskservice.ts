@@ -166,7 +166,7 @@ export class Runtime {
   // 会话
   // ------------------------------------------------------------------
 
-  async createSession(principal: string, input: CreateSessionInput): Promise<SessionInfo> {
+  async createSession(input: CreateSessionInput): Promise<SessionInfo> {
     validateOrigins(input.allowedOrigins, input.modelOrigins);
     validateSessionTarget(input.target);
     const { browser } = await this.ensureBrowser();
@@ -204,7 +204,6 @@ export class Runtime {
     const status = page ? 'ready' : 'awaiting_page';
     const row = {
       sessionId,
-      principal,
       status,
       pageId: page ? guessPageId(context, page) : input.target.kind === 'existing' ? input.target.pageId ?? null : null,
       allowedJson: JSON.stringify(input.allowedOrigins),
@@ -221,8 +220,8 @@ export class Runtime {
     };
   }
 
-  async listPages(principal: string, sessionId: string): Promise<PageCandidate[]> {
-    const s = this.requireSession(principal, sessionId);
+  async listPages(sessionId: string): Promise<PageCandidate[]> {
+    const s = this.requireSession(sessionId);
     const { browser } = await this.ensureBrowser();
     const context = browser.contexts()[0];
     const sel = await selectPage(context, s.pageId ?? undefined);
@@ -231,8 +230,8 @@ export class Runtime {
     return sel.candidates.filter((c) => authorized.has(originOf(c.url)));
   }
 
-  async selectPage(principal: string, sessionId: string, pageId: string): Promise<SessionInfo> {
-    const s = this.requireSession(principal, sessionId);
+  async selectPage(sessionId: string, pageId: string): Promise<SessionInfo> {
+    const s = this.requireSession(sessionId);
     const { browser } = await this.ensureBrowser();
     const context = browser.contexts()[0];
     const sel = await selectPage(context, pageId);
@@ -243,8 +242,8 @@ export class Runtime {
     return { sessionId, status: 'ready', pageId, allowedOrigins: JSON.parse(s.allowedJson) as string[], modelOrigins: JSON.parse(s.modelJson) as string[] };
   }
 
-  async disconnect(principal: string, sessionId: string, opts: { detachTask?: boolean } = {}): Promise<{ disconnected: boolean }> {
-    const s = this.requireSession(principal, sessionId);
+  async disconnect(sessionId: string, opts: { detachTask?: boolean } = {}): Promise<{ disconnected: boolean }> {
+    const s = this.requireSession(sessionId);
     const active = this.store.listStale(['queued', 'running', 'cancelling']).filter((t) => t.sessionId === sessionId);
     if (active.length > 0) throw err('SESSION_BUSY', `会话仍有活动任务: ${active.map((t) => t.taskId).join(',')}`);
     const pausedTasks = this.store.listStale(['paused']).filter((t) => t.sessionId === sessionId);
@@ -267,19 +266,19 @@ export class Runtime {
   // 任务提交
   // ------------------------------------------------------------------
 
-  async execute(principal: string, sessionId: string, input: ExecuteTaskInput, opts: SubmitOptions = {}): Promise<TaskEnvelope> {
-    const s = this.requireSession(principal, sessionId);
+  async execute(sessionId: string, input: ExecuteTaskInput, opts: SubmitOptions = {}): Promise<TaskEnvelope> {
+    const s = this.requireSession(sessionId);
     if (s.status !== 'ready') throw err('SESSION_NOT_READY', `会话未就绪（${s.status}），先 select-page`);
     validateExecuteSteps(input.steps);
     // 含 goal 步骤时需要 Jev：提前快速失败，而不是执行一半后失败（DESIGN §6.1）
     if (input.steps.some((st) => st.kind === 'goal') && !this.judge.available()) {
       throw err('JEV_NOT_CONFIGURED', `execute 中的 goal 步骤需要 Jev key（${this.cfg.jev.apiKeyEnv}）`);
     }
-    return this.enqueueTask(principal, sessionId, 'execute', input, opts, input.budget);
+    return this.enqueueTask(sessionId, 'execute', input, opts, input.budget);
   }
 
-  async run(principal: string, sessionId: string, input: RunTaskInput, opts: SubmitOptions = {}): Promise<TaskEnvelope> {
-    const s = this.requireSession(principal, sessionId);
+  async run(sessionId: string, input: RunTaskInput, opts: SubmitOptions = {}): Promise<TaskEnvelope> {
+    const s = this.requireSession(sessionId);
     if (s.status !== 'ready') throw err('SESSION_NOT_READY', `会话未就绪（${s.status}）`);
     if (!input.successCriteria || !input.successCriteria.trim()) {
       throw err('INVALID_INPUT', 'run 需要 successCriteria（DESIGN §8.1：防止规划器自证成功）');
@@ -290,17 +289,16 @@ export class Runtime {
     if (!this.judge.available()) {
       throw err('JEV_NOT_CONFIGURED', 'run 的任务级验收需要 Jev key；纯确定性 execute 不需要它');
     }
-    return this.enqueueTask(principal, sessionId, 'run', input, opts, input.budget);
+    return this.enqueueTask(sessionId, 'run', input, opts, input.budget);
   }
 
-  async act(principal: string, sessionId: string, input: ActInput, opts: SubmitOptions = {}): Promise<TaskEnvelope> {
-    this.requireSession(principal, sessionId);
+  async act(sessionId: string, input: ActInput, opts: SubmitOptions = {}): Promise<TaskEnvelope> {
+    this.requireSession(sessionId);
     validateExecuteSteps([input.step]);
-    return this.enqueueTask(principal, sessionId, 'act', { sessionId, steps: [input.step], values: input.values }, opts);
+    return this.enqueueTask(sessionId, 'act', { sessionId, steps: [input.step], values: input.values }, opts);
   }
 
   private async enqueueTask(
-    principal: string,
     sessionId: string,
     mode: 'execute' | 'run' | 'act',
     request: object,
@@ -316,7 +314,6 @@ export class Runtime {
     const row: TaskRow = {
       taskId,
       sessionId,
-      principal,
       mode,
       status: 'queued',
       pauseReason: null,
@@ -336,7 +333,7 @@ export class Runtime {
     // 幂等记录与任务创建原子提交（DESIGN §8.3）；返回实际生效的 taskId
     const effectiveId = this.store.tx(() => {
       if (opts.idempotencyKey) {
-        const pkey = `submit:${principal}:${mode}:${opts.idempotencyKey}`;
+        const pkey = `submit:${mode}:${opts.idempotencyKey}`;
         const existing = this.store.findIdempotent(pkey);
         if (existing) {
           if (existing.bodyHash !== bodyHash) throw err('IDEMPOTENCY_CONFLICT', '相同 Idempotency-Key 但请求体不同');
@@ -770,13 +767,13 @@ export class Runtime {
   // 查询 / 快照 / 取消 / 恢复 / 审批
   // ------------------------------------------------------------------
 
-  getTask(principal: string, taskId: string): TaskEnvelope {
-    const row = this.requireTask(principal, taskId);
+  getTask(taskId: string): TaskEnvelope {
+    const row = this.requireTask(taskId);
     return this.envelope(row);
   }
 
-  listArtifacts(principal: string, taskId: string): ArtifactMeta[] {
-    this.requireTask(principal, taskId);
+  listArtifacts(taskId: string): ArtifactMeta[] {
+    this.requireTask(taskId);
     return this.store.listArtifactsByTask(taskId).map(({ artifactId, filename, size, sha256 }) => ({ artifactId, filename, size, sha256 }));
   }
 
@@ -784,8 +781,8 @@ export class Runtime {
    * 只读快照（browser_snapshot）：不建任务、受 origin/modelOrigins 约束。
    * 经 profile 队列串行执行——不能绕开已暂停/运行任务窃读页面（DESIGN §8.3）。
    */
-  async snapshot(principal: string, sessionId: string, opts: { forModel?: boolean } = {}): Promise<unknown> {
-    const s = this.requireSession(principal, sessionId);
+  async snapshot(sessionId: string, opts: { forModel?: boolean } = {}): Promise<unknown> {
+    const s = this.requireSession(sessionId);
     const page = this.sessionPages.get(sessionId);
     if (!page) throw err('SESSION_NOT_READY', '会话没有可用页面');
     const allowed: string[] = JSON.parse(s.allowedJson);
@@ -821,8 +818,8 @@ export class Runtime {
     return describeCapabilities(this.cfg);
   }
 
-  async cancelTask(principal: string, taskId: string, opts: CancelOptions): Promise<TaskEnvelope> {
-    const row = this.requireTask(principal, taskId);
+  async cancelTask(taskId: string, opts: CancelOptions): Promise<TaskEnvelope> {
+    const row = this.requireTask(taskId);
     const replay = this.store.findIdempotent(`cancel:${taskId}:${opts.requestId}`);
     if (replay) return this.envelope(this.store.getTask(replay.taskId)!);
     if (opts.expectedRevision !== undefined && opts.expectedRevision !== row.revision) {
@@ -858,8 +855,8 @@ export class Runtime {
     return this.envelope(this.store.getTask(taskId)!);
   }
 
-  async resumeTask(principal: string, taskId: string, opts: ResumeOptions): Promise<TaskEnvelope> {
-    let row = this.requireTask(principal, taskId);
+  async resumeTask(taskId: string, opts: ResumeOptions): Promise<TaskEnvelope> {
+    let row = this.requireTask(taskId);
     const replay = this.store.findIdempotent(`resume:${taskId}:${opts.requestId}`);
     if (replay) return this.envelope(this.store.getTask(replay.taskId)!);
     if (opts.expectedRevision !== undefined && opts.expectedRevision !== row.revision) {
@@ -929,8 +926,8 @@ export class Runtime {
     }
   }
 
-  approveTask(principal: string, taskId: string, token: string): TaskEnvelope {
-    const row = this.requireTask(principal, taskId);
+  approveTask(taskId: string, token: string): TaskEnvelope {
+    const row = this.requireTask(taskId);
     const key = process.env.JEV_BROWSER_APPROVAL_KEY;
     if (!key) throw err('GRANT_INVALID', '缺少 JEV_BROWSER_APPROVAL_KEY（独立签发凭据，不注入执行 Agent）');
     // 先校验并暂存 grant，不执行动作；resume 后派发前才原子消费（DESIGN §8.2）
@@ -946,8 +943,8 @@ export class Runtime {
     return this.envelope(row);
   }
 
-  artifactPath(principal: string, taskId: string, artifactId: string): { path: string; filename: string } {
-    this.requireTask(principal, taskId);
+  artifactPath(taskId: string, artifactId: string): { path: string; filename: string } {
+    this.requireTask(taskId);
     const art = this.store.getArtifact(artifactId);
     if (!art || art.taskId !== taskId) throw err('ARTIFACT_NOT_FOUND', `artifact 不存在: ${artifactId}`);
     return { path: art.path, filename: art.filename };
@@ -1097,15 +1094,15 @@ export class Runtime {
   // 内部工具
   // ------------------------------------------------------------------
 
-  private requireSession(principal: string, sessionId: string) {
+  private requireSession(sessionId: string) {
     const s = this.store.getSession(sessionId);
-    if (!s || s.principal !== principal) throw err('NOT_FOUND', `会话不存在: ${sessionId}`);
+    if (!s) throw err('NOT_FOUND', `会话不存在: ${sessionId}`);
     return s;
   }
 
-  private requireTask(principal: string, taskId: string): TaskRow {
+  private requireTask(taskId: string): TaskRow {
     const row = this.store.getTask(taskId);
-    if (!row || row.principal !== principal) throw err('NOT_FOUND', `任务不存在: ${taskId}`);
+    if (!row) throw err('NOT_FOUND', `任务不存在: ${taskId}`);
     return row;
   }
 

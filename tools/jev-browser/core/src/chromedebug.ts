@@ -1,9 +1,12 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { defaultUserConfigFile, loadConfig } from './config.js';
 import { err } from './errors.js';
+
+const execFileP = promisify(execFile);
 
 /**
  * Chrome 固定调试端口启动器（attach 前置步骤）。
@@ -12,13 +15,13 @@ import { err } from './errors.js';
  * --remote-debugging-port；Chrome 144+ 的 chrome://inspect 授权通道端口随机。
  * 因此 attach 调试用固定端口 + 独立 profile 目录启动一个专用 Chrome 实例：
  *
- *   chrome --remote-debugging-port=9222 --user-data-dir=<专用目录>
+ *   chrome --remote-debugging-port=9223 --user-data-dir=<专用目录>
  *
  * 跨平台（win32/darwin/linux）：可执行文件路径、profile 目录、
  * 环境变量写法均按平台适配。已在本端口监听时跳过启动（幂等）。
  */
 
-export const DEFAULT_CHROME_DEBUG_PORT = 9222;
+export const DEFAULT_CHROME_DEBUG_PORT = 9223;
 
 /**
  * 自动确保固定端口调试 Chrome（默认开启）：attach 连接前探测，未启动则自动拉起。
@@ -88,15 +91,14 @@ export function defaultChromeDebugUserDataDir(): string {
   const home = os.homedir();
   switch (process.platform) {
     case 'win32': {
-      // 习惯位置 D:\chrome-debug-profile（存在 D: 盘时）；否则落在工具数据目录
-      if (fs.existsSync('D:\\')) return 'D:\\chrome-debug-profile';
+      // 固定 C 盘用户目录（不随盘符/习惯位置变化）：C:\Users\<用户>\AppData\Local\AI-Redfish\...
       const base = process.env.LOCALAPPDATA ?? path.join(home, 'AppData', 'Local');
       return path.join(base, 'AI-Redfish', 'jev-browser', 'chrome-debug-profile');
     }
     case 'darwin':
       return path.join(home, 'Library', 'Application Support', 'AI-Redfish', 'jev-browser', 'chrome-debug-profile');
     default:
-      return path.join(process.env.XDG_DATA_HOME ?? path.join(home, '.local', 'share'), 'jev-browser', 'chrome-debug-profile');
+      return path.join(process.env.XDG_DATA_HOME ?? path.join(home, '.local', 'share'), 'AI-Redfish', 'jev-browser', 'chrome-debug-profile');
   }
 }
 
@@ -104,6 +106,76 @@ export interface CdpProbe {
   up: boolean;
   /** /json/version 的 Browser 字段（如 "Chrome/145.0.7369.62"），非 Chrome 服务可能取不到。 */
   browser?: string;
+}
+
+export interface PortOccupant {
+  pid: number;
+  /** 进程名（尽力而为，从命令行提取）。 */
+  name?: string;
+  /** 命令行（尽力而为，已截断）。 */
+  commandLine?: string;
+}
+
+function truncateLine(s: string, n = 200): string {
+  const t = s.trim();
+  return t.length > n ? `${t.slice(0, n)}…` : t;
+}
+
+/** Windows 下查进程命令行（尽力而为；失败返回空对象）。 */
+async function winProcessInfo(pid: number): Promise<Pick<PortOccupant, 'name' | 'commandLine'>> {
+  try {
+    const { stdout } = await execFileP('powershell.exe',
+      ['-NoProfile', '-Command', `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine`],
+      { timeout: 5000 });
+    const commandLine = stdout.trim();
+    if (!commandLine) return {};
+    const exe = /^"([^"]+)"/.exec(commandLine)?.[1] ?? commandLine.split(/\s+/)[0] ?? '';
+    return { name: exe.split(/[\\/]/).pop(), commandLine: truncateLine(commandLine) };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * 查询 TCP 端口的监听进程（尽力而为，查不到/查询失败返回 null）。
+ *
+ * 用途：区分「端口空闲」与「端口被无 CDP 能力的进程占用」（如日常 Chrome、其他程序）。
+ * 后者再拉起调试 Chrome，新实例无法绑定调试端口（进程照常启动但无 DevTools 服务），
+ * 只会白等超时——应快速失败并指明占用者（见 prepareChromeDebug）。
+ */
+export async function findPortOccupant(port: number): Promise<PortOccupant | null> {
+  try {
+    if (process.platform === 'win32') {
+      const { stdout } = await execFileP('netstat', ['-ano', '-p', 'tcp'], { timeout: 3000 });
+      let pid: number | undefined;
+      for (const line of stdout.split(/\r?\n/)) {
+        if (!/LISTENING/i.test(line)) continue;
+        const cols = line.trim().split(/\s+/); // 协议 本地地址 远程地址 状态 PID
+        if ((cols[1] ?? '').endsWith(`:${port}`)) {
+          const last = Number(cols[cols.length - 1]);
+          if (Number.isFinite(last) && last > 0) pid = last;
+          break;
+        }
+      }
+      if (!pid) return null;
+      return { pid, ...(await winProcessInfo(pid)) };
+    }
+    // darwin / linux：lsof（未安装则视为查不到，退回原有行为）
+    const { stdout } = await execFileP('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN'], { timeout: 3000 });
+    const row = stdout.split(/\r?\n/).slice(1).find((l) => l.trim() !== '');
+    if (!row) return null;
+    const pid = Number(row.trim().split(/\s+/)[1]);
+    if (!Number.isFinite(pid) || pid <= 0) return null;
+    try {
+      const { stdout: cl } = await execFileP('ps', ['-p', String(pid), '-o', 'command='], { timeout: 2000 });
+      const commandLine = truncateLine(cl);
+      return { pid, name: commandLine.split(/\s+/)[0]?.split('/').pop(), commandLine };
+    } catch {
+      return { pid };
+    }
+  } catch {
+    return null; // 尽力而为：任何失败都退回「查不到占用者」
+  }
 }
 
 /** 探测本机回环 CDP 端点是否已有调试服务在监听。 */
@@ -135,7 +207,7 @@ async function waitForCdp(port: number, waitMs: number): Promise<CdpProbe> {
 }
 
 export interface ChromeDebugOptions {
-  /** 固定调试端口，默认 9222。 */
+  /** 固定调试端口，默认 9223。 */
   port?: number;
   /** 调试专用 profile 目录，默认按平台选取。 */
   userDataDir?: string;
@@ -187,6 +259,20 @@ async function prepareChromeDebugOnce(opts: ChromeDebugOptions, port: number): P
   }
 
   const chromePath = findChromeExecutable(opts.executable);
+
+  // 端口已被监听但未提供 CDP 调试服务（如日常 Chrome、其他程序占用了端口）：
+  // 此时再 spawn Chrome，新实例无法绑定调试端口（进程照常启动但无 DevTools），
+  // 只会白等超时——快速失败并指出占用者，给出可操作的出路。
+  const occupant = await findPortOccupant(port);
+  if (occupant) {
+    // 消息前 200 字符需包含关键信息与全部出路（failures 拼接会截断），命令行详情放末尾
+    throw err('BROWSER_BUSY',
+      `端口 ${port} 已被 PID ${occupant.pid}${occupant.name ? `（${occupant.name}）` : ''} 占用且未提供 CDP 调试服务（/json/version 不可用），在此端口启动调试 Chrome 无法绑定调试端口。` +
+      `出路：① 换端口 chrome-debug --port <其他端口>；② 走授权流程接管日常 Chrome（chrome://inspect/#remote-debugging，Chrome ≥ 144）；③ 结束占用进程后重试。` +
+      `占用者命令行：${occupant.commandLine ?? '未知'}`,
+      { retryable: true, details: { endpoint, port, occupant } });
+  }
+
   fs.mkdirSync(userDataDir, { recursive: true });
   try {
     // detached + ignore stdio：Chrome 独立成进程，CLI 退出不影响
@@ -201,10 +287,14 @@ async function prepareChromeDebugOnce(opts: ChromeDebugOptions, port: number): P
 
   const after = await waitForCdp(port, opts.waitMs ?? 15_000);
   if (!after.up) {
+    // 竞态兜底：启动间隙被其他进程抢占端口时，指出具体占用者；否则按 profile 冲突提示
+    const late = await findPortOccupant(port);
+    const why = late
+      ? `端口 ${port} 现被占用（PID ${late.pid}${late.commandLine ? `：${late.commandLine}` : ''}）——新实例大概率未能绑定调试端口。`
+      : `常见原因：profile 目录被另一个 Chrome 实例占用（${userDataDir}），或新启动的 Chrome 未能绑定端口 ${port}。`;
     throw err('BROWSER_BUSY',
-      `Chrome 已启动，但 ${endpoint} 在 ${opts.waitMs ?? 15_000}ms 内未就绪。` +
-      `常见原因：profile 目录被另一个 Chrome 实例占用（${userDataDir}），或端口 ${port} 被其他进程占用。`,
-      { details: { endpoint, userDataDir, port } });
+      `Chrome 已启动，但 ${endpoint} 在 ${opts.waitMs ?? 15_000}ms 内未就绪。${why}`,
+      { details: { endpoint, userDataDir, port, occupant: late ?? undefined } });
   }
   return { port, endpoint, alreadyRunning: false, launched: true, chromePath, userDataDir, browserVersion: after.browser };
 }

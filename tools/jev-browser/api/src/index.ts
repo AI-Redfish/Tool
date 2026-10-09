@@ -39,7 +39,6 @@ if (!token && require.main === module) {
   process.exit(2);
 }
 
-const PRINCIPAL = 'api-host';
 const runtime = require.main === module ? new Runtime(config) : (undefined as unknown as Runtime);
 const recovery = runtime?.recoverOnStartup();
 if (require.main === module) {
@@ -146,25 +145,25 @@ export function createApiServer(rt: Runtime, opts: { token: string; rateLimitPer
       // POST /v1/sessions
       if (req.method === 'POST' && url.pathname === '/v1/sessions') {
         const body = await readJsonBody(req);
-        const session = await rt.createSession(PRINCIPAL, body as never);
+        const session = await rt.createSession(body as never);
         return send(res, 201, session);
       }
 
       // GET /v1/sessions/:id/pages
       if (req.method === 'GET' && parts[1] === 'sessions' && parts[3] === 'pages') {
-        return send(res, 200, { pages: await rt.listPages(PRINCIPAL, parts[2]!) });
+        return send(res, 200, { pages: await rt.listPages(parts[2]!) });
       }
 
       // POST /v1/sessions/:id/page | .../act | .../snapshot
       if (req.method === 'POST' && parts[1] === 'sessions' && ['page', 'act', 'snapshot'].includes(parts[3] ?? '')) {
         const body = await readJsonBody(req);
         if (parts[3] === 'page') {
-          return send(res, 200, await rt.selectPage(PRINCIPAL, parts[2]!, String(body.pageId)));
+          return send(res, 200, await rt.selectPage(parts[2]!, String(body.pageId)));
         }
         if (parts[3] === 'snapshot') {
-          return send(res, 200, await rt.snapshot(PRINCIPAL, parts[2]!, { forModel: body.forModel === true }));
+          return send(res, 200, await rt.snapshot(parts[2]!, { forModel: body.forModel === true }));
         }
-        const queued = await rt.act(PRINCIPAL, parts[2]!, { sessionId: parts[2]!, step: body.step as never, values: (body.values ?? {}) as never });
+        const queued = await rt.act(parts[2]!, { sessionId: parts[2]!, step: body.step as never, values: (body.values ?? {}) as never });
         return send(res, 202, queued);
       }
 
@@ -172,24 +171,24 @@ export function createApiServer(rt: Runtime, opts: { token: string; rateLimitPer
       if (req.method === 'POST' && parts[1] === 'tasks' && (parts[2] === 'execute' || parts[2] === 'run')) {
         const body = await readJsonBody(req);
         const queued = parts[2] === 'execute'
-          ? await rt.execute(PRINCIPAL, String(body.sessionId), body as never, { idempotencyKey: idem })
-          : await rt.run(PRINCIPAL, String(body.sessionId), body as never, { idempotencyKey: idem });
+          ? await rt.execute(String(body.sessionId), body as never, { idempotencyKey: idem })
+          : await rt.run(String(body.sessionId), body as never, { idempotencyKey: idem });
         return send(res, 202, queued);
       }
 
       // GET /v1/tasks/:id
       if (req.method === 'GET' && parts[1] === 'tasks' && parts.length === 3) {
-        return send(res, 200, { envelope: rt.getTask(PRINCIPAL, parts[2]!) });
+        return send(res, 200, { envelope: rt.getTask(parts[2]!) });
       }
 
       // GET /v1/tasks/:id/artifacts（列表）
       if (req.method === 'GET' && parts[1] === 'tasks' && parts[3] === 'artifacts' && parts.length === 4) {
-        return send(res, 200, { artifacts: rt.listArtifacts(PRINCIPAL, parts[2]!) });
+        return send(res, 200, { artifacts: rt.listArtifacts(parts[2]!) });
       }
 
       // GET /v1/tasks/:id/artifacts/:artifactId（下载；大小上限防内存耗尽）
       if (req.method === 'GET' && parts[1] === 'tasks' && parts[3] === 'artifacts' && parts.length === 5) {
-        const { path: filePath, filename } = rt.artifactPath(PRINCIPAL, parts[2]!, parts[4]!);
+        const { path: filePath, filename } = rt.artifactPath(parts[2]!, parts[4]!);
         const stat = fs.statSync(filePath);
         if (stat.size > 200 * 1024 * 1024) {
           return fail(res, 413, 'POLICY_BLOCKED', `artifact 超过 200MB 下载上限: ${stat.size}B`);
@@ -206,15 +205,15 @@ export function createApiServer(rt: Runtime, opts: { token: string; rateLimitPer
       // POST /v1/tasks/:id/cancel|resume|approve
       if (req.method === 'POST' && parts[1] === 'tasks' && parts.length === 4 && ['cancel', 'resume', 'approve'].includes(parts[3]!)) {
         const body = await readJsonBody(req);
-        if (parts[3] === 'cancel') return send(res, 200, { envelope: await rt.cancelTask(PRINCIPAL, parts[2]!, body as never) });
-        if (parts[3] === 'resume') return send(res, 200, { envelope: await rt.resumeTask(PRINCIPAL, parts[2]!, body as never) });
-        return send(res, 200, { envelope: rt.approveTask(PRINCIPAL, parts[2]!, String(body.grant)) });
+        if (parts[3] === 'cancel') return send(res, 200, { envelope: await rt.cancelTask(parts[2]!, body as never) });
+        if (parts[3] === 'resume') return send(res, 200, { envelope: await rt.resumeTask(parts[2]!, body as never) });
+        return send(res, 200, { envelope: rt.approveTask(parts[2]!, String(body.grant)) });
       }
 
       // DELETE /v1/sessions/:id
       if (req.method === 'DELETE' && parts[1] === 'sessions' && parts.length === 3) {
         const detachTask = url.searchParams.get('detachTask') === 'true';
-        return send(res, 200, await rt.disconnect(PRINCIPAL, parts[2]!, { detachTask }));
+        return send(res, 200, await rt.disconnect(parts[2]!, { detachTask }));
       }
 
       return fail(res, 404, 'NOT_FOUND', `未知路由: ${req.method} ${url.pathname}`);
