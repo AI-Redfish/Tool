@@ -669,8 +669,29 @@ node cli/dist/index.js execute --file examples/read-page.flow.json --url "https:
 **`--steps <json>`** —— 直接给 FlowStep 数组。
 
 ```powershell
-
+node cli/dist/index.js execute  --url "https://example.com"  --origin "https://example.com"  --steps '[{\"id\":\"s1\",\"kind\":\"action\",\"action\":\"navigate\",\"value\":\"https://example.com/search\",\"expect\":[{\"kind\":\"url_contains\",\"value\":\"/search\"}]},{\"id\":\"s2\",\"kind\":\"action\",\"action\":\"fill\",\"target\":{\"by\":\"role\",\"role\":\"textbox\",\"name\":\"关键词\"},\"valuesRef\":\"kw\",\"expect\":[{\"kind\":\"visible\",\"target\":{\"by\":\"role\",\"role\":\"textbox\",\"name\":\"关键词\"}}]},{\"id\":\"s3\",\"kind\":\"action\",\"action\":\"click\",\"target\":{\"by\":\"role\",\"role\":\"button\",\"name\":\"搜索\"},\"expect\":[{\"kind\":\"text_present\",\"value\":\"条结果\"}]},{\"id\":\"s4\",\"kind\":\"extract\",\"target\":{\"by\":\"css\",\"selector\":\".result-list\"},\"fields\":[\"count\"],\"saveAs\":\"resultCount\"},{\"id\":\"s5\",\"kind\":\"assert\",\"expect\":[{\"kind\":\"count_gte\",\"target\":{\"by\":\"css\",\"selector\":\".result-item\"},\"value\":1}]}]'  --values '{\"kw\": \"redfish\"}'  --json
 ```
+
+
+
+**执行目标**
+
+--url,--page,uusession <id>
+
+三种参数是 execute（以及 run/snapshot）指定"在哪个页面上跑”的三种方式，核心区别在会话的生命周期和标签页来源：
+
+ 对比总览
+
+|                   | `--url`                     | `--page`                 | `--session`                |
+| ----------------- | --------------------------- | ------------------------ | -------------------------- |
+| 会话来源          | 现场新建（一次性）          | 现场新建（一次性）       | 复用 `connect` 建好        |
+| 的长会话          |                             |                          |                            |
+| 标签页            | **新开**一个标签页          | **附加**到已打开的标签页 | 会话当时绑定的             |
+| 标签页            |                             |                          |                            |
+| 命令结束后        | 自动 `disconnect` + `close` | 同左                     | **保持连接**，供后续命     |
+| 令继续使用        |                             |                          |                            |
+| 需要配 `--origin` | ✅ 必须传                    | ✅ 必须传                 | ❌ 不用，`connect` 时已设定 |
+
 
 
 
@@ -686,11 +707,23 @@ node cli/dist/index.js execute --file examples/read-page.flow.json --url "https:
 node cli/dist/index.js execute --file examples/read-page.flow.json --page p0 --origin "https://example.com"
 ```
 
-**`--session <id>`** —— 目标页三选一：复用长会话（跨命令场景，先见 `connect`）。
+**`--session <id>`** —— 目标页三选一：复用长会话（跨命令场景，先见 `connect`）。不需要--origin参数。
 
 ```powershell
 node cli/dist/index.js execute --file bili-open4.flow.json --session sXX
 ```
+
+
+
+**安源域**
+
+| 对比项   | `--origin`（动作域）                                  | `--model-origin`（外发域）                        |
+| -------- | ----------------------------------------------------- | ------------------------------------------------- |
+| 管什么   | 会话能在哪些 origin 上执行操作（导航/点击/填表/读取） | 允许把哪些 origin 的页面摘要发给云模型（planner） |
+| 防什么   | 机器人越权跑到别的网站乱操作                          | 页面内容（可能含隐私）泄露给 AI服务               |
+| 边界方向 | 工具 → 网站（控制面）                                 | 网站 → 云模型（数据面）                           |
+| 默认值   | 空 = 全部禁止                                         | 空 = 全部禁止                                     |
+| 违规后果 | 首个域外动作直接报 `ORIGIN_NOT_ALLOWED`               | 暂停而非失败                                      |
 
 
 
@@ -710,11 +743,7 @@ node cli/dist/index.js execute --file with-goal.flow.json --url "https://example
 
 
 
-**`--values <json>`** —— 变量初值（标量字典），供步骤 `valuesRef` 引用（三大用法见 2.3）。
 
-```powershell
-node cli/dist/index.js execute --file search.flow.json --url "https://www.bilibili.com" --origin "https://www.bilibili.com" --origin "https://search.bilibili.com" --values '{"startUrl":"https://www.bilibili.com","keyword":"虎皮鹦鹉"}'
-```
 
 **`--idempotency-key <k>`** —— 幂等键：同 key + 同请求体重放返回原任务；同 key + 不同请求体报 `IDEMPOTENCY_CONFLICT`（防网络超时重发重复下单）。
 
@@ -724,53 +753,72 @@ node cli/dist/index.js execute --file order.flow.json --session sXX --idempotenc
 
 
 
+**`--values <json>`** —— 变量初值（标量字典），供步骤 `valuesRef` 引用。
+
+```powershell
+node cli/dist/index.js execute --file search.flow.json --url "https://www.bilibili.com" --origin "https://www.bilibili.com" --origin "https://search.bilibili.com" --values '{"startUrl":"https://www.bilibili.com","keyword":"虎皮鹦鹉"}'
+```
+
+
+
+
+
 ### snapshot 
 
-只读快照
+功能和execute的区别如下：
 
-stdout 总是输出快照 JSON（不受 `--json` 影响）；`elements` 含 role/name/text，供写 flow 定位。
+| 对比项       | `snapshot`                                                   | `execute`                                               |
+| ------------ | ------------------------------------------------------------ | ------------------------------------------------------- |
+| 本质         | 只读观察当前页面（风险级 `readonly`）                        | 执行确定性步骤序列（含写操作）                          |
+| 输入         | 只有目标页参数 + `--for-model`                               | 必须给 `steps`（`--file` /`--steps`）+ `--values`       |
+| 对页面的影响 | 零副作用：不点击、不导航、不填表                             | 会改变页面状态：navigate / click / fill / upload…       |
+| 输出         | `PageObservation`：snapshotId、url、title、元素清单（role/name，脱敏，上限 400 个，超出标 `truncated`） | `TaskEnvelope`：status、stepResults、artifacts、metrics |
+| 是否调模型   | 不调；`--for-model` 只是把快照按模型友好格式输出（需 origin ∈ `modelOrigins`） | 全程不调模型（区别于 `run`）                            |
+| 失败语义     | 采集失败一次性报错（如 `CAPABILITY_UNSUPPORTED`）            | 逐步执行，可暂停（审批 / needs_input）再 resume         |
+| 退出码       | 正常输出后直接 0                                             | 0 done / 2 参数错 / 3 paused / 4 failed                 |
 
-**`--url <url>`** —— 快照目标三选一（`--url`/`--page`/`--session`）：自动建临时会话、快照后自动断开（需配 `--origin`）。
+案例：
 
-```powershell
-node cli/dist/index.js snapshot --url "https://example.com" --origin "https://example.com"
+```
+# 1. 侦察：看页面上有什么元素
+node cli/dist/index.js snapshot --url "https://www.bilibili.com" --origin "https://www.bilibili.com"
+
+# 2. 根据输出写 flow.json（比如定位到 role=textbox name=搜索）
+# 3. 执行
+node cli/dist/index.js execute --file search.flow.json --url "https://www.bilibili.com" --origin     "https://www.bilibili.com"
 ```
 
-**`--page <id>`** —— 快照目标三选一：绑定既有标签页的一次性快照。
 
-```powershell
-node cli/dist/index.js snapshot --page p0 --origin "https://example.com"
-```
-
-**`--session <id>`** —— 快照目标三选一：长会话方式，快照当前绑定页。
-
-```powershell
-node cli/dist/index.js snapshot --session sXX
-```
-
-**`--origin <o>`** —— 一次性方式（`--url`/`--page`）必填*的临时会话授权域（规则同 execute）。
-
-```powershell
-node cli/dist/index.js snapshot --url "https://example.com" --origin "https://example.com"
-```
-
-**`--model-origin <o>`** —— 同 execute：允许外发云模型的域（⊆ origin）。
-
-```powershell
-node cli/dist/index.js snapshot --url "https://example.com" --origin "https://example.com" --model-origin "https://example.com"
-```
-
-**`--for-model`** —— 声明快照将发云模型：要求当前页 origin ∈ modelOrigins，否则拒绝（默认禁止外发）。
-
-```powershell
-node cli/dist/index.js snapshot --session sXX --for-model
-```
 
 ### run 
 
 自主任务（规划 + 执行）。
 
-前置（一次性配置；规划器与 Jev 是两份独立凭据）：
+run 和 execute 的本质区别一句话：execute 是你写死步骤它照做；run 是你给目标 ，云模型现场规划步骤再执行，做完还有“语义验收”把
+
+关。
+
+
+
+ run 的执行流程
+
+ ```
+   --goal + --success
+      → ① 盲规划：planner 只看 goal/验收文本/URL，产出 FlowStep[]
+      → ② 逐步执行（同 execute；若含 goal 步骤 → 此处才有"观察页面→发LLM模型"生成FlowStep[]，循环执行。
+  ）
+      → ③ 任务级验收：Jev 只拿脱敏URL+done步骤id+验收文本打分
+           p ≥ doneAt → done (semantic)
+           p < doneAt → likely_done 暂停
+                ├ task resume --rerun-confirm   人工拍板
+                └ task resume --replan          重规划后缀（输入多给completedStepIds + pausedReason，依然没有整页快照）
+ ```
+
+
+
+**前置**
+
+一次性配置；规划器与 Jev 是两份独立凭据：
 
 ```powershell
 $env:JEV_BROWSER_PLANNER_ENABLED = "true"
@@ -780,61 +828,327 @@ $env:JEV_BROWSER_PLANNER_API_KEY = "<规划模型 key>"
 $env:TYPESAFE_API_KEY = "<Jev key>"
 ```
 
-**`--goal <文本>`** —— 自然语言目标（必填）。
+
+
+**特有参数**
+
+| 参数                                  | 说明                                                     |
+| ------------------------------------- | -------------------------------------------------------- |
+| `--goal <文本>`                       | **必填**，自然语言目标                                   |
+| `--success <文本>`                    | **必填**，任务级验收条件（防规划器自证成功，代码硬校验） |
+| `--model-origin <o>`                  | 声明允许把哪个域的页面摘要发给云模型。                   |
+| `--replan`（`task resume` 时）        |                                                          |
+| `--rerun-confirm`（`task resume` 时） |                                                          |
+
+
+
+#### **--replan**
+
+ 你用 run 时，系统内部发生的事可以类比为 GPS 导航：
+
+ ```
+   你说的                        系统做的
+   ─────────────────────────────────────────────────────
+   --goal "搜索并打开第一个视频"   → 规划器画出一条路线（一串步骤）
+   --success "播放器出现"         → 一句"怎么算到了"
+ ```
+
+ 假设规划器画出的路线是 5 步：
+
+ ```
+   计划：[s1 打开搜索页] [s2 填关键词] [s3 点搜索] [s4 点第一个结果] [s5 断言播放器]
+          └────────── 已走 ──────────┘└──────── 未走（后缀）────────┘
+                                      ↑ 游标 cursor 停在这里
+ ```
+
+ 中途抛锚：任务为什么会暂停
+
+ 执行到 s4 卡住了——比如页面弹了个登录框，或者按钮定位器过时了。任务不是失败，而是暂停（paused），整个状态
+ 被完整冻结：
+
+ - 已完成的 s1~s3（连同它们造成的页面效果）原样保留
+ - 游标 cursor 停在 3，后缀 [s4, s5] 原封不动存着
+ - 任务记录里存着暂停原因（pauseReason）
+
+ 现在轮到你来决策：这条路线的后半段，还作数吗？这就是 task resume 系列参数的由来——三种走法：
+
+ 三种走法（这里是核心）
+
+ ```
+                           暂停中（s1✓ s2✓ s3✓ | s4 s5 未走）
+                                         │
+           ┌─────────────────────────────┼─────────────────────────────┐
+           ▼                             ▼                             ▼
+      resume（不带参数）            --rerun-confirm                  --replan
+           │                             │                             │
+      "障碍没了，原计划继续"         "其实已经到了"                 "后半段路作废，重新规划"
+           │                             │                             │
+      适合：你手动关掉了弹窗，        适合：页面其实已经到达目的地，    适合：原计划的后半段
+      s4 s5 再试一遍就能过           只是验收打分没过 → 人工签收       确实走不通（选择器过时、
+                                                                     缺信息）→ 模型重想
+ ```
+
+ --replan 就是第三种走法。
+
+ --replan 具体做了什么
+
+ 它让规划器重新画后半段的路，注意三个细节：
+
+ ```
+   重新规划时模型能看到什么：
+     目标 + 验收条件 + 当前 URL + 已完成步骤 id（s1,s2,s3）+ 暂停原因
+     （依然看不到页面内容——和初始规划一样是"盲"的）
+
+   重新规划后怎么拼：
+     [s1 s2 s3]  +  [s4' s5']     ← 新后缀可能是完全不同的步骤
+      原样保留        模型新生成      （已花的功夫不浪费，副作用不重放）
+
+   然后呢：
+     接着跑新后缀 → 跑完照旧过 Jev 验收 → 过了才 done
+     （重新规划 ≠ 直接算成功，验收关照过不误）
+ ```
+
+ 为什么要有预算闸门
+
+ 重规划要烧一次模型调用，而且可能“规划→跑→又暂停→再规划”无限打转。所以：
+
+ - maxReplans（默认 3 次）：最多改道 3 次
+ - maxPlannerRequests（默认 8 次）：初始规划 + 所有重规划加起来最多 8 次
+ - 超了直接 BUDGET_EXCEEDED，逼你人工介入
+
+ 这也是为什么 --replan 是每次 resume 显式声明才触发——系统绝不自作主张替你改道烧钱。
+
+
+
+**场景案例**
+
+**第 1 幕：发起任务**
 
 ```powershell
-node cli/dist/index.js run --url "https://search.bilibili.com/all?keyword=%E8%99%8E%E7%9A%AE%E9%B9%A6%E9%B9%89" --goal "在当前B站搜索结果页，按顺序找到第4条视频结果并打开它" --success "当前页是 bilibili 视频播放页（URL 含 /video/BV），且视频标题与搜索结果第4条一致" --origin "https://search.bilibili.com" --origin "https://www.bilibili.com"
+node cli/dist/index.js run `
+  --goal "打开博客首页，抓取最近 3 篇文章的标题" `
+  --success "提取到 3 个标题并存入变量" `
+  --url "https://blog.example.com" --origin "https://blog.example.com" `
+  --model-origin "https://blog.example.com" --json
 ```
 
-**`--success <文本>`** —— 人类可读验收条件（必填）；任务级验收由引擎执行，规划器不能自证完成（两层验收见技术原理）。
+规划器画出路线：
+
+```
+[s1 打开首页] [s2 extract 文章链接列表] [s3 点"下一页"翻页] [s4 extract 标题] [s5 断言 3 条]
+```
+
+**第 2 幕：卡死在 s3**
+
+这个博客的文章列表其实是**滚动自动加载**的，根本没有"下一页"按钮。s3 点了三次"下一页"，页面纹丝不动，goal 执行器判定死循环：
+
+```
+PauseSignal('ambiguous', '连续 3 次相同动作且页面无变化，判定为循环')
+```
+
+任务暂停。看现场：
 
 ```powershell
-node cli/dist/index.js run --url "https://example.com" --goal "打开页面并确认标题" --success "页面标题为 Example Domain" --origin "https://example.com"
+node cli/dist/index.js task get t_xyz789
 ```
 
-**`--url <url>`** —— 目标页三选一（`--url`/`--page`/`--session`）：一次性会话（语义同 execute）。
+```json
+{
+  "taskId": "t_xyz789",
+  "status": "paused",
+  "pauseReason": "ambiguous",
+  "metrics": { "actions": 6, "plannerRequests": 1 },
+  "stepResults": [
+    { "id": "s1", "status": "done" },
+    { "id": "s2", "status": "done" },
+    { "id": "s3", "status": "paused" }
+  ]
+}
+```
+
+**第 3 幕：两种徒劳的走法**
 
 ```powershell
-node cli/dist/index.js run --url "https://example.com" --goal "..." --success "..." --origin "https://example.com"
+# 走法 1：直接续跑 —— s3 还是点"下一页"，还是死循环，白跑
+node cli/dist/index.js task resume t_xyz789 --request-id r1
+
+# 走法 2：--rerun-confirm —— 只是"再点一次下一页"，循环依旧，治标不治本
+node cli/dist/index.js task resume t_xyz789 --rerun-confirm --request-id r2
 ```
 
-**`--page <id>`** —— 目标页三选一：绑定既有标签页。
+**问题不在"这一步没跑好"，而在"这一步本身就不该这么走"**——原计划的后缀 `[s3 翻页] [s4] [s5]` 整体已经不适用了。这才是 `--replan` 登场的时机。
+
+**第 4 幕：--replan 改道**
 
 ```powershell
-node cli/dist/index.js run --page p0 --goal "..." --success "..." --origin "https://example.com"
+node cli/dist/index.js task resume t_xyz789 --replan --request-id r3
 ```
 
-**`--session <id>`** —— 目标页三选一：复用长会话。
+这一下，系统把任务状态打包喂给规划器：
+
+```json
+{
+  "goal": "打开博客首页，抓取最近 3 篇文章的标题",
+  "successCriteria": "提取到 3 个标题并存入变量",
+  "currentUrl": "https://blog.example.com",
+  "completedStepIds": ["s1", "s2"],
+  "pausedReason": "ambiguous"
+}
+```
+
+规划器换了个思路，产出**新后缀**（不再翻页，改用滚动加载）：
+
+```
+原计划：[s1 ✓] [s2 ✓] [s3 点下一页] [s4 extract] [s5 断言]
+                        └──── 作废 ────┘
+拼 接： [s1 ✓] [s2 ✓] [s3' evaluate 滚动加载脚本] [s4' extract 标题] [s5' 断言 3 条]
+        └── 已完成的副作用原样保留 ──┘  └──────── 新后缀 ────────┘
+```
+
+**第 5 幕：跑完收工**
+
+```
+→ s3' 滚动加载出文章 → s4' 提取到 3 个标题 → s5' 断言通过
+→ Jev 任务级验收 p=0.91 ≥ 0.8 → status: done
+```
+
+最终 envelope 里会留下改道痕迹：
+
+```json
+"metrics": { "actions": 9, "plannerRequests": 2, "replans": 1 }
+```
+
+**边界情况（顺手记住）**
 
 ```powershell
-node cli/dist/index.js run --session sXX --goal "..." --success "..."
+# 改道不是无限的：maxReplans 默认 3 次，用完再试 →
+[jev-browser-cli] BUDGET_EXCEEDED: 重规划次数超过预算 3
+
+# 用错了暂停类型也不行：likely_done 的任务不能用 --replan →
+[jev-browser-cli] INVALID_INPUT: allowReplan 仅适用于 ambiguous/needs_input 暂停（当前 likely_done）
 ```
 
-**`--origin <o>`** —— 一次性会话必填*的授权域（规则同 execute，可重复）。
+**复盘对比**
 
-```powershell
-node cli/dist/index.js run --url "https://search.bilibili.com/all?keyword=虎皮鹦鹉" --goal "..." --success "..." --origin "https://search.bilibili.com" --origin "https://www.bilibili.com"
-```
+| | `--rerun-confirm`（购物下单案例） | `--replan`（本案例） |
+| --- | --- | --- |
+| 病因 | 结果未知（订单提交没？） | **方案本身错了**（翻页 vs 滚动加载） |
+| 药方 | 人核实后放行，**原样重跑当前步** | 模型**换思路重写后缀**，已完成部分保留 |
+| 烧钱 | 0 次模型调用 | 每次消耗 1 个 plannerRequests |
+| 上限 | 无次数限制 | `maxReplans`=3 |
 
-**`--model-origin <o>`** —— 可外发域（⊆ origin）；run 的任务级验收本身也要外发，不给会暂停 `likely_done`。
+一句话：**`--rerun-confirm` 是"路没走完，接着走"；`--replan` 是"这条路不通，掉头重规划剩下的路——但已走过的里程不作废"。**
 
-```powershell
-node cli/dist/index.js run --url "https://search.bilibili.com/all?keyword=虎皮鹦鹉" --goal "..." --success "..." --origin "https://search.bilibili.com" --origin "https://www.bilibili.com" --model-origin "https://search.bilibili.com" --model-origin "https://www.bilibili.com"
-```
 
-**`--values <json>`** —— 变量初值（供规划产物的 `valuesRef` 使用）。
 
-```powershell
-node cli/dist/index.js run --session sXX --goal "..." --success "..." --values '{"keyword":"虎皮鹦鹉"}'
-```
+#### **--rerun-confirm**  
 
-**`--idempotency-key <k>`** —— 幂等键（语义同 execute）。
+ 案例：让 AI 在购物站下单
 
-```powershell
-node cli/dist/index.js run --session sXX --goal "..." --success "..." --idempotency-key run-001
-```
+第 1 幕：发起任务
 
-### 长会话交互
+ ```powershell
+   node cli/dist/index.js run `
+     --goal "搜索《三体》实体书，加入购物车并提交订单" `
+     --success "出现订单确认页，且包含订单号" `
+     --url "https://shop.example.com" --origin "https://shop.example.com" `
+     --model-origin "https://shop.example.com" --json
+ ```
+
+ 规划器画出路线，开始执行：
+
+ ```
+   [s1 搜索三体] → [s2 点加入购物车] → [s3 点结算] → [s4 填地址] → [s5 点提交订单] → [s6 断言订单号]
+ ```
+
+第 2 幕：出事的那个瞬间
+
+ s1~s4 一路顺利。执行 s5（点击“提交订单”） 时——
+
+ 点击请求刚发出去，浏览器调试连接断了（Chrome 更新重启/网络抖动）。
+
+ 现在系统面临一个它无法回答的问题：
+
+ │ 这个点击，到底生效了没有？
+ │ - 订单可能已经创建了 ✅
+ │ - 也可能请求根本没到服务器 ❌
+ │
+ │ 连接断了，没有证据，无法证明。
+
+第 3 幕：任务冻结，浏览器隔离
+
+ 任务暂停，你查一下状态：
+
+ ```powershell
+   node cli/dist/index.js task get t_abc123
+ ```
+
+ ```json
+   {
+     "taskId": "t_abc123",
+     "status": "paused",
+     "pauseReason": "interrupted",
+     "stepResults": [
+       { "id": "s1", "status": "done" },
+       { "id": "s2", "status": "done" },
+       { "id": "s3", "status": "done" },
+       { "id": "s4", "status": "done" },
+       { "id": "s5", "status": "paused", "error": { "code": "ACTION_OUTCOME_UNKNOWN" } }
+     ]
+   }
+ ```
+
+ 注意 s5 的错误码：ACTION_OUTCOME_UNKNOWN——动作结果未知。同时系统给这个浏览器 profile 上了隔离：其他任务
+ 不许来碰这个“状态不明的浏览器”。
+
+第 4 幕：你直接恢复，被拒绝
+
+ ```powershell
+   node cli/dist/index.js task resume t_abc123
+ ```
+
+ ```
+   [jev-browser-cli] TASK_NOT_RESUMABLE: 该暂停涉及未证实结果或人工核验，需要显式 rerunConfirmed=true
+ ```
+
+ 系统的话翻译过来就是：“s5 可能已经执行过了，我现在重跑它可能会重复下单。我不会赌，你先去搞清楚。”
+
+第 5 幕：这就是设计目的——逼你先核实
+
+ 你现在必须做一件系统做不了的事：去现实世界里查证。
+
+ 打开浏览器看页面？查邮箱有没有订单确认邮件？登商家后台看订单列表？
+
+ 分支 A：查证结果——订单没建成（页面还停在结算页，没有确认邮件）
+
+ 好，重跑 s5 没有风险。签字：
+
+ ```powershell
+   node cli/dist/index.js task resume t_abc123 --rerun-confirm --request-id r1
+ ```
+
+ ```
+   任务恢复 → 重新执行 s5 → 点击提交订单 → 订单创建
+   → s6 断言通过 → Jev 验收 p=0.93 ≥ 0.8
+   → status: done ✓
+ ```
+
+ 同时浏览器隔离解除，其他任务可以正常使用它了。
+
+ 分支 B：查证结果——订单其实建成了（收到了确认邮件！）
+
+ 这时你绝不能带 --rerun-confirm 恢复——重跑 s5 就是第二笔订单，扣两次款。正确动作是取消任务、人工收尾：
+
+ ```powershell
+   node cli/dist/index.js task cancel t_abc123 --request-id r2
+ ```
+
+ --rerun-confirm 的全部意义就一句话：系统拒绝在事实不清时自动重放，把“重复执行会不会出事”这个判断，强制交
+ 还给掌握现实信息的人。
+
+
+
+## 长会话交互
 
 一次性会话「跑完即断」；要在同一页面上多轮交互（观察 → 操作 → 再观察），先 `connect` 建会话，后续命令都传 `--session`：
 
@@ -844,7 +1158,7 @@ node cli/dist/index.js execute --session sXX --file bili-open4.flow.json    # �
 node cli/dist/index.js run --session sXX --goal "..." --success "..."       # 在会话上跑自主任务
 ```
 
-#### connect —— 建会话
+### connect —— 建会话
 
 **`--url <url>`** —— 会话目标二选一（`--url`/`--page`）：新开标签页。stdout 打印会话 JSON（取 `sessionId`）。
 
@@ -870,7 +1184,7 @@ node cli/dist/index.js connect --url "https://example.com" --origin "https://exa
 node cli/dist/index.js connect --url "https://example.com" --origin "https://example.com" --model-origin "https://example.com"
 ```
 
-#### pages —— 列标签页
+### pages —— 列标签页
 
 **`--session <id>`** —— 会话 id（必填）。列出会话可见标签页（按授权域过滤、URL 脱敏）；典型用途：找 `target=_blank` 新开页的 pageId。
 
@@ -878,7 +1192,7 @@ node cli/dist/index.js connect --url "https://example.com" --origin "https://exa
 node cli/dist/index.js pages --session sXX
 ```
 
-#### select-page —— 切换绑定页
+### select-page —— 切换绑定页
 
 **`--session <id>`** —— 会话 id（必填）。
 
@@ -892,7 +1206,7 @@ node cli/dist/index.js select-page --session sXX --page p2
 node cli/dist/index.js select-page --session sXX --page p2
 ```
 
-#### act —— 单步动作
+### act —— 单步动作
 
 在既有会话上执行一个动作并等待任务落定；适合「snapshot 观察 → act 操作」交互循环。
 
@@ -915,7 +1229,7 @@ Get-Content click.step.json | node cli/dist/index.js act --session sXX --step -
 node cli/dist/index.js act --session sXX --step fill.step.json --values '{"keyword":"虎皮鹦鹉"}'
 ```
 
-#### disconnect —— 断开会话
+### disconnect —— 断开会话
 
 **`--session <id>`** —— 会话 id（必填）。attach 模式仅断开 CDP 连接，绝不关用户浏览器。
 
@@ -929,9 +1243,9 @@ node cli/dist/index.js disconnect --session sXX
 node cli/dist/index.js disconnect --session sXX --detach-task
 ```
 
-### 任务治理
+## 任务治理
 
-#### task —— 任务管理
+### task —— 任务管理
 
 用法：`node cli/dist/index.js task <get|cancel|resume|approve> <taskId>`（taskId 位置式，或用 `--task <id>` 代替）。
 
@@ -990,7 +1304,7 @@ node cli/dist/index.js task approve tmumiwtkqa4474d0 --grant eyJhbGciOi...
 node cli/dist/index.js task approve tmumiwtkqa4474d0 --grant eyJhbGciOi...
 ```
 
-#### artifact —— 产物管理
+### artifact —— 产物管理
 
 截图/下载文件都在受管 artifact 区：`<数据目录>\artifacts\<taskId>\`。
 
@@ -1024,7 +1338,7 @@ node cli/dist/index.js artifact get --task tmumiwtkqa4474d0 --artifact aXyz --ou
 node cli/dist/index.js artifact get --task tmumiwtkqa4474d0 --artifact aXyz --out .\report.xlsx
 ```
 
-### 审批签发
+## 审批签发
 
 #### grant —— 签发审批令牌
 

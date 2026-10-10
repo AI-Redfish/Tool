@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "_说明": "站内搜索语法模板：fill 的 valuesRef 引用 --values 里的 kw。注意：需在真实搜索页运行（存在 name=关键词 的 textbox 与 搜索 按钮）；example.com 是静态页，直接执行会在 s1（url_contains /search）失败——请把 --url/--origin 和步骤里的 URL/定位器换成实际站点。",
+  "steps": [
+    {
+      "id": "s1",
+      "kind": "action",
+      "action": "navigate",
+      "value": "https://example.com/search",
+      "expect": [{ "kind": "url_contains", "value": "/search" }]
+    },
+    {
+      "id": "s2",
+      "kind": "action",
+      "action": "fill",
+      "target": { "by": "role", "role": "textbox", "name": "关键词" },
+      "valuesRef": "kw",
+      "expect": [{ "kind": "visible", "target": { "by": "role", "role": "textbox", "name": "关键词" } }]
+    },
+    {
+      "id": "s3",
+      "kind": "action",
+      "action": "click",
+      "target": { "by": "role", "role": "button", "name": "搜索" },
+      "expect": [{ "kind": "text_present", "value": "条结果" }]
+    },
+    {
+      "id": "s4",
+      "kind": "extract",
+      "target": { "by": "css", "selector": ".result-list" },
+      "fields": ["count"],
+      "saveAs": "resultCount"
+    },
+    {
+      "id": "s5",
+      "kind": "assert",
+      "expect": [{ "kind": "count_gte", "target": { "by": "css", "selector": ".result-item" }, "value": 1 }]
+    }
+  ]
+}
