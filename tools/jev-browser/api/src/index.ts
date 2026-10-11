@@ -155,13 +155,22 @@ export function createApiServer(rt: Runtime, opts: { token: string; rateLimitPer
       }
 
       // POST /v1/sessions/:id/page | .../act | .../snapshot
-      if (req.method === 'POST' && parts[1] === 'sessions' && ['page', 'act', 'snapshot'].includes(parts[3] ?? '')) {
+      if (req.method === 'POST' && parts[1] === 'sessions' && ['page', 'act', 'snapshot', 'judge'].includes(parts[3] ?? '')) {
         const body = await readJsonBody(req);
         if (parts[3] === 'page') {
           return send(res, 200, await rt.selectPage(parts[2]!, String(body.pageId)));
         }
+        if (parts[3] === 'judge') {
+          return send(res, 200, await rt.judgePage(parts[2]!, String(body.question ?? '')));
+        }
         if (parts[3] === 'snapshot') {
-          return send(res, 200, await rt.snapshot(parts[2]!, { forModel: body.forModel === true }));
+          return send(res, 200, await rt.snapshot(parts[2]!, {
+            forModel: body.forModel === true,
+            viewportOnly: body.viewportOnly === true,
+            maxElements: typeof body.maxElements === 'number' ? body.maxElements : undefined,
+            filter: typeof body.filter === 'string' ? body.filter : undefined,
+            roles: Array.isArray(body.roles) ? (body.roles as string[]) : undefined,
+          }));
         }
         const queued = await rt.act(parts[2]!, { sessionId: parts[2]!, step: body.step as never, values: (body.values ?? {}) as never });
         return send(res, 202, queued);

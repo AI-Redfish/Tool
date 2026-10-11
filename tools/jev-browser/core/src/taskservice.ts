@@ -25,7 +25,9 @@ import { credentialPresent } from './config.js';
 import { TaskStore, type TaskRow } from './store.js';
 import { assertTransition, recoverStale, resolveCancelling } from './statemachine.js';
 import { PolicyGate, originOf } from './policy.js';
+import { redactUrl } from './ports.js';
 import { observePage, slimObservation } from './observe.js';
+import { expandShorthandSteps } from './shorthand.js';
 import { verifyGrant } from './grants.js';
 import { WRITE_ACTIONS, validatePlannedSteps } from './planner.js';
 import type { JudgePort } from './judge.js';
@@ -70,6 +72,9 @@ export interface CancelOptions {
   requestId: string;
   expectedRevision?: number;
 }
+
+/** judge 单问判断发送的候选上限（判断通常只关心少数关键元素）。 */
+const MAX_JUDGE_ELEMENTS = 60;
 
 const RETENTION_MS = 24 * 60 * 60_000; // 幂等/元数据拟保留 24h（DESIGN §9.1）
 
@@ -137,7 +142,18 @@ export class Runtime {
   private connectMs: number | undefined;
 
   private async ensureBrowser(): Promise<{ browser: BrowserPort; ownership: 'borrowed' | 'owned' }> {
-    if (this.browser) return { browser: this.browser.port, ownership: this.browser.ownership };
+    if (this.browser) {
+      if (this.browser.port.isConnected()) {
+        return { browser: this.browser.port, ownership: this.browser.ownership };
+      }
+      // 浏览器已断开（用户关掉调试 Chrome / 崩溃）。此前这里直接返回缓存句柄，
+      // 于是本进程此后**每次**调用都只报 `PAGE_NOT_RESOLVED`，直到重启 MCP——
+      // 而浏览器其实可以立刻重新接管（doctor --connect 走的就是那条路）。
+      // 丢弃缓存句柄与失效的页面句柄，落到下面重新连接。
+      this.sessionPages.clear();
+      this.queues.clear();
+      this.browser = null;
+    }
     this.acquireHostLock();
     const t0 = this.clock.now();
     const res = await this.connector.connect();
@@ -190,6 +206,12 @@ export class Runtime {
       // 仅列出已授权域的脱敏页面元数据（DESIGN §8.1；宿主级 + 会话级许可的并集）
       const authorized = new Set([...this.cfg.safety.allowedOrigins, ...input.allowedOrigins]);
       const filterAuthorized = (cs: PageCandidate[]) => cs.filter((c) => authorized.has(originOf(c.url)));
+      // 未显式指定页时，默认页必须自己就在授权域内。像 chrome://new-tab-page 这类页面
+      // 既无法授权，绑上去之后每一步都 ORIGIN_NOT_ALLOWED，连 pages 都被过滤成空，
+      // agent 看不到任何线索、也无法自救。此时按「无默认页」处理，交给下面的候选逻辑。
+      if (!input.target.pageId && sel.page && !authorized.has(originOf(sel.page.url()))) {
+        sel = { page: null, candidates: sel.candidates };
+      }
       let filtered = filterAuthorized(sel.candidates);
       // 未指定页且唯一匹配（过滤后仅剩一个授权页）→ 自动绑定；否则保持 awaiting_page（DESIGN §8.1）
       if (!input.target.pageId && !sel.page && filtered.length === 1) {
@@ -271,12 +293,13 @@ export class Runtime {
   async execute(sessionId: string, input: ExecuteTaskInput, opts: SubmitOptions = {}): Promise<TaskEnvelope> {
     const s = this.requireSession(sessionId);
     if (s.status !== 'ready') throw err('SESSION_NOT_READY', `会话未就绪（${s.status}），先 select-page`);
-    validateExecuteSteps(input.steps);
+    // 归一化：展开简写、补 id；下游（落库/执行/只读判定）一律面对 FlowStep[]
+    const steps = validateExecuteSteps(input.steps);
     // 含 goal 步骤时需要 Jev：提前快速失败，而不是执行一半后失败（DESIGN §6.1）
-    if (input.steps.some((st) => st.kind === 'goal') && !this.judge.available()) {
+    if (steps.some((st) => st.kind === 'goal') && !this.judge.available()) {
       throw err('JEV_NOT_CONFIGURED', `execute 中的 goal 步骤需要 Jev key（${this.cfg.jev.apiKeyEnv}）`);
     }
-    return this.enqueueTask(sessionId, 'execute', input, opts, input.budget);
+    return this.enqueueTask(sessionId, 'execute', { ...input, steps }, opts, input.budget);
   }
 
   async run(sessionId: string, input: RunTaskInput, opts: SubmitOptions = {}): Promise<TaskEnvelope> {
@@ -296,8 +319,8 @@ export class Runtime {
 
   async act(sessionId: string, input: ActInput, opts: SubmitOptions = {}): Promise<TaskEnvelope> {
     this.requireSession(sessionId);
-    validateExecuteSteps([input.step]);
-    return this.enqueueTask(sessionId, 'act', { sessionId, steps: [input.step], values: input.values }, opts);
+    const [step] = validateExecuteSteps([input.step]);
+    return this.enqueueTask(sessionId, 'act', { sessionId, steps: [step], values: input.values }, opts);
   }
 
   private async enqueueTask(
@@ -405,11 +428,28 @@ export class Runtime {
     while (true) {
       const raw = this.store.kvGet(`reserve:${pk}`);
       if (!raw) break;
+      let owner: string | undefined;
       try {
-        const r = JSON.parse(raw) as { taskId: string };
-        if (r.taskId === taskId) break;
+        owner = (JSON.parse(raw) as { taskId: string }).taskId;
       } catch {
         break;
+      }
+      if (owner === taskId) break;
+      // 持有者是**暂停等人**的任务时，等它毫无意义——它不会自己释放。此前会一路空转到
+      // queueTimeoutMs（默认 60 秒）才报 BROWSER_BUSY：调用方（尤其是 Agent）会白等一分钟。
+      // 改为立刻失败并指名道姓，把「先处理那个暂停任务」这条路径说清楚。
+      const holder = owner ? this.store.getTask(owner) : undefined;
+      if (holder && holder.status === 'paused') {
+        row = this.store.getTask(taskId)!;
+        this.transitionTo(row, 'failed', {
+          error: {
+            code: 'SESSION_BUSY',
+            message: `浏览器被暂停任务 ${owner} 预约（${holder.pauseReason ?? 'paused'}）；先 task cancel ${owner} 或 task resume ${owner}，再重试本任务（不再空等）`,
+            retryable: false,
+          },
+        });
+        this.resolveWaiter(taskId);
+        return;
       }
       if (this.clock.now() > queueDeadline || (row.deadlineAt !== null && this.clock.now() > row.deadlineAt)) {
         row = this.store.getTask(taskId)!;
@@ -477,13 +517,15 @@ export class Runtime {
       metrics.jevRequests = ju.jevRequests - judgeStart.jevRequests;
       metrics.inputTokens = ju.inputTokens - judgeStart.inputTokens;
       metrics.outputTokens = ju.outputTokens - judgeStart.outputTokens;
-      if (ju.model) metrics.jevModel = ju.model;
+      // 只在本次任务真的调过 Jev 时才记模型名：judge 是 Runtime 级实例，lastModel 是粘的，
+      // 否则一个纯确定性任务也会显示上一个任务用过的 Jev 模型，读起来像"这步也调了模型"。
+      if ((metrics.jevRequests ?? 0) > 0 && ju.model) metrics.jevModel = ju.model;
       if (this.planner?.usage && plannerStart) {
         const pu = this.planner.usage();
         metrics.plannerRequests = Math.max(metrics.plannerRequests ?? 0, pu.requests - plannerStart.requests);
         metrics.inputTokens += pu.inputTokens - plannerStart.inputTokens;
         metrics.outputTokens += pu.outputTokens - plannerStart.outputTokens;
-        if (pu.model) metrics.plannerModel = pu.model;
+        if ((metrics.plannerRequests ?? 0) > 0 && pu.model) metrics.plannerModel = pu.model;
       }
     };
     const persist = (patch: Partial<{ cursor: number; goalJson: string | null; planJson: string | null }> = {}) => {
@@ -583,12 +625,14 @@ export class Runtime {
           maxInputTokens: this.cfg.runtime.maxInputTokens,
           maxOutputTokens: this.cfg.runtime.maxOutputTokens,
           actionTimeoutMs: this.cfg.runtime.actionTimeoutMs,
+          expectRetryMs: this.cfg.runtime.expectRetryMs,
           thresholds: {
             doneAt: this.cfg.jev.doneAt,
             confirmLow: this.cfg.jev.confirmLow,
             confirmHigh: this.cfg.jev.confirmHigh,
             blockedAt: this.cfg.jev.blockedAt,
             errorAt: this.cfg.jev.errorAt,
+            targetConfidenceAt: this.cfg.jev.targetConfidenceAt,
           },
           artifacts: fctx.artifacts,
           ledger: fctx.ledger,
@@ -611,6 +655,7 @@ export class Runtime {
         ledger,
         nextActionRevision: () => ++seq,
         actionTimeoutMs: this.cfg.runtime.actionTimeoutMs,
+        expectRetryMs: this.cfg.runtime.expectRetryMs,
         cancelFlag,
         dialogs: this.dialogs,
         allowedUploadDirs: this.cfg.safety.allowedUploadDirs,
@@ -786,7 +831,7 @@ export class Runtime {
    */
   async snapshot(
     sessionId: string,
-    opts: { forModel?: boolean; viewportOnly?: boolean; maxElements?: number } = {},
+    opts: { forModel?: boolean; viewportOnly?: boolean; maxElements?: number; filter?: string; roles?: string[] } = {},
   ): Promise<unknown> {
     const s = this.requireSession(sessionId);
     const page = this.sessionPages.get(sessionId);
@@ -819,6 +864,8 @@ export class Runtime {
         viewportOnly: opts.viewportOnly,
         maxElements: opts.maxElements,
         forModel: opts.forModel,
+        filter: opts.filter,
+        roles: opts.roles,
       });
       if (opts.forModel) {
         // forModel：只回紧凑文本 + 元信息，不回元素对象数组（这才是「模型友好」的实质）
@@ -826,6 +873,44 @@ export class Runtime {
         return { snapshotId, url, title, counts, truncated, rendered };
       }
       return slimObservation(obs);
+    });
+    this.queues.set(pk, run.then(() => undefined, () => undefined));
+    return run;
+  }
+
+  /**
+   * 单问题语义判断（browser_check 场景）：把「当前页是否满足某条件」交给 Jev 打分。
+   *
+   * 用途是**替代一次观察回传**：调用方若只需知道「有没有订单号」「是否已登录」，
+   * 读一整屏元素（数百到上千 token）不如问一句（约 300ms + 几十 token）。
+   * 页面候选会发给云模型，因此与 forModel 快照同一条门禁：origin 必须在 modelOrigins 内。
+   */
+  async judgePage(sessionId: string, question: string): Promise<{ p: number; url: string; model?: string }> {
+    if (!question.trim()) throw err('INVALID_INPUT', 'judge 需要非空 question');
+    const s = this.requireSession(sessionId);
+    const page = this.sessionPages.get(sessionId);
+    if (!page) throw err('SESSION_NOT_READY', '会话没有可用页面');
+    const allowed: string[] = JSON.parse(s.allowedJson);
+    const modelOrigins: string[] = JSON.parse(s.modelJson);
+    if (!this.judge.available()) throw err('JEV_NOT_CONFIGURED', '语义判断需要 Jev key（纯确定性 execute 不需要）');
+    const pk = this.profileKey();
+    const prev = this.queues.get(pk) ?? Promise.resolve();
+    const run = prev.then(async () => {
+      this.reapStaleLocks();
+      if (!modelOrigins.includes(originOf(page.url()))) {
+        throw err('ORIGIN_NOT_ALLOWED', `judge 会把页面候选发给 Jev，要求 origin ∈ modelOrigins（当前未包含）: ${originOf(page.url())}`);
+      }
+      const obs = await observePage(page, { allowedOrigins: allowed, viewportOnly: true, maxElements: MAX_JUDGE_ELEMENTS });
+      const before = this.judge.usage();
+      // 只发判断用得上的字段（与 goal 路径同口径）
+      const state = {
+        url: redactUrl(obs.url),
+        title: obs.title,
+        elements: obs.elements.map((e, idx) => ({ i: idx, role: e.role, name: e.name })),
+      };
+      const p = await this.judge.check(state, question);
+      const used = this.judge.usage();
+      return { p, url: obs.url, model: used.model, ...(before.jevRequests === used.jevRequests ? {} : {}) };
     });
     this.queues.set(pk, run.then(() => undefined, () => undefined));
     return run;
@@ -1341,10 +1426,12 @@ function validateOrigins(allowed: string[], model: string[]): void {
   for (const o of model) if (!allowed.includes(o)) throw err('INVALID_INPUT', `modelOrigins 必须是 allowedOrigins 子集: ${o}`);
 }
 
-/** execute 输入校验：白名单 + 写操作必须提供后置条件 + id 全局唯一（DESIGN §8.1）。 */
-export function validateExecuteSteps(steps: FlowStep[]): void {
+/** execute 输入校验：白名单 + 写操作必须提供后置条件 + id 全局唯一（DESIGN §8.1）。
+ *  同时归一化输入：展开字符串简写、给缺 id 的步骤补 id，返回可落库的 FlowStep[]。 */
+export function validateExecuteSteps(steps: readonly (FlowStep | string)[]): FlowStep[] {
   if (!Array.isArray(steps) || steps.length === 0) throw err('INVALID_INPUT', 'steps 不能为空');
-  validatePlannedSteps(JSON.parse(JSON.stringify(steps)) as unknown);
+  const normalized = expandShorthandSteps(steps);
+  validatePlannedSteps(JSON.parse(JSON.stringify(normalized)) as unknown);
   const seen = new Set<string>();
   const walk = (list: FlowStep[]) => {
     for (const s of list) {
@@ -1354,9 +1441,9 @@ export function validateExecuteSteps(steps: FlowStep[]): void {
       if (s.kind === 'forEach') walk(s.body);
     }
   };
-  walk(steps);
+  walk(normalized);
   let branchDepth = 0;
-  for (const s of steps) {
+  for (const s of normalized) {
     if (s.kind === 'action' && WRITE_ACTIONS.has(s.action) && (!s.expect || s.expect.length === 0)) {
       throw err('INVALID_INPUT', `动作 ${s.action}（${s.id}）必须提供 expect 后置条件`);
     }
@@ -1365,6 +1452,7 @@ export function validateExecuteSteps(steps: FlowStep[]): void {
       if (branchDepth > 1) throw err('INVALID_INPUT', 'branch 只允许一层');
     }
   }
+  return normalized;
 }
 
 /** secretRef 解析：从 JEV_BROWSER_SECRET_<NAME> 读取，缺失 → 暂停（DESIGN §6.3）。 */

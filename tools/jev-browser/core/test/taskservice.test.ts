@@ -24,6 +24,7 @@ function testConfig(overrides: Partial<JevBrowserConfig> = {}): JevBrowserConfig
   cfg.runtime.dataDir = dir;
   cfg.safety.allowedOrigins = ['https://example.com'];
   cfg.runtime.queueTimeoutMs = 2000;
+  cfg.runtime.expectRetryMs = 0; // 测试里断言失败是预期行为，不要重试拖慢用例
   return { ...cfg, ...overrides };
 }
 
@@ -78,6 +79,7 @@ test('execute：确定性流程完成，模型调用为 0', async () => {
   const final = await rt.waitEnvelope(env.taskId);
   assert.equal(final.status, 'done');
   assert.equal(final.metrics.actions, 0); // 无写动作
+  assert.equal(final.metrics.jevModel, undefined, '没调 Jev 的任务不该带 Jev 模型名（lastModel 是粘的）');
   assert.equal(judge.usage().jevRequests, 0); // 纯确定性：0 模型调用
   await rt.close();
 });
@@ -701,4 +703,234 @@ test('resolveValues：非 secret 值直传；secret 缺失抛暂停', () => {
   const out = resolveValues({ a: 'plain', n: 3 });
   assert.deepEqual(out, { a: 'plain', n: 3 });
   assert.throws(() => resolveValues({ s: { secretRef: 'NOPE' } }), (e: unknown) => (e as Error).name === 'PauseSignal');
+});
+
+// ---------------------------------------------------------------------------
+// 陈旧锁自愈（实测缺陷：expired 任务留下的 reserve/isolation 会永久封死浏览器）
+// ---------------------------------------------------------------------------
+
+test('陈旧锁自愈：指向终态任务的 reserve/isolation 被清除，写任务恢复正常', async () => {
+  const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
+  const rt = makeRuntime(testConfig(), [page]);
+  const session = await rt.createSession({
+    target: { kind: 'existing' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: [],
+  });
+
+  // 造一个已终态（done）的任务，再把 reserve/isolation 手工指向它，模拟历史遗留状态
+  const doneEnv = await rt.execute(session.sessionId, {
+    sessionId: session.sessionId,
+    steps: flow([{ id: 'a', kind: 'assert', expect: [] }]),
+    values: {},
+  });
+  assert.equal((await rt.waitEnvelope(doneEnv.taskId)).status, 'done');
+
+  const pk = rt.profileKey();
+  store.kvSet(`reserve:${pk}`, JSON.stringify({ taskId: doneEnv.taskId, state: 'paused', at: 1 }));
+  store.kvSet(`isolation:${pk}`, JSON.stringify({ taskId: doneEnv.taskId, at: 1, reason: 'ACTION_OUTCOME_UNKNOWN' }));
+
+  // 自愈：持有者已终态，两条标记都应消失
+  assert.equal(rt.reapStaleLocks(), 2);
+  assert.equal(store.kvGet(`reserve:${pk}`), undefined);
+  assert.equal(store.kvGet(`isolation:${pk}`), undefined);
+
+  // 且残留标记不会再挡住新的写任务（runTask 内部先自愈）
+  store.kvSet(`reserve:${pk}`, JSON.stringify({ taskId: doneEnv.taskId, state: 'paused', at: 1 }));
+  store.kvSet(`isolation:${pk}`, JSON.stringify({ taskId: doneEnv.taskId, at: 1, reason: 'ACTION_OUTCOME_UNKNOWN' }));
+  const writeEnv = await rt.execute(session.sessionId, {
+    sessionId: session.sessionId,
+    steps: flow([{ id: 'w', kind: 'action', action: 'fill', target: { by: 'css', selector: '#y' }, value: 'v', expect: [{ kind: 'visible', target: { by: 'css', selector: '#y' } }] }]),
+    values: {},
+  });
+  assert.equal((await rt.waitEnvelope(writeEnv.taskId)).status, 'done');
+  await rt.close();
+});
+
+test('陈旧锁自愈：暂停中的任务（未终态）仍受保护，不会被误清', async () => {
+  const page = new FakePage({ url: 'https://example.com/', bodyText: 'x', clickError: new Error('TimeoutError: 1ms exceeded') });
+  const rt = makeRuntime(testConfig(), [page]);
+  const session = await rt.createSession({
+    target: { kind: 'existing' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: [],
+  });
+  const env = await rt.execute(session.sessionId, {
+    sessionId: session.sessionId,
+    steps: flow([{ id: 't1', kind: 'action', action: 'click', target: { by: 'css', selector: '#x' }, expect: [{ kind: 'url_contains', value: 'never' }] }]),
+    values: {},
+  });
+  const paused = await rt.waitEnvelope(env.taskId);
+  assert.equal(paused.status, 'paused');
+
+  const pk = rt.profileKey();
+  assert.equal(rt.reapStaleLocks(), 0, '暂停任务的隔离必须保留，人工对账前不清');
+  assert.ok(store.kvGet(`isolation:${pk}`));
+  await rt.close();
+});
+
+test('goal：动作后后置条件一旦成立就收工，不再多问一轮 Jev', async () => {
+  const page = new FakePage({ url: 'https://example.com/video/1', bodyText: 'x', elements: [{ role: 'link', name: '第二条视频' }] });
+  const judge = new FakeJudge({ decisions: [{ action: 'click', targetIndex: 0, probabilities: { target: { c0: 0.95 } } }] });
+  const rt = makeRuntime(testConfig(), [page], judge);
+  const session = await rt.createSession({ target: { kind: 'existing' }, allowedOrigins: ['https://example.com'], modelOrigins: ['https://example.com'] });
+  const env = await rt.execute(session.sessionId, {
+    sessionId: session.sessionId,
+    steps: [{ id: 'g', kind: 'goal', goal: '打开视频', expect: [{ kind: 'url_contains', value: '/video/' }] }] as never,
+    values: {},
+  });
+  const final = await rt.waitEnvelope(env.taskId);
+  assert.equal(final.status, 'done');
+  // 实测踩过：动作其实已完成，却又跑了一轮；那一轮 Jev 把握不足 → 任务暂停在 ambiguous
+  assert.equal(judge.usage().jevRequests, 1, '后置条件成立即收工，只应问一轮 Jev');
+  assert.equal(final.goalVerification?.by, 'deterministic', '确定性条件成立时应记为 deterministic');
+  await rt.close();
+});
+
+test('judgePage：单问判断走 Jev，且 origin 未授权时拒绝外发', async () => {
+  const page = new FakePage({ url: 'https://example.com/order', title: '订单', elements: [{ role: 'link', name: '订单号 A123' }] });
+  const judge = new FakeJudge({ decisions: [], checkP: 0.87 });
+  const rt = makeRuntime(testConfig(), [page], judge);
+  const session = await rt.createSession({ target: { kind: 'existing' }, allowedOrigins: ['https://example.com'], modelOrigins: ['https://example.com'] });
+
+  const r = await rt.judgePage(session.sessionId, '页面上是否出现了订单号？');
+  assert.equal(r.p, 0.87);
+  assert.equal(judge.checkCalls.length, 1, '只发一次 Jev 请求');
+  assert.match(judge.checkCalls[0]!, /订单号/, '问题要原样带过去');
+
+  // origin 不在 modelOrigins：页面候选不得外发
+  const s2 = await rt.createSession({ target: { kind: 'existing' }, allowedOrigins: ['https://example.com'], modelOrigins: [] });
+  await assert.rejects(
+    rt.judgePage(s2.sessionId, 'x'),
+    (e: unknown) => (e as { code?: string }).code === 'ORIGIN_NOT_ALLOWED',
+  );
+  await rt.close();
+});
+
+test('预约被暂停任务持有时立刻失败，不空等 queueTimeoutMs', async () => {
+  const page = new FakePage({ url: 'https://example.com/cart', bodyText: 'ok' });
+  const rt = makeRuntime(testConfig(), [page]);
+  const session = await rt.createSession({ target: { kind: 'existing' }, allowedOrigins: ['https://example.com'], modelOrigins: [] });
+  // 高风险目标 → 暂停 needs_confirmation（预约整个 profile，但不隔离）
+  const pausedEnv = await rt.execute(session.sessionId, {
+    sessionId: session.sessionId,
+    steps: flow([{ id: 'risk', kind: 'action', action: 'click', target: { by: 'role', role: 'button', name: '确认支付' }, expect: [{ kind: 'text_present', value: 'ok' }] }]),
+    values: {},
+  });
+  const paused = await rt.waitEnvelope(pausedEnv.taskId);
+  assert.equal(paused.status, 'paused');
+
+  // 立刻提交新任务：应当在毫秒级失败并指名暂停任务，而不是空转到 queueTimeoutMs（本测试配置 2s）
+  const t0 = Date.now();
+  const env2 = await rt.execute(session.sessionId, { sessionId: session.sessionId, steps: flow([{ id: 'a', kind: 'assert', expect: [] }]), values: {} });
+  const final2 = await rt.waitEnvelope(env2.taskId);
+  const elapsed = Date.now() - t0;
+  assert.equal(final2.status, 'failed');
+  assert.equal(final2.error?.code, 'SESSION_BUSY');
+  assert.match(final2.error?.message ?? '', /task cancel/, '要说清怎么解开');
+  assert.ok(elapsed < 1000, `应当立刻失败，实际 ${elapsed}ms`);
+  await rt.cancelTask(paused.taskId, { requestId: 'cx' });
+  await rt.close();
+});
+
+test('浏览器被关掉后自动重连，而不是永久卡在 PAGE_NOT_RESOLVED', async () => {
+  const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
+  store = new TaskStore(path.join(dir, 'tasks.db'));
+  const browser = new FakeBrowser(new FakeContext([page]));
+  const connector = new FakeConnector(browser);
+  const rt = new Runtime(testConfig(), { store, connector, judge: new FakeJudge({ decisions: [] }) });
+  await rt.createSession({ target: { kind: 'existing' }, allowedOrigins: ['https://example.com'], modelOrigins: [] });
+  assert.equal(connector.lastConnect, 1);
+
+  // 模拟用户关掉调试 Chrome：缓存句柄失效
+  browser.disconnected = true;
+  const again = await rt.createSession({ target: { kind: 'existing' }, allowedOrigins: ['https://example.com'], modelOrigins: [] });
+  assert.equal(again.status, 'ready', '应当自动重连而不是报 PAGE_NOT_RESOLVED');
+  assert.equal(connector.lastConnect, 2, '应当重新连接了一次');
+  await rt.close();
+});
+
+test('失败步骤会留在 stepResults 里（不再凭空消失）', async () => {
+  const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
+  const rt = makeRuntime(testConfig(), [page]);
+  const session = await rt.createSession({
+    target: { kind: 'existing' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: [],
+  });
+  const env = await rt.execute(session.sessionId, {
+    sessionId: session.sessionId,
+    steps: flow([
+      { id: 'ok', kind: 'assert', expect: [] },
+      { id: 'boom', kind: 'action', action: 'click', target: { by: 'css', selector: '#x' }, expect: [{ kind: 'url_contains', value: 'never' }] },
+    ]),
+    values: {},
+  });
+  const final = await rt.waitEnvelope(env.taskId);
+  assert.equal(final.status, 'failed');
+  assert.deepEqual(final.stepResults.map((s) => [s.id, s.status]), [['ok', 'done'], ['boom', 'failed']]);
+  assert.equal(final.stepResults[1]!.error?.code, 'ACTION_FAILED');
+  await rt.close();
+});
+
+// ---------------------------------------------------------------------------
+// Jev 目标置信度闸门（targetConfidenceAt 此前定义了但从未落地）
+// ---------------------------------------------------------------------------
+
+test('goal：Jev 对目标把握不足 → 暂停并把候选交回调用方，不赌随机点击', async () => {
+  const page = new FakePage({ url: 'https://example.com/list', bodyText: 'x', elements: [{ role: 'link', name: '第三条' }] });
+  const judge = new FakeJudge({ decisions: [{ action: 'click', targetIndex: 0, probabilities: { target: { c0: 0.1 } } }] });
+  const rt = makeRuntime(testConfig(), [page], judge);
+  const session = await rt.createSession({ target: { kind: 'existing' }, allowedOrigins: ['https://example.com'], modelOrigins: ['https://example.com'] });
+  const env = await rt.execute(session.sessionId, {
+    sessionId: session.sessionId,
+    steps: [{ id: 'g', kind: 'goal', goal: '打开第三条', expect: [] }] as never,
+    values: {},
+  });
+  const final = await rt.waitEnvelope(env.taskId);
+  assert.equal(final.status, 'paused');
+  assert.equal(final.pauseReason, 'ambiguous');
+  assert.match(final.error?.message ?? '', /把握不足/);
+  assert.match(final.error?.message ?? '', /第三条/, '候选清单要带回去，调用方才能立刻改用确定性 click');
+  assert.equal(page.calls.filter((c) => c.startsWith('locator:')).length, 0, '低置信度时不得解析目标、更不得派发点击');
+  await rt.close();
+});
+
+test('goal：Jev 有把握时正常执行并完成（不被闸门误伤）', async () => {
+  const locatorLog: string[] = [];
+  const page = new FakePage({ url: 'https://example.com/list', bodyText: 'x', elements: [{ role: 'link', name: '第三条' }], locatorLog });
+  const judge = new FakeJudge({
+    decisions: [{ action: 'click', targetIndex: 0, probabilities: { target: { c0: 0.95 } } }],
+    fallback: { done: 1, doneConfirm: 1, action: 'none', targetIndex: null },
+  });
+  const rt = makeRuntime(testConfig(), [page], judge);
+  const session = await rt.createSession({ target: { kind: 'existing' }, allowedOrigins: ['https://example.com'], modelOrigins: ['https://example.com'] });
+  const env = await rt.execute(session.sessionId, {
+    sessionId: session.sessionId,
+    steps: [{ id: 'g', kind: 'goal', goal: '打开第三条', expect: [] }] as never,
+    values: {},
+  });
+  const final = await rt.waitEnvelope(env.taskId);
+  assert.equal(final.status, 'done');
+  assert.ok(locatorLog.includes('click'), `高置信度应正常点击，实际定位器调用：${locatorLog.join(',')}`);
+  await rt.close();
+});
+
+test('execute：接受一行式简写步骤（展开后仍受写操作后置条件约束）', async () => {
+  const page = new FakePage({ url: 'https://example.com/', bodyText: 'x' });
+  const rt = makeRuntime(testConfig(), [page]);
+  const session = await rt.createSession({
+    target: { kind: 'existing' },
+    allowedOrigins: ['https://example.com'],
+    modelOrigins: [],
+  });
+  const env = await rt.execute(session.sessionId, {
+    sessionId: session.sessionId,
+    steps: ['screenshot', 'scroll:600'],
+    values: {},
+  });
+  const final = await rt.waitEnvelope(env.taskId);
+  assert.equal(final.status, 'done');
+  assert.deepEqual(final.stepResults.map((s) => s.id), ['s1', 's2']);
+  await rt.close();
 });

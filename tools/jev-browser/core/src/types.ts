@@ -62,6 +62,7 @@ export type ErrorCode =
   | 'ACTION_FAILED'
   | 'CAPABILITY_UNSUPPORTED'
   | 'JEV_NOT_CONFIGURED'
+  | 'JEV_UNAVAILABLE'
   | 'PLANNER_NOT_CONFIGURED'
   | 'PLANNER_INVALID_OUTPUT'
   | 'STORE_ERROR'
@@ -216,7 +217,8 @@ export interface CreateSessionInput {
 
 export interface ExecuteTaskInput {
   sessionId: string;
-  steps: FlowStep[];
+  /** 步骤：FlowStep 对象，或紧凑简写字符串（见 shorthand.ts；id 可省略，会自动补齐）。 */
+  steps: Array<FlowStep | string>;
   values?: Record<string, ValueInput>;
   budget?: TaskBudget;
 }
@@ -231,7 +233,8 @@ export interface RunTaskInput {
 
 export interface ActInput {
   sessionId: string;
-  step: ActionStep;
+  /** 单个 ActionStep，或紧凑简写字符串（如 'click:role/button/搜索'）。 */
+  step: ActionStep | string;
   values?: Record<string, ValueInput>;
 }
 

@@ -1,4 +1,4 @@
-import type { ActionStep, FlowStep, StepResult } from './types.js';
+import type { ActionStep, ErrorCode, FlowStep, StepResult } from './types.js';
 import { err, PauseSignal } from './errors.js';
 import { resolveLocator, resolveVarPath, verifyExpects } from './locator.js';
 import { performAction, type ArtifactSink, type LedgerHook, type PerformContext } from './executor.js';
@@ -18,6 +18,8 @@ export interface FlowRunContext {
   /** 每个动作派发前分配递增序号（审批 grant 绑定该序号，DESIGN §10）。 */
   nextActionRevision(): number;
   actionTimeoutMs: number;
+  /** 页面状态类断言的重试窗口（毫秒，0 = 单发）。 */
+  expectRetryMs?: number;
   cancelFlag: { cancelled: boolean };
   dialogs?: DialogManager;
   acceptDialogOnce?: boolean;
@@ -92,8 +94,19 @@ export class FlowExecutor {
     try {
       return this.decorate(await this.runOneInner(step), stepStart);
     } catch (e) {
-      // 失败/暂停的步骤同样记录耗时
-      void e;
+      // 出事的那一步必须留在结果里。此前失败步骤直接抛出、不进 stepResults，
+      // 调用方只看到前面成功的步骤，出事的那步凭空消失（实测：点击打开新标签导致
+      // 后置条件失败时，envelope 里 stepResults 为空、actions 为 0，看着像什么都没做）。
+      const code = (e as { code?: ErrorCode }).code;
+      const failed: StepResult = {
+        id: step.id,
+        kind: step.kind,
+        status: e instanceof PauseSignal ? 'paused' : 'failed',
+        durationMs: Date.now() - stepStart,
+        ...(code ? { error: { code, message: (e as Error).message.slice(0, 300) } } : {}),
+      };
+      this.results.push(failed);
+      this.ctx.onProgress?.(failed);
       throw e;
     }
   }
@@ -118,7 +131,7 @@ export class FlowExecutor {
         return { id: step.id, kind: 'action', status: 'done', artifactId: out.artifactId, evidence: out.evidence };
       }
       case 'assert': {
-        const verdict = await verifyExpects(this.page, step.expect, { vars: this.ctx.vars }, this.ctx.actionTimeoutMs);
+        const verdict = await verifyExpects(this.page, step.expect, { vars: this.ctx.vars, retryMs: this.ctx.expectRetryMs }, this.ctx.actionTimeoutMs);
         if (!verdict.ok) {
           throw err('ACTION_FAILED', `断言失败: ${verdict.failures.map((f) => f.reason).join('; ')}`.slice(0, 300), {
             details: { failures: verdict.failures, stepId: step.id },
@@ -191,6 +204,7 @@ export class FlowExecutor {
       ledger: this.ctx.ledger,
       actionRevision: this.ctx.nextActionRevision(),
       actionTimeoutMs: this.ctx.actionTimeoutMs,
+      expectRetryMs: this.ctx.expectRetryMs,
       cancelFlag: this.ctx.cancelFlag,
       dialogs: this.ctx.dialogs,
       acceptDialogOnce: this.ctx.acceptDialogOnce,

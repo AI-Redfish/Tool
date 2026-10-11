@@ -79,6 +79,10 @@ export interface FakePageOptions {
   downloadAfterClick?: { filename: string; content: string };
   /** 共享的 locator 级调用记录（用于断言 fill/press 等实际参数）。 */
   locatorLog?: string[];
+  /** 所有定位到的元素初始是否可见（默认 true）。设 false 用于验证 not_visible/hidden。 */
+  locatorVisible?: boolean;
+  /** 定位到的元素当前值（用于验证 value_equals / value_contains）。 */
+  locatorValue?: string;
 }
 
 export class FakePage implements PagePort {
@@ -118,7 +122,8 @@ export class FakePage implements PagePort {
     return new FakeLocator({
       count: this.opts.elements?.length ?? 1,
       text: this.opts.bodyText ?? 'Example',
-      visible: true,
+      visible: this.opts.locatorVisible ?? true,
+      value: this.opts.locatorValue,
       clickError: this.opts.clickError,
       log: this.locatorLog,
     });
@@ -126,17 +131,19 @@ export class FakePage implements PagePort {
 
   async evaluate<T = unknown>(script: string): Promise<T> {
     this.calls.push('evaluate');
+    // 观察脚本要优先识别：脚本里同时含 ".includes("（内容过滤）等子串，
+    // 用「哪个子串先命中」来分派会误判，改用观察脚本独有的稳定标记。
+    if (script.includes('const VIEWPORT_ONLY')) {
+      return {
+        elements: (this.opts.elements ?? []).map((e, i) => ({ i, role: e.role, name: e.name, tag: 'button', text: e.name })),
+        truncated: false,
+      } as T;
+    }
     if (script.includes('readyState')) return true as T;
     if (script.includes('.includes(')) {
       const m = script.match(/includes\((".*?")\)/);
       const needle = m ? JSON.parse(m[1]) as string : '';
       return (this.opts.bodyText ?? '').includes(needle) as T;
-    }
-    if (script.includes('querySelectorAll')) {
-      return {
-        elements: (this.opts.elements ?? []).map((e, i) => ({ i, role: e.role, name: e.name, tag: 'button', text: e.name })),
-        truncated: false,
-      } as T;
     }
     return null as T;
   }
@@ -215,7 +222,14 @@ export class FakeContext implements ContextPort {
 
 export class FakeBrowser implements BrowserPort {
   closed = false;
+  /** 置 true 模拟「用户关掉了调试 Chrome / 浏览器崩溃」。 */
+  disconnected = false;
+
   constructor(public readonly context: FakeContext) {}
+
+  isConnected(): boolean {
+    return !this.disconnected;
+  }
 
   contexts(): ContextPort[] {
     return [this.context];

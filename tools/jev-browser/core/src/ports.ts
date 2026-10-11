@@ -62,6 +62,8 @@ export interface ContextPort {
 }
 
 export interface BrowserPort {
+  /** 连接是否仍然有效（用户关掉调试 Chrome / 浏览器崩溃后为 false）。 */
+  isConnected(): boolean;
   contexts(): ContextPort[];
   /** detach：attach 时只应断开连接（P0 验证项，DESIGN §4.3）；launch 时关闭实例。 */
   close(): Promise<void>;

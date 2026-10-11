@@ -24,6 +24,8 @@ export interface BrowserLaunchConfig {
 export interface JevConfig {
   model: string;
   apiKeyEnv: string;
+  /** Jev 服务端点；空/缺省 = 用 SDK 默认（https://api.typesafe.ai）。 */
+  baseUrl?: string;
   /** done 判定阈值与确认带（dev 初值，须按业务校准，DESIGN §6.3）。 */
   doneAt: number;
   confirmLow: number;
@@ -54,6 +56,11 @@ export interface RuntimeConfig {
   maxInputTokens: number;
   maxOutputTokens: number;
   queueTimeoutMs: number;
+  /**
+   * 页面类断言的重试窗口（毫秒，0 = 不重试）。
+   * SPA 的效果落地常有延迟，单发断言会偶发失败；重试窗口吸收这段抖动。
+   */
+  expectRetryMs: number;
   pauseTtlMs: number;
   taskTtlMs: number;
   /** 单动作超时（dispatch 后的 Playwright timeout 上限）。 */
@@ -156,6 +163,7 @@ export function defaultConfig(): JevBrowserConfig {
       maxInputTokens: 200_000,
       maxOutputTokens: 20_000,
       queueTimeoutMs: 60_000,
+      expectRetryMs: 5_000,
       pauseTtlMs: 900_000,
       taskTtlMs: 1_800_000,
       actionTimeoutMs: 15_000,
@@ -193,6 +201,7 @@ const OPTIONAL_FIELDS = new Set([
   'planner.provider',
   'planner.baseUrl',
   'planner.model',
+  'jev.baseUrl',
 ]);
 
 /** 以 template 的键为准：未知键报错；标量类型必须与默认值一致；数组与对象递归。 */
@@ -283,6 +292,10 @@ function applyEnv(cfg: JevBrowserConfig, env: NodeJS.ProcessEnv): void {
   if (jevModel) jev.model = jevModel;
   const jevKeyEnv = get('JEV_BROWSER_JEV_API_KEY_ENV');
   if (jevKeyEnv) jev.apiKeyEnv = jevKeyEnv;
+  // 端点显式可配：Jev 是外部服务，地区受限时服务端会返回 451，此时需要指向可达的代理/自建端点。
+  // 不配就走 SDK 默认（SDK 自身也认 TYPESAFE_BASE_URL，这里给它一个属于本工具的一等入口）。
+  const jevBase = get('JEV_BROWSER_JEV_BASE_URL');
+  if (jevBase) jev.baseUrl = jevBase;
 
   const planner = cfg.planner as unknown as Plain;
   const pEnabled = get('JEV_BROWSER_PLANNER_ENABLED');
@@ -315,6 +328,7 @@ function applyEnv(cfg: JevBrowserConfig, env: NodeJS.ProcessEnv): void {
   setNum(rt, 'maxInputTokens', 'JEV_BROWSER_MAX_INPUT_TOKENS');
   setNum(rt, 'maxOutputTokens', 'JEV_BROWSER_MAX_OUTPUT_TOKENS');
   setNum(rt, 'queueTimeoutMs', 'JEV_BROWSER_QUEUE_TIMEOUT_MS');
+  setNum(rt, 'expectRetryMs', 'JEV_BROWSER_EXPECT_RETRY_MS');
   setNum(rt, 'pauseTtlMs', 'JEV_BROWSER_PAUSE_TTL_MS');
   setNum(rt, 'taskTtlMs', 'JEV_BROWSER_TASK_TTL_MS');
   setNum(rt, 'actionTimeoutMs', 'JEV_BROWSER_ACTION_TIMEOUT_MS');
@@ -423,6 +437,7 @@ function validateFinal(cfg: JevBrowserConfig): void {
     [cfg.runtime.maxJevRequests, 'runtime.maxJevRequests'],
     [cfg.runtime.maxPlannerRequests, 'runtime.maxPlannerRequests'],
     [cfg.runtime.queueTimeoutMs, 'runtime.queueTimeoutMs'],
+    [cfg.runtime.expectRetryMs, 'runtime.expectRetryMs'],
     [cfg.runtime.pauseTtlMs, 'runtime.pauseTtlMs'],
     [cfg.runtime.taskTtlMs, 'runtime.taskTtlMs'],
     [cfg.runtime.actionTimeoutMs, 'runtime.actionTimeoutMs'],
@@ -433,6 +448,9 @@ function validateFinal(cfg: JevBrowserConfig): void {
   }
   for (const [v, name] of [[cfg.jev.doneAt, 'jev.doneAt'], [cfg.jev.confirmLow, 'jev.confirmLow'], [cfg.jev.confirmHigh, 'jev.confirmHigh']] as Array<[number, string]>) {
     if (v < 0.5 || v > 1) throw err('CONFIG_INVALID', `${name} 应在 0.5..1 之间: ${v}`);
+  }
+  if (cfg.jev.baseUrl && !/^https?:\/\//i.test(cfg.jev.baseUrl)) {
+    throw err('CONFIG_INVALID', `jev.baseUrl 必须是 http(s) URL: ${cfg.jev.baseUrl}`);
   }
   if (cfg.api.port < 1 || cfg.api.port > 65535) throw err('CONFIG_INVALID', `api.port 非法: ${cfg.api.port}`);
 }

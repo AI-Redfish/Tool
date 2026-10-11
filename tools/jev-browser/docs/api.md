@@ -21,8 +21,9 @@ node api/dist/index.js --config "D:\config\jev-browser.json" --port 3737    # �
 | `POST /v1/sessions` | `{target, allowedOrigins, modelOrigins}` | 201 会话 | connect |
 | `GET /v1/sessions/:id/pages` | — | 200 `{pages}` | pages |
 | `POST /v1/sessions/:id/page` | `{pageId}` | 200 | select-page |
-| `POST /v1/sessions/:id/snapshot` | `{forModel}` | 200 快照 | snapshot |
+| `POST /v1/sessions/:id/snapshot` | `{forModel, viewportOnly?, maxElements?, filter?, roles?}` | 200 快照 | snapshot |
 | `POST /v1/sessions/:id/act` | `{step, values}` | 202 任务 | act |
+| `POST /v1/sessions/:id/judge` | `{question}` | 200 `{p, url, model}` | judge |
 | `POST /v1/tasks/execute` | `{sessionId, steps, values}`（可加 `Idempotency-Key` 头） | 202 任务 | execute |
 | `POST /v1/tasks/run` | `{sessionId, goal, successCriteria, values}` | 202 任务 | run |
 | `GET /v1/tasks/:id` | — | 200 `{envelope}` | task get |

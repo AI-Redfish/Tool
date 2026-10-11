@@ -27,8 +27,14 @@ export interface GoalLoopOptions {
   maxInputTokens?: number;
   maxOutputTokens?: number;
   actionTimeoutMs: number;
+  /** 页面状态类断言的重试窗口（毫秒，0 = 单发）。 */
+  expectRetryMs?: number;
   /** 阈值来自 config.jev（dev 初值，须按业务校准，DESIGN §6.3）。 */
-  thresholds: { doneAt: number; confirmLow: number; confirmHigh: number; blockedAt: number; errorAt: number };
+  thresholds: {
+    doneAt: number; confirmLow: number; confirmHigh: number; blockedAt: number; errorAt: number;
+    /** 目标选择的最低置信度：低于它不许猜，交回调用方（= 把大模型接进来做这一步决策）。 */
+    targetConfidenceAt: number;
+  };
   artifacts: ArtifactSink;
   ledger: LedgerHook;
   cancelFlag: { cancelled: boolean };
@@ -46,7 +52,8 @@ export class GoalExecutor {
     private readonly opts: GoalLoopOptions,
   ) {}
 
-  async run(expect: GoalStep['expect']): Promise<{ rounds: number; verification: { by: 'semantic'; ok: boolean } }> {
+  /** verification.by：动作后后置条件成立 → deterministic；靠 Jev 判定收工 → semantic。 */
+  async run(expect: GoalStep['expect']): Promise<{ rounds: number; verification: { by: 'semantic' | 'deterministic'; ok: boolean } }> {
     if (!this.opts.judge.available()) {
       throw err('JEV_NOT_CONFIGURED', '语义目标需要 Jev；纯确定性 execute 不调用模型');
     }
@@ -65,7 +72,9 @@ export class GoalExecutor {
       if (judge.usage().inputTokens + judge.usage().outputTokens > (this.opts.maxInputTokens ?? Number.MAX_SAFE_INTEGER) + (this.opts.maxOutputTokens ?? Number.MAX_SAFE_INTEGER)) {
         throw err('BUDGET_EXCEEDED', '模型 token 累计超过预算');
       }
-      await waitForSettle(this.page, 8000);
+      // 上限 1500ms 而非 8s：页面已经就绪时 waitForSettle 立即返回（双 rAF / 定时器兜底），
+      // 这个上限只在页面确实很忙时才起作用——那时也不必死等 8 秒，后置条件会重试。
+      await waitForSettle(this.page, 1500);
       const obs = await observePage(this.page, { allowedOrigins: this.opts.allowedOrigins });
       const diff = diffObservation(prev, obs);
       prev = obs;
@@ -96,7 +105,7 @@ export class GoalExecutor {
           // 中带 + 确认不足 → likely_done 不计成功（DESIGN §8.2）
           throw new PauseSignal('likely_done', `done=${decision.done.toFixed(2)} 处于确认带且未通过严格确认，需人工核验`);
         }
-        const verdict = await verifyExpects(this.page, expect, { vars: {} as Record<string, unknown> }, this.opts.actionTimeoutMs);
+        const verdict = await verifyExpects(this.page, expect, { vars: {} as Record<string, unknown>, retryMs: this.opts.expectRetryMs }, this.opts.actionTimeoutMs);
         if (!verdict.ok && expect.length > 0) {
           throw new PauseSignal('likely_done', `done 信号足够但代码后置条件未通过: ${verdict.failures.map((f) => f.reason).join('; ')}`);
         }
@@ -118,6 +127,22 @@ export class GoalExecutor {
       // targetIndex 对应本轮实际发送给模型的候选切片（修复切片后索引错位）
       const candidate = decision.candidates[decision.targetIndex];
       if (!candidate) throw new PauseSignal('ambiguous', '目标候选过期（快照漂移），需重新观察');
+
+      // 目标置信度闸门：设计里的 targetConfidenceAt 此前从未落地。Jev 没把握时不许赌一次
+      // 随机点击——把候选交回调用方（人/大模型）来定，这才是「Jev 优先，不确定再上 LLM」。
+      const targetProbs = (decision.probabilities?.target ?? {}) as Record<string, number>;
+      const chosenConf = decision.targetConfidence ?? Number(targetProbs[`c${decision.targetIndex}`]);
+      if (Number.isFinite(chosenConf) && chosenConf < this.opts.thresholds.targetConfidenceAt) {
+        const top = decision.candidates
+          .slice(0, 5)
+          .map((c, idx) => `c${idx} ${c.role} "${c.name}"`)
+          .join(' | ');
+        throw new PauseSignal(
+          'ambiguous',
+          `Jev 对目标选择的把握不足（p=${chosenConf.toFixed(2)} < ${this.opts.thresholds.targetConfidenceAt}）。候选前 5：${top}。` +
+            '请指定明确目标后改用确定性 click（更快），或补充页面上下文重试。',
+        );
+      }
 
       const target = locatorFromCandidate(candidate);
       const step: ActionStep = {
@@ -157,6 +182,15 @@ export class GoalExecutor {
         allowedUploadDirs: this.opts.allowedUploadDirs,
         maxUploadBytes: this.opts.maxUploadBytes,
       });
+
+      // 代码可计算的事实优先（DESIGN §6.1）：后置条件一旦成立就收工，不必再问 Jev。
+      // 实测踩过：动作其实已经完成（视频页已打开），循环却又跑了一轮，那一轮 Jev 把握不足
+      // （p=0.53）→ 任务暂停在 ambiguous，用户看到的是「明明成功了却报失败」。
+      // 确定性条件成立时，不该再赌语义判断。
+      if (expect.length > 0) {
+        const verdict = await verifyExpects(this.page, expect, { vars: {} as Record<string, unknown>, retryMs: this.opts.expectRetryMs }, this.opts.actionTimeoutMs);
+        if (verdict.ok) return { rounds, verification: { by: 'deterministic', ok: true } };
+      }
     }
   }
 }

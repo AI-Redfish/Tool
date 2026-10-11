@@ -1,5 +1,5 @@
 import { err } from './errors.js';
-import type { ExpectSpec, FlowStep, LocatorSpec } from './types.js';
+import type { ActionStep, ExpectSpec, FlowStep, GoalStep, LocatorSpec } from './types.js';
 
 /**
  * 紧凑步骤语法（可选）：把一条步骤压成一行字符串，省掉模型生成整段 JSON 的开销。
@@ -26,7 +26,14 @@ import type { ExpectSpec, FlowStep, LocatorSpec } from './types.js';
  *   'wait:2000'
  */
 
-const VERBS = new Set(['navigate', 'click', 'fill', 'press', 'select', 'scroll', 'wait', 'screenshot', 'upload', 'evaluate']);
+const VERBS = new Set(['navigate', 'click', 'fill', 'press', 'select', 'scroll', 'wait', 'screenshot', 'upload', 'evaluate', 'goal']);
+
+/** 末尾 "!" 表示精确匹配：text/播放! → { by:'text', text:'播放', exact:true }。
+ *  列表页常有同名元素（标题链接、同名容器、hover 卡），非精确会点到不可点的容器上——
+ *  实测踩过：B 站 UP 主名有 4 个同名节点，非精确点击落空。 */
+function splitExact(raw: string): { value: string; exact: boolean } {
+  return raw.endsWith('!') ? { value: raw.slice(0, -1), exact: true } : { value: raw, exact: false };
+}
 
 function parseLocator(raw: string, where: string): LocatorSpec {
   const i = raw.indexOf('/');
@@ -39,16 +46,22 @@ function parseLocator(raw: string, where: string): LocatorSpec {
   switch (by) {
     case 'role': {
       const j = rest.indexOf('/');
-      if (j < 0) return { by: 'role', role: rest };
-      const name = rest.slice(j + 1);
-      return name ? { by: 'role', role: rest.slice(0, j), name } : { by: 'role', role: rest.slice(0, j) };
+      if (j < 0) return { by: 'role', role: splitExact(rest).value }; // 无人名时也不能把 "!" 留在 role 里
+      const rawName = rest.slice(j + 1);
+      if (!rawName) return { by: 'role', role: rest.slice(0, j) };
+      const { value: name, exact } = splitExact(rawName);
+      return { by: 'role', role: rest.slice(0, j), name, ...(exact ? { exact: true } : {}) };
     }
-    case 'label':
-      return { by: 'label', name: rest };
+    case 'label': {
+      const { value: name, exact } = splitExact(rest);
+      return { by: 'label', name, ...(exact ? { exact: true } : {}) };
+    }
     case 'testid':
       return { by: 'testId', id: rest };
-    case 'text':
-      return { by: 'text', text: rest };
+    case 'text': {
+      const { value: text, exact } = splitExact(rest);
+      return { by: 'text', text, ...(exact ? { exact: true } : {}) };
+    }
     case 'css':
       return { by: 'css', selector: rest };
     default:
@@ -99,11 +112,17 @@ function parseExpect(raw: string): ExpectSpec {
   }
 }
 
-/** 解析单条简写为 FlowStep（id 由调用方补齐）。 */
-export function parseShorthandStep(input: string): Omit<FlowStep, 'id'> & { id?: string } {
+/** 简写解析产物：action 步骤去掉 id（由 expandShorthandSteps 统一补齐）。 */
+export type ShorthandStep = Omit<ActionStep, 'id'> | Omit<GoalStep, 'id'>;
+
+/** 解析单条简写为 action 步骤（id 由调用方补齐）。 */
+export function parseShorthandStep(input: string): ShorthandStep {
   const raw = input.trim();
   if (!raw) throw err('INVALID_INPUT', '步骤简写不能为空');
-  const arrow = raw.indexOf('=>');
+  // evaluate 的参数是自由 JS，里面几乎必然出现 "=>"（箭头函数），不能按它切分后置条件；
+  // 需要给 evaluate 加后置条件时请用对象形式写步骤。
+  const isEvaluate = /^evaluate\s*:/.test(raw);
+  const arrow = isEvaluate ? -1 : raw.indexOf('=>');
   const head = (arrow < 0 ? raw : raw.slice(0, arrow)).trim();
   const expectPart = arrow < 0 ? '' : raw.slice(arrow + 2);
   const expects: ExpectSpec[] = expectPart
@@ -150,6 +169,10 @@ export function parseShorthandStep(input: string): Omit<FlowStep, 'id'> & { id?:
     }
     case 'evaluate':
       return { ...base, action: 'evaluate', script: needArg() };
+    case 'goal':
+      // Jev 局部语义循环：本页上「点哪/填哪」交给 Jev 自己判断，大模型不必先看一遍页面。
+      // 需要该页 origin ∈ modelOrigins（页面候选会发给 Jev 服务）。
+      return { kind: 'goal', goal: needArg(), expect: expects };
     default:
       // screenshot
       return { ...base, action: 'screenshot' };
@@ -166,8 +189,7 @@ export function expandShorthandSteps(input: readonly (FlowStep | string)[]): Flo
   for (const item of input) {
     n += 1;
     if (typeof item === 'string') {
-      const parsed = parseShorthandStep(item) as FlowStep;
-      out.push({ ...parsed, id: parsed.id ?? `s${n}` });
+      out.push({ ...parseShorthandStep(item), id: `s${n}` } as FlowStep);
     } else {
       out.push(item.id ? item : { ...item, id: `s${n}` });
     }

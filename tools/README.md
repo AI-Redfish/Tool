@@ -11,7 +11,7 @@
 
 - [`server-a/`](server-a/README.md)：多入口工具最小示例（TypeScript，`core + cli + mcp` 三包工作区，echo/now），本目录分层约定的参考实现。
 - [`server-py/`](server-py/README.md)：同构 Python 标准库版（`core.py + cli.py + mcp_server.py` + `launcher.json`），演示任意语言工具接入。
-- [`jev-browser/`](jev-browser/README.md)：浏览器控制工具（Playwright + Jev，`core + cli + mcp + api` 四包工作区，execute/run 双模式共用执行引擎）。**核心已实现**：62 个离线测试通过；launch 路径（受管 Chromium）端到端冒烟通过（`scripts/smoke.mjs`）；attach 接管日常 Chrome 待用户授权后专项验证（见 [docs/compatibility.md](jev-browser/docs/compatibility.md)），此前勿用于生产。
+- [`jev-browser/`](jev-browser/README.md)：浏览器控制工具（Playwright + Jev，`core + cli + mcp + api` 四包工作区，execute/run 双模式共用执行引擎）。**核心已实现**：91 个离线测试通过；launch 路径（受管 Chromium）端到端冒烟通过（`scripts/smoke.mjs`）；attach 接管日常 Chrome 待用户授权后专项验证（见 [docs/compatibility.md](jev-browser/docs/compatibility.md)），此前勿用于生产。
 - [`jev-desktop/`](jev-desktop/README.md)：Windows 桌面控制工具（UIA 观察 + Jev 判断 + 规划 LLM，Python 实现 `core + cli + mcp` + `launcher.json`）。**已实现并通过本地端到端验证**（离线测试/真实窗口快照/execute 全链路/Jev mock 联调/MCP 协议，见其 README 实机验证记录）；SendInput 输入类动作待真人监督实测，OCR 为可选依赖。
 
 阅读顺序（两者同构）：[方案总览](jev-browser/README.md) → [技术设计](jev-browser/DESIGN.md) → [开发计划](jev-browser/DEVELOPMENT_PLAN.md) → [兼容性验证](jev-browser/docs/compatibility.md)；事实依据见 [RESEARCH](jev-browser/RESEARCH.md) / [jev-desktop RESEARCH](jev-desktop/RESEARCH.md)。

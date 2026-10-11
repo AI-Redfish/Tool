@@ -18,6 +18,8 @@ export interface ObservedElement {
   checked?: boolean;
   /** 文本输入的已有值会被遮蔽为固定标记，不外发真实内容。 */
   hasValue?: boolean;
+  /** 是否与视口相交。goal 循环据此优先把「眼前能点的」交给 Jev；不外发（对外载荷剥掉）。 */
+  inViewport?: boolean;
 }
 
 export interface PageObservation {
@@ -36,18 +38,25 @@ export interface PageObservation {
 export const MAX_ELEMENTS_DEFAULT = 400;
 export const MAX_ELEMENTS_CAP = 2000;
 
-/** 瘦身版观察：剥离与 name 恒等的 text 字段（当前观察脚本里两者同源），其余原样。 */
+/** 瘦身版观察（仅用于对外序列化，不影响 goal/judge 的内部候选）：
+ *  1) 剥离与 name 恒等的 text 字段（当前观察脚本里两者同源）；
+ *  2) 剥掉「同名标题」——搜索/列表页每张卡片都是 `<a>标题</a>` + `<h3>同名标题</h3>`，
+ *     非 heading 已给出同样的名字时，heading 是纯重复。 */
 export function slimObservation(obs: PageObservation): PageObservation {
-  return {
-    ...obs,
-    elements: obs.elements.map((e) => {
-      if (e.text === undefined || e.text === e.name) {
-        const { text: _drop, ...rest } = e;
-        return rest as ObservedElement;
-      }
-      return e;
-    }),
-  };
+  const named = new Set<string>();
+  const elements: ObservedElement[] = [];
+  for (const e of obs.elements) {
+    if (e.role === 'heading' && named.has(e.name)) continue;
+    if (e.role !== 'heading') named.add(e.name);
+    if (e.text === undefined || e.text === e.name) {
+      // inViewport 也是内部信息（对外默认已按视口过滤，保留它只是白占体积）
+      const { text: _drop, inViewport: _drop2, ...rest } = e;
+      elements.push(rest as ObservedElement);
+    } else {
+      elements.push(e);
+    }
+  }
+  return { ...obs, elements, counts: { total: elements.length } };
 }
 
 /** forModel 紧凑渲染：[i] role "name" [标记]。 */
@@ -63,10 +72,17 @@ export function renderObservation(obs: PageObservation): string[] {
   return lines;
 }
 
-const SNAPSHOT_SCRIPT = (viewportOnly: boolean, maxElements: number) => `
+const SNAPSHOT_SCRIPT = (
+  viewportOnly: boolean,
+  maxElements: number,
+  filter: string,
+  roles: string[],
+) => `
 (() => {
   const MAX = ${maxElements};
   const VIEWPORT_ONLY = ${viewportOnly};
+  const FILTER = ${JSON.stringify(filter.toLowerCase())};
+  const ROLES = ${JSON.stringify(roles)};
   // h1–h6 有隐式 ARIA 角色 heading（DESIGN §6.2：按 role/name 枚举交互元素）
   const sel = 'a[href], button, input, select, textarea, [role], label, summary, option, h1, h2, h3, h4, h5, h6';
   const nodes = Array.from(document.querySelectorAll(sel));
@@ -134,9 +150,12 @@ const SNAPSHOT_SCRIPT = (viewportOnly: boolean, maxElements: number) => `
     const role = roleOf(el);
     const name = nameOf(el).slice(0, 120);
     if (!name) continue;
+    if (ROLES.length > 0 && !ROLES.includes(role)) continue;
+    if (FILTER && !name.toLowerCase().includes(FILTER)) continue;
     // text 与 name 同源：保留在内部对象里（goal/judge 的候选去重依赖它），
     // 但序列化给外部（CLI/MCP/API）时会由 slimObservation 剥掉，避免同一串字符传两遍。
     const item = { i: i++, role, name, tag: el.tagName.toLowerCase(), text: name.slice(0, 160) };
+    if (inViewport(box)) item.inViewport = true;
     if (el.disabled) item.disabled = true;
     if (role === 'checkbox' || role === 'radio') item.checked = Boolean(el.checked);
     if ((role === 'textbox') && el.value) item.hasValue = true;
@@ -155,6 +174,10 @@ export interface ObserveOptions {
   maxElements?: number;
   /** true = 额外产出 rendered 紧凑文本，供模型直接阅读。 */
   forModel?: boolean;
+  /** 只保留 name 含该子串的元素（大小写不敏感）。用于「找我要的那个东西」而非整页。 */
+  filter?: string;
+  /** 只保留这些 role 的元素（如 ['button','textbox']）。 */
+  roles?: string[];
 }
 
 export async function observePage(
@@ -166,7 +189,9 @@ export async function observePage(
   const max = Math.max(1, Math.min(Number.isFinite(raw0) ? raw0 : MAX_ELEMENTS_DEFAULT, MAX_ELEMENTS_CAP));
   let raw: { elements: ObservedElement[]; truncated: boolean };
   try {
-    raw = await page.evaluate(SNAPSHOT_SCRIPT(opts.viewportOnly === true, max)) as { elements: ObservedElement[]; truncated: boolean };
+    raw = await page.evaluate(
+      SNAPSHOT_SCRIPT(opts.viewportOnly === true, max, opts.filter ?? '', opts.roles ?? []),
+    ) as { elements: ObservedElement[]; truncated: boolean };
   } catch (e) {
     throw err('CAPABILITY_UNSUPPORTED', `页面观察失败（frame/导航中?）: ${(e as Error).message.slice(0, 120)}`);
   }
@@ -213,7 +238,14 @@ export async function waitForSettle(page: PagePort, timeoutMs: number): Promise<
     const start = Date.now();
     const tick = () => {
       if (document.readyState === 'complete') {
-        requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)));
+        // 后台标签页里 requestAnimationFrame 不触发，只靠它会让 settle 一直挂到超时；
+        // 用定时器兜底（取先到者）。
+        let settled = false;
+        const done = () => { if (!settled) { settled = true; resolve(true); } };
+        requestAnimationFrame(() => requestAnimationFrame(done));
+        // 定时器兜底：后台标签页 rAF 不触发，只能靠它。实测它在「后台 + 每轮 goal」的路径上
+        // 是每轮的主要固定开销（goal 单轮 ~600ms 里它占 ~200ms）。120ms 仍有 ~7 帧余量。
+        setTimeout(done, 120);
         return;
       }
       if (Date.now() - start > ${Math.min(timeoutMs, 8000)}) { resolve(false); return; }

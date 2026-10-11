@@ -3,6 +3,24 @@
 > 本文档记录 jev-browser 在真实 Windows 环境的验证结果与剩余待验证项。
 > 生成于 2026-09-27 实现轮；全部结果来自本机实测，可按「复现步骤」重跑。
 
+## 0. 复验（2026-10-11 优化轮）
+
+本节记录优化轮（输出体积 / 对话往返 / 陈旧锁自愈 / 断言表达力）后的复验结果；下方 §1–§4 为 2026-09-27 实现轮原始记录，未改动。
+
+| 检查 | 命令 | 结果 |
+| --- | --- | --- |
+| 离线测试 | `pnpm test` | **91/91 通过**（实现轮 67 → 本轮新增 24） |
+| 端到端冒烟 | `pnpm smoke` | **go**（11 项全绿，真实受管 Chromium，独立临时 profile/dataDir） |
+| MCP 注册 | `node mcp/dist/index.js` + `tools/list` | 14 工具注册成功；新增参数 `browser_snapshot.{viewportOnly,maxElements}`、`browser_execute/act.includeObservation`、`steps` 允许字符串简写 |
+
+冒烟脚本新增三项针对性检查（对应本轮改动，属新增覆盖而非替换）：
+
+- 一行式简写步骤展开并执行（自动补 id）
+- `value_equals` 输入值后置条件在真实浏览器上生效
+- 快照视口过滤 + 元素上限生效、冗余 `text` 字段已剥离
+
+**过程中发现的既有缺陷**：`scripts/smoke.mjs` 已与 Runtime API 脱节（仍按旧的定位参数签名调用 `createSession/execute/listArtifacts/artifactPath/disconnect`），在本次改动前就跑不通。已一并修正——否则本文件记录的「冒烟通过」无法复现。
+
 ## 1. 验证环境
 
 | 项 | 值 |

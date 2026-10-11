@@ -11,7 +11,7 @@
 **一个核心，三个适配器**
 
 ```text
-CLI（node cli/dist/index.js）   MCP（stdio, 14 工具）   HTTP API（loopback+token）
+CLI（node cli/dist/index.js）   MCP（stdio, 15 工具）   HTTP API（loopback+token）
       └──────────────── 同一套 Runtime（core）────────────────┘
                               │
    ┌──────────────┬───────────┴──────────┬──────────────┐
@@ -45,6 +45,41 @@ core 里的三个类，内部组件。
 | `FlowExecutor` | 确定性步骤执行引擎（action/assert/extract/branch/forEach） | 0 次 | **execute 和 run 共用**——所有步骤最终都由它执行 |
 | `GoalExecutor` | `kind:"goal"` 步骤的处理器：Jev 局部语义循环（观察→Jev 判断→执行一个动作→差量再观察） | 每轮调 Jev | **既不专属 execute 也不专属 run**：FlowExecutor 执行中遇到 `goal` 步骤就转入它（两入口的步骤里都可含 goal） |
 | `Planner` | 计划生成器：把 goal+successCriteria 拆成 FlowStep[] | 每次规划 1 次 | **仅 run 入口**在开工前调用一次；产出的计划仍交回 FlowExecutor 执行 |
+
+**Jev 优先的取舍**：能写清步骤时（`click:...`）走确定性路径——0 次模型调用、约 100ms；只有「不知道点哪」时才用
+`goal:<目标>` 让 Jev 在服务端自己循环。goal 循环里的中间观察**不进入调用方上下文**，所以它比
+「snapshot → 大模型决定 → click → 再 snapshot」省掉 N 次往返与 N 份页面文本。Jev 把握不足（低于
+`jev.targetConfidenceAt`，默认 0.6）时**停下并把候选交回调用方**，而不是赌一次点击。
+
+**Jev 外呼的两个坑（都实测踩过）**
+
+1. **代理**：Node **不读 Windows 系统代理**，只认环境变量。本机开了代理时会出现「浏览器能访问、工具报 451」
+   的假象——真因是直连被拦。修法：`HTTPS_PROXY` + `NODE_USE_ENV_PROXY=1`（后者**只在进程启动时读取**），
+   回环加进 `NO_PROXY`。**经仓库启动器拉起 MCP 时会自动注入系统代理**，可直接跑 CLI/API 时需自行设置。
+2. **端点**：确属地区限制时，用 `jev.baseUrl`（配置文件）或 `JEV_BROWSER_JEV_BASE_URL` / `TYPESAFE_BASE_URL`
+   指向可达端点。`doctor` 会打印当前生效的端点；失败码为 `JEV_UNAVAILABLE` 并附上述两条修复路径。
+
+**发给 Jev 的请求体只含 `{i, role, name}`**：`tag` 从不参与提问，`text` 与 `name` 恒等——都是纯体积。
+
+**候选裁剪是准确率问题，不只是省钱问题**。实测（同一目标「打开搜索结果里的第二个视频」）：
+
+| 候选 | 决策 | 说明 |
+|---|---|---|
+| 整页 166 个（混着导航/页脚/广告） | 判 `done=0.70 / action=none` **没做事** | 信号被噪声淹没 |
+| 裁剪到 20 个干净候选 | **3/3 全对**，p=0.60~0.70 | 同样的模型、同样的目标 |
+
+所以做了三件事，实测（166 元素、真实长度中文标题）**单轮请求体 17,149 → 5,851 字符（2.93x）**：
+
+| 改动 | 说明 |
+|---|---|
+| 候选上限 200 → **80** | 超出即按相关性裁剪 |
+| **去掉同名标题** | 搜索页每张卡片是 `<a>标题</a>` + `<h3>同名标题</h3>`，纯重复 |
+| **候选标签只给序号** | 元素名已在 `state.elements` 里，标签再重复一遍纯属浪费（标签部分 7,272 → 964 字符）。之所以能这么做，是因为 payload 的 `i` 与 criteria 的 `c{idx}` 已严格对齐、问题文本也写明「元素列表见 state.elements（序号 i）」；需要标签自解释时置 `JEV_BROWSER_CRITERIA_VERBOSE=1` |
+
+排序按「元素名出现在目标里」（中文无空格词元，只能反向匹配）+ 词元命中，**视口内只作同分加成**（被点名的元素哪怕要滚动也排前面）。
+
+置信度实测分布（干净候选）：无歧义目标（点全屏/下一页）p=1.00；「第一个视频」p=0.83~0.88；「第二个视频」p=0.60~0.70。
+`jev.targetConfidenceAt`（默认 0.6）正好卡在后者的边缘——这是"拿不准停下"的预期行为，可按你的业务数据校准。
 
 
 
@@ -117,6 +152,20 @@ launchPersistentContext：用指定的磁盘目录作为用户数据目录（等
 无头仅适用于 launch。
 
 launch 模式下浏览器实例属于启动它的进程——裸 CLI 跨命令复用会话不可行（进程退出浏览器即关），跨命令长会话必须用长驻 API 或 attach。
+
+
+
+**暂停任务会预约整个 profile——因此它的持有要有出路**
+
+ 预约被**暂停等人**的任务持有时，新任务**立刻失败并指名**（`SESSION_BUSY`：先 `task cancel`/`task resume` 那个任务）。
+ 早期实现会一路空转到 `queueTimeoutMs`（默认 60 秒）才报 `BROWSER_BUSY`——Agent 会白等一分钟，
+ 而它本来就该先处理那个暂停任务。
+
+**一个浏览器 profile 同时只归一个宿主进程**
+
+ 实测：MCP 进程开着时再敲 CLI，会直接 `BROWSER_BUSY: 浏览器已被另一宿主进程占用 (pid=…)`。这是有意的独占
+ 设计（避免两个进程同时驱动同一个浏览器），代价是**不能一边用 MCP 一边用 CLI 调试**。要多个客户端共享同一次
+ 连接，走长驻 HTTP API，让 CLI/MCP 都转发过去（见 docs/api.md）。
 
 
 
@@ -385,6 +434,30 @@ code / message / retryable
 
 
 
+**输出体积纪律（面向模型调用）**
+
+ envelope 不只是给人看的，更多时候是喂给模型的上下文，所以按「模型要读多少字」来约束：
+
+ - MCP 侧结果用**紧凑 JSON**（不带缩进）。缩进对模型没有任何价值，实测同一份快照 21,450 → 13,122 字符
+ - 快照元素**不重复下发** `text` 字段（它与 `name` 同源）；每步证据里的超长 URL 收敛为 `origin+path`
+ - 快照支持 `viewportOnly` 与 `maxElements`：长页面的页脚、导航、相关推荐往往占掉大半元素，按视口取即可
+ - `execute`/`act` 落定后自动附一份紧凑观察，省掉「做完再喊一次 snapshot」的往返
+ - **失败步骤同样进入 `stepResults`**（状态 `failed`/`paused` 并带 `error`）。早期实现里出错的那一步会从结果中消失，
+   调用方只看到前面成功的步骤，看着像什么都没做
+
+
+
+**等待与重试纪律**
+
+ 页面类的后置条件默认**在窗口内轮询重试**（`runtime.expectRetryMs`，默认 5s，`JEV_BROWSER_EXPECT_RETRY_MS` 可调，
+ 0 = 退回单发）。原因：SPA 的路由切换、接口回包、框架重渲染都有百毫秒级延迟，单发判定会把「慢」误判成「失败」。
+ `var_equals` / `download_completed` 是任务内事实，不重试。
+
+ 与之配套，`navigate` 用 `domcontentloaded` 而不是 `load` —— `load` 要等页面上所有子资源（图片/广告/埋点），
+ 实测同一个 B 站搜索页在 1.2s ~ 7.7s 之间剧烈波动。DOM 就绪即可，剩下的交给会重试的后置条件。
+
+
+
 # 前置条件与构建
 
 | 项     | 要求   | 说明                                                         |
@@ -396,7 +469,7 @@ code / message / retryable
 cd tools/jev-browser
 pnpm install && pnpm build         # 首选 pnpm（托管 pnpm-lock.yaml，安装可复现）
 node cli/dist/index.js help        # 打印命令帮助 → 构建成功
-pnpm test                          # 64 个离线测试，无需浏览器/key
+pnpm test                          # 91 个离线测试，无需浏览器/key
 ```
 
 > 未装 pnpm 时可用 npm 回退：`npm install && npm run build`。但 npm 与 pnpm 的

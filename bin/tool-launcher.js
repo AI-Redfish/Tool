@@ -29,6 +29,8 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 
+const { execFileSync } = require('child_process');
+
 const TOOLS_ROOT = path.join(__dirname, '..', 'tools');
 const IS_WIN = process.platform === 'win32';
 
@@ -284,10 +286,54 @@ const command = isManifest ? resolved.manifest.command : process.execPath;
 const spawnArgs = isManifest
   ? [...(resolved.manifest.args || []), ...restArgs]
   : [resolved.entry, ...restArgs];
+/**
+ * Windows 系统代理默认**不被 Node 使用**（curl/Node 都只认环境变量，不读注册表）：
+ * 结果是浏览器能访问的服务，本工具的外呼（Jev 判断、规划模型）直连失败——
+ * 实测表现为 `451 Typesafe is not available in your region`，看起来像地区限制，
+ * 实际是本机代理没被使用。
+ *
+ * NODE_USE_ENV_PROXY 只在**进程启动时**读取（脚本内运行时赋值无效），所以必须在 spawn 的
+ * env 里给出。这里把系统代理翻译成子进程认得的环境变量。
+ * 设 JEV_BROWSER_NO_SYSTEM_PROXY=1 可关闭该行为。
+ */
+function systemProxyEnv() {
+  if (process.platform !== 'win32') return {};
+  if (process.env.JEV_BROWSER_NO_SYSTEM_PROXY === '1') return {};
+  if (process.env.NODE_USE_ENV_PROXY) return {}; // 用户已显式配置，不覆盖
+  const KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
+  try {
+    const enabled = execFileSync('reg', ['query', KEY, '/v', 'ProxyEnable'], { encoding: 'utf8' });
+    if (!/0x1\b/.test(enabled)) return {};
+    const raw = execFileSync('reg', ['query', KEY, '/v', 'ProxyServer'], { encoding: 'utf8' });
+    const m = raw.match(/ProxyServer\s+REG_SZ\s+(.+)/);
+    if (!m) return {};
+    let server = m[1].trim();
+    // 允许 "http=host:port;https=host:port" 这种按协议分行
+    if (server.includes('=')) {
+      const parts = Object.fromEntries(server.split(';').map((kv) => kv.split('=').map((x) => x.trim())));
+      server = parts.https || parts.http || '';
+    }
+    if (!server) return {};
+    const url = /^https?:\/\//i.test(server) ? server : `http://${server}`;
+    const noProxy = [process.env.NO_PROXY, process.env.no_proxy, '127.0.0.1', 'localhost', '::1']
+      .filter(Boolean)
+      .join(',');
+    // 本机回环必须直连：浏览器 attach（CDP）与本地 API 都走 127.0.0.1
+    return { NODE_USE_ENV_PROXY: '1', HTTPS_PROXY: url, HTTP_PROXY: url, NO_PROXY: noProxy, no_proxy: noProxy };
+  } catch {
+    return {};
+  }
+}
+
+const proxyEnv = systemProxyEnv();
+if (proxyEnv.HTTPS_PROXY) {
+  console.error(`[launcher] 检测到系统代理 ${proxyEnv.HTTPS_PROXY}，已注入子进程（NODE_USE_ENV_PROXY=1，回环直连）——否则 Jev/规划模型的外呼会直连失败`);
+}
+
 const child = spawn(command, spawnArgs, {
   cwd: isManifest ? toolDir : path.dirname(resolved.entry),
   stdio: 'inherit', // stdin/stdout/stderr 全部透传，stdout 即 MCP stdio 协议通道
-  env: { ...process.env, TOOL_NAME: toolName },
+  env: { ...process.env, ...proxyEnv, TOOL_NAME: toolName },
 });
 
 child.on('error', (err) => {

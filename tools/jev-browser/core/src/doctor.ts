@@ -64,6 +64,12 @@ export async function runDoctor(opts: LoadConfigOptions & { attemptConnect?: boo
     planner: credentialPresent(config, 'planner', env),
     api: credentialPresent(config, 'api', env),
   };
+  // Jev 端点是外呼配置，地区受限时会 451；把它显式打出来，排查不用猜
+  checks.push({
+    name: 'jevEndpoint',
+    ok: true,
+    detail: `${config.jev.baseUrl || 'https://api.typesafe.ai（SDK 默认）'}（可用 JEV_BROWSER_JEV_BASE_URL / TYPESAFE_BASE_URL 覆盖；地区受限会返回 451）`,
+  });
   checks.push({
     name: 'credentials',
     ok: true,

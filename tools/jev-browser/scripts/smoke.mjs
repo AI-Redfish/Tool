@@ -20,7 +20,6 @@ import path from 'node:path';
 import { Runtime, loadConfig } from '../core/dist/index.js';
 
 const keep = process.argv.includes('--keep');
-const PRINCIPAL = 'smoke';
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'jev-smoke-'));
 const log = (...a) => console.error('[smoke]', ...a);
 
@@ -39,6 +38,7 @@ function serveFixture() {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(`<!doctype html><html><head><title>JEV Smoke Fixture</title></head>
 <body><h1>JEV Smoke Fixture</h1><span id="status">ready</span>
+<input id="kw" type="text" aria-label="关键词">
 <a id="dl" href="/report.txt" download="smoke-report.txt">下载报告</a></body></html>`);
     });
     server.listen(0, '127.0.0.1', () => resolve(server));
@@ -76,7 +76,7 @@ async function main() {
   let taskId = null;
   try {
     // 1) launch 连接 + 建会话（新页必须在授权域内）
-    const s = await rt.createSession(PRINCIPAL, {
+    const s = await rt.createSession({
       target: { kind: 'new', url: `${base}/` },
       allowedOrigins: [base],
       modelOrigins: [],
@@ -85,7 +85,8 @@ async function main() {
     sessionId = s.sessionId;
     check('connect+createSession(launch/chromium/headless)', true, `session=${sessionId}`);
 
-    // 2) 确定性流程：导航 → 提取 → 断言 → 下载 → 截图（模型调用必须为 0）
+    // 2) 确定性流程：导航 → 提取 → 断言 → 简写填空+值断言 → 下载 → 截图（模型调用必须为 0）
+    //    'fill:... => value_equals:...' 是新增能力：一行式简写 + 输入值后置条件（真浏览器验证）
     const flow = {
       steps: [
         { id: 'nav', kind: 'action', action: 'navigate', value: `${base}/`,
@@ -93,30 +94,53 @@ async function main() {
         { id: 'read', kind: 'extract', target: { by: 'role', role: 'heading', name: 'JEV Smoke Fixture', exact: true },
           fields: ['text', 'count'], saveAs: 'heading' },
         { id: 'verify', kind: 'assert', expect: [{ kind: 'var_equals', variable: 'heading.text', value: 'JEV Smoke Fixture' }] },
+        'fill:css/#kw=虎皮鹦鹉 => value_equals:css/#kw=虎皮鹦鹉',
         { id: 'dl', kind: 'action', action: 'click', target: { by: 'css', selector: '#dl' },
           expect: [{ kind: 'download_completed', variable: 'report' }] },
         { id: 'shot', kind: 'action', action: 'screenshot' },
       ],
       values: {},
     };
-    const queued = await rt.execute(PRINCIPAL, sessionId, flow, { idempotencyKey: 'smoke-1' });
+    const queued = await rt.execute(sessionId, { sessionId, steps: flow.steps, values: {} }, { idempotencyKey: 'smoke-1' });
     taskId = queued.taskId;
     const env = await rt.waitEnvelope(taskId);
     check('execute → done', env.status === 'done',
       env.status !== 'done' ? JSON.stringify(env.error ?? env.stepResults?.filter((x) => x.status !== 'done')) : '');
+    check('简写步骤展开并执行（自动补 id）',
+      env.stepResults.some((x) => x.id === 's4' && x.kind === 'action' && x.status === 'done'),
+      JSON.stringify(env.stepResults.map((x) => `${x.id}:${x.status}`)));
     const metrics = env.metrics ?? {};
     check('模型调用为 0（纯确定性）',
-      (metrics.plannerRequests ?? 0) === 0 && (metrics.judgeRequests ?? 0) === 0,
+      (metrics.plannerRequests ?? 0) === 0 && (metrics.jevRequests ?? 0) === 0,
       JSON.stringify(metrics));
 
+    // 2b) 快照瘦身：视口过滤 + 元素上限；与 name 同源的 text 字段不再下发
+    const obs = await rt.snapshot(sessionId, { viewportOnly: true, maxElements: 50 });
+    check('snapshot 视口过滤 + 元素上限生效',
+      Array.isArray(obs.elements) && obs.elements.length > 0 && obs.elements.length <= 50,
+      `elements=${obs.elements?.length}`);
+    check('snapshot 已剥离冗余 text 字段',
+      obs.elements.every((e) => e.text === undefined),
+      JSON.stringify(obs.elements[0] ?? null));
+
+    // 2c) 快照按需收窄：filter（name 子串）与 roles
+    const filtered = await rt.snapshot(sessionId, { viewportOnly: false, filter: 'JEV' });
+    check('snapshot filter 生效（只留 name 命中的元素）',
+      filtered.elements.length > 0 && filtered.elements.every((e) => e.name.toLowerCase().includes('jev')),
+      `elements=${filtered.elements.length}: ${JSON.stringify(filtered.elements.map((e) => e.name))}`);
+    const onlyTextbox = await rt.snapshot(sessionId, { viewportOnly: false, roles: ['textbox'] });
+    check('snapshot roles 过滤生效',
+      onlyTextbox.elements.length > 0 && onlyTextbox.elements.every((e) => e.role === 'textbox'),
+      JSON.stringify(onlyTextbox.elements.map((e) => e.role)));
+
     // 3) 产物：下载文件与截图受管落盘，取回并比对内容
-    const arts = rt.listArtifacts(PRINCIPAL, taskId);
+    const arts = rt.listArtifacts(taskId);
     const report = arts.find((a) => a.filename.includes('.txt'));
     const shots = arts.filter((a) => /\.(png|jpe?g|webm)$/.test(a.filename));
     check('下载产物已受管保存', Boolean(report), JSON.stringify(arts.map((a) => a.filename)));
     check('截图产物已保存', shots.length >= 1);
     if (report) {
-      const { path: src } = rt.artifactPath(PRINCIPAL, taskId, report.artifactId);
+      const { path: src } = rt.artifactPath(taskId, report.artifactId);
       const out = path.join(tmpRoot, 'saved-report.txt');
       fs.copyFileSync(src, out);
       const content = fs.readFileSync(out, 'utf8');
@@ -124,12 +148,12 @@ async function main() {
     }
 
     // 4) 幂等：同键同体重放不产生第二个任务
-    const replay = await rt.execute(PRINCIPAL, sessionId, flow, { idempotencyKey: 'smoke-1' });
+    const replay = await rt.execute(sessionId, { sessionId, steps: flow.steps, values: {} }, { idempotencyKey: 'smoke-1' });
     check('幂等重放返回原任务', replay.taskId === taskId);
 
     // 5) 断开与清理
-    const d = await rt.disconnect(PRINCIPAL, sessionId, {});
-    check('disconnect 完成', d.ok !== false, JSON.stringify(d));
+    const d = await rt.disconnect(sessionId, {});
+    check('disconnect 完成', d.disconnected === true, JSON.stringify(d));
     sessionId = null;
   } finally {
     await rt.close({ graceMs: 3000 }).catch(() => undefined);

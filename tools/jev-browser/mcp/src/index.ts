@@ -18,6 +18,7 @@ import {
   TOOLS,
   Runtime,
   loadConfig,
+  pollNewPages,
   runDoctor,
   type TaskEnvelope,
 } from '@ai-redfish/jev-browser-core';
@@ -39,6 +40,16 @@ async function rt(): Promise<Runtime> {
   return runtime;
 }
 
+// 外呼代理可见性：Node 默认**不读 Windows 系统代理**（只认环境变量），这是「Jev 报地区限制
+// / 451」的头号真因——浏览器能通的服务，本进程直连就失败。启动器会把系统代理注入进来，
+// 这里打一行日志，便于在 MCP 日志里确认它到底有没有生效（不含凭据，只有端点）。
+if (process.env.HTTPS_PROXY || process.env.NODE_USE_ENV_PROXY) {
+  console.error(
+    `[jev-browser-mcp] 外呼代理: HTTPS_PROXY=${process.env.HTTPS_PROXY ?? '(未设置)'} ` +
+      `NODE_USE_ENV_PROXY=${process.env.NODE_USE_ENV_PROXY ?? '(未设置)'} NO_PROXY=${process.env.NO_PROXY ?? '(未设置)'}`,
+  );
+}
+
 const originSchema = z.array(z.string()).describe('http/https origin 列表，如 ["https://example.com"]');
 
 /** 工具描述统一附加风险标签（DESIGN §3：TOOLS 携带风险标签）。 */
@@ -47,14 +58,102 @@ const desc = (i: number) => `${TOOLS[i].description}【风险: ${TOOLS[i].risk}�
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
 function text(data: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+  // 紧凑 JSON：缩进对模型毫无价值，却让同一份数据膨胀约 1.6 倍（实测快照 21,450 → 13,122 字符）
+  return { content: [{ type: 'text' as const, text: JSON.stringify(data) }] };
 }
 function textErr(e: unknown) {
   const errObj = e as { code?: string; message?: string };
   return {
-    content: [{ type: 'text' as const, text: JSON.stringify({ error: { code: errObj.code ?? 'INTERNAL', message: errObj.message ?? String(e) } }, null, 2) }],
+    content: [{ type: 'text' as const, text: JSON.stringify({ error: { code: errObj.code ?? 'INTERNAL', message: errObj.message ?? String(e) } }) }],
     isError: true,
   };
+}
+
+/**
+ * execute/act 落定后自动附一份紧凑观察，省掉「做完再喊一次 snapshot」的第二次往返
+ * ——对话式操作里这一步的往返和 token 成本比浏览器动作本身高得多。
+ * 观察失败不影响任务结果本身（吞掉异常）。
+ */
+async function attachObservation(
+  sessionId: string,
+  payload: unknown,
+  opts: { viewportOnly: boolean; maxElements: number },
+): Promise<unknown> {
+  try {
+    const obs = api
+      ? await api.snapshot(sessionId, { viewportOnly: opts.viewportOnly, maxElements: opts.maxElements })
+      : await (await rt()).snapshot(sessionId, { viewportOnly: opts.viewportOnly, maxElements: opts.maxElements });
+    return { ...(payload as Record<string, unknown>), afterObservation: obs };
+  } catch {
+    return payload;
+  }
+}
+
+/** execute/act 的观察选项：默认只回视口内的元素，并把上限压到 150。 */
+const OBS_OPTS = { viewportOnly: true, maxElements: 150 };
+
+/** 当前会话可见的标签页；失败返回空数组（标签页信息不该让整个任务结果失败）。 */
+async function pagesOf(sessionId: string): Promise<Array<{ pageId: string; url?: string; title?: string }>> {
+  try {
+    if (api) {
+      const r = (await api.pages(sessionId)) as { pages?: Array<{ pageId: string; url?: string; title?: string }> };
+      return r.pages ?? [];
+    }
+    return await (await rt()).listPages(sessionId);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 新标签页的出现**晚于任务落定**：浏览器处理 target=_blank 是异步的。
+ * 实测（本地 fixture + Playwright 直接量）：点击 resolve 之后还要 **276~440ms** 才能在
+ * context.pages() 里看到新页——所以「任务一结束就查一次」必然漏报（连续两次点击确实都开了
+ * 新页，却一次都没报出来，就是这么来的）。
+ *
+ * 窗口取 700ms = 实测上限的 1.6 倍。这份等待只在**步骤里含 click** 时才付。
+ * 明确不关心新页的场景（连续开多个结果页）传 followNewTab:false 可彻底免等（只查一次）。
+ */
+const NEW_TAB_WAIT_MS = 700;
+
+/** 步骤里是否可能出现新标签页（简写以 click: 开头，或对象形式的 action==='click'）。 */
+function stepsMayOpenTab(steps: unknown): boolean {
+  if (!Array.isArray(steps)) return false;
+  return steps.some((s) => {
+    if (typeof s === 'string') return /^\s*click\s*:/.test(s);
+    if (s && typeof s === 'object') return (s as { action?: string }).action === 'click';
+    return false;
+  });
+}
+
+/**
+ * 识别「任务期间新开的标签页」。搜索/列表页的结果链接普遍是 target=_blank，点一下就多一个页；
+ * 不在这里识别，调用方就得再花 pages + select-page 两次往返才能继续，而这两次是纯开销。
+ * followNewTab 顺手把「切过去」也做掉，并在结果里明示 followedPageId——不是静默换页。
+ */
+async function trackNewPages(
+  sessionId: string,
+  before: Array<{ pageId: string }>,
+  followNewTab: boolean,
+  mayOpenTab: boolean,
+): Promise<Record<string, unknown>> {
+  // followNewTab=false 表示调用方自己管标签页，这时连探测都不必等（只查一次）
+  const opened = await pollNewPages(before, () => pagesOf(sessionId), {
+    waitMs: followNewTab && mayOpenTab ? NEW_TAB_WAIT_MS : 0,
+  });
+  if (opened.length === 0) return {};
+  const out: Record<string, unknown> = { openedPages: opened };
+  if (followNewTab) {
+    const newest = opened[opened.length - 1]!;
+    try {
+      if (api) await api.selectPage(sessionId, newest.pageId);
+      else await (await rt()).selectPage(sessionId, newest.pageId);
+      out.followedPageId = newest.pageId;
+    } catch {
+      /* 跟随失败不改任务结果；调用方仍可自行 select-page */
+    }
+  }
+  return out;
 }
 
 server.tool('browser_doctor', desc(0), { connect: z.boolean().optional().describe('尝试接管（需 Chrome 授权）') }, async ({ connect }) => {
@@ -100,9 +199,23 @@ server.tool('browser_select_page', desc(3), { sessionId: z.string(), pageId: z.s
   }
 });
 
-server.tool('browser_snapshot', desc(6), { sessionId: z.string(), forModel: z.boolean().optional().describe('true = 打算发给云模型，要求 origin ∈ modelOrigins') }, async ({ sessionId, forModel }) => {
+server.tool('browser_snapshot', desc(6), {
+  sessionId: z.string(),
+  forModel: z.boolean().optional().describe('true = 打算发给云模型：只回 rendered 紧凑文本行（需 origin ∈ modelOrigins）'),
+  viewportOnly: z.boolean().optional().describe('默认 true 只采集视口内元素（页脚/长列表噪声占大多数）；要整页元素请传 false'),
+  maxElements: z.number().int().optional().describe('元素上限，默认 200（硬上限 2000）'),
+  filter: z.string().optional().describe('只保留 name 含该子串的元素（大小写不敏感）——「我要找那个东西」时用它，比拉整页小一个量级'),
+  roles: z.array(z.string()).optional().describe('只保留这些 role 的元素，如 ["button","textbox"]'),
+}, async ({ sessionId, forModel, viewportOnly, maxElements, filter, roles }) => {
   try {
-    const obs = api ? await api.snapshot(sessionId, forModel) : await (await rt()).snapshot(sessionId, { forModel });
+    const opts = {
+      forModel,
+      viewportOnly: viewportOnly !== false,
+      maxElements: maxElements ?? 200,
+      filter,
+      roles,
+    };
+    const obs = api ? await api.snapshot(sessionId, opts) : await (await rt()).snapshot(sessionId, opts);
     return text(obs);
   } catch (e) {
     return textErr(e);
@@ -111,16 +224,32 @@ server.tool('browser_snapshot', desc(6), { sessionId: z.string(), forModel: z.bo
 
 server.tool('browser_execute', desc(4), {
   sessionId: z.string(),
-  steps: z.array(z.record(z.unknown())).describe('FlowStep[]；导航/写操作需 expect 后置条件'),
+  steps: z.array(z.union([z.record(z.unknown()), z.string()])).describe(
+    '步骤数组，每项是 FlowStep 对象或一行简写字符串。' +
+    '【选路径，按速度排序】① 知道点哪 → 直接写确定性步骤，如 "click:css/#submit => url_contains:/done"（0 次模型调用，约 100ms）；' +
+    '② 只知道要达成什么、不知道点哪 → 写 "goal:<自然语言目标>"，由 Jev 在服务端自己观察并选动作——全程仍只占 1 次调用，' +
+    '中间观察不进入你的上下文（比你自己 snapshot→读→click 快一个量级；需该页 origin ∈ modelOrigins）；' +
+    '③ 只是要验证某个条件 → 用 browser_judge 问一句，不要拉整屏元素。' +
+    '【简写语法】"navigate:<url>" / "click:<loc>" / "fill:<loc>=<值>" / "select:<loc>=<值>" / "press:<键>" / "scroll:<px>" / "wait:<ms>" / "screenshot" / "evaluate:<js>"；' +
+    '定位器 role/<role>[/<name>] | label/<name> | testid/<id> | text/<文本> | css/<选择器>，末尾加 "!" 表示精确匹配；' +
+    '后置条件追加 " => "（多项用 ";" 分隔）：url_contains / text_present / visible / hidden / not_visible / count_gte / value_equals / var_equals / download_completed。' +
+    '【约束】id 可省略（自动补）；导航/写操作必须有 expect。' +
+    '例："click:role/button/搜索 => url_contains:/search"、"fill:css/#pw=$password => value_equals:css/#pw=<原值>"、"goal:打开搜索结果里的第二个视频 => url_contains:/video/"',
+  ),
   values: z.record(z.unknown()).optional().describe('值字典；敏感值用 {"secretRef":"NAME"}（环境 JEV_BROWSER_SECRET_<NAME>）'),
-}, async ({ sessionId, steps, values }) => {
+  includeObservation: z.boolean().optional().describe('默认 true：任务落定后自动附 afterObservation（视口内紧凑观察），省掉一次 snapshot 往返'),
+  followNewTab: z.boolean().optional().describe('默认 true：任务期间新开的标签页自动切过去（结果里以 openedPages/followedPageId 明示，非静默）；传 false 则免去含 click 任务最多 0.7s 的新页探测等待'),
+}, async ({ sessionId, steps, values, includeObservation, followNewTab }) => {
   try {
     const input = { sessionId, steps, values: (values ?? {}) as Record<string, import('@ai-redfish/jev-browser-core').ValueInput> };
+    const before = await pagesOf(sessionId);
     const queued = api
       ? (await api.execute(input)) as unknown as TaskEnvelope
       : await (await rt()).execute(sessionId, input as never);
     const env = api ? await pollUntilSettled(api, queued.taskId) : await (await rt()).waitEnvelope(queued.taskId);
-    return text(env);
+    const payload = { ...(env as unknown as Record<string, unknown>), ...(await trackNewPages(sessionId, before, followNewTab !== false, stepsMayOpenTab(steps))) };
+    const out = includeObservation === false ? payload : await attachObservation(sessionId, payload, OBS_OPTS);
+    return text(out);
   } catch (e) {
     return textErr(e);
   }
@@ -128,7 +257,7 @@ server.tool('browser_execute', desc(4), {
 
 server.tool('browser_run', desc(5), {
   sessionId: z.string(),
-  goal: z.string(),
+  goal: z.string().describe('自然语言目标。注意：多数场景用 browser_execute 的 goal 步骤更快——run 会先让云模型盲规划整条链路（多一次秒级模型调用），只有「完全不知道从哪下手」时才值得'),
   successCriteria: z.string().describe('用户可观察的验收条件；防止规划器自证成功'),
   values: z.record(z.unknown()).optional(),
 }, async ({ sessionId, goal, successCriteria, values }) => {
@@ -146,16 +275,21 @@ server.tool('browser_run', desc(5), {
 
 server.tool('browser_act', desc(7), {
   sessionId: z.string(),
-  step: z.record(z.unknown()).describe('单个 ActionStep'),
+  step: z.union([z.record(z.unknown()), z.string()]).describe('单个 ActionStep 对象，或一行简写字符串（语法同 browser_execute.steps）'),
   values: z.record(z.unknown()).optional(),
-}, async ({ sessionId, step, values }) => {
+  includeObservation: z.boolean().optional().describe('默认 true：落定后自动附 afterObservation'),
+  followNewTab: z.boolean().optional().describe('默认 true：新开的标签页自动切过去（结果里明示 openedPages/followedPageId）；传 false 则免去最多 0.7s 的新页探测等待'),
+}, async ({ sessionId, step, values, includeObservation, followNewTab }) => {
   try {
     const input = { step, values: values ?? {} };
+    const before = await pagesOf(sessionId);
     const queued = api
       ? (await api.act(sessionId, input)) as unknown as TaskEnvelope
       : await (await rt()).act(sessionId, { sessionId, step: step as never, values: (values ?? {}) as Record<string, import('@ai-redfish/jev-browser-core').ValueInput> });
     const env = api ? await pollUntilSettled(api, queued.taskId) : await (await rt()).waitEnvelope(queued.taskId);
-    return text(env);
+    const payload = { ...(env as unknown as Record<string, unknown>), ...(await trackNewPages(sessionId, before, followNewTab !== false, stepsMayOpenTab([step]))) };
+    const out = includeObservation === false ? payload : await attachObservation(sessionId, payload, OBS_OPTS);
+    return text(out);
   } catch (e) {
     return textErr(e);
   }
@@ -206,6 +340,18 @@ server.tool('browser_task_approve', desc(11), {
   try {
     const env = api ? (await api.approveTask(taskId, { grant })).envelope : (await rt()).approveTask(taskId, grant);
     return text(env);
+  } catch (e) {
+    return textErr(e);
+  }
+});
+
+server.tool('browser_judge', desc(14), {
+  sessionId: z.string(),
+  question: z.string().describe('要向 Jev 提的是/否问题，如「页面上是否出现了订单号？」'),
+}, async ({ sessionId, question }) => {
+  try {
+    const result = api ? await api.judgePage(sessionId, question) : await (await rt()).judgePage(sessionId, question);
+    return text(result);
   } catch (e) {
     return textErr(e);
   }

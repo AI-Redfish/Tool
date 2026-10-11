@@ -205,6 +205,10 @@ class PwContextAdapter implements ContextPort {
 class PwBrowserAdapter implements BrowserPort {
   constructor(private readonly browser: PwBrowser) {}
 
+  isConnected(): boolean {
+    return this.browser.isConnected();
+  }
+
   contexts(): ContextPort[] {
     return this.browser.contexts().map((c) => new PwContextAdapter(c));
   }
@@ -366,6 +370,9 @@ export class PlaywrightConnector implements BrowserConnector {
       });
       const context = new PwContextAdapter(ctx);
       const wrapper: BrowserPort = {
+        // launch 是我们自己的实例：context 的 browser 句柄可用时问它，拿不到就按连通处理
+        // （真崩了会在后续调用上直接暴露，这里不假装能检测一切）
+        isConnected: () => ctx.browser()?.isConnected() ?? true,
         contexts: () => [context],
         close: () => ctx.close(),
       };

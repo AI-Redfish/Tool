@@ -79,8 +79,21 @@ export class ApiClient {
     return this.call('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/act`, input);
   }
 
-  snapshot(sessionId: string, forModel?: boolean): Promise<unknown> {
-    return this.call('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/snapshot`, { forModel: forModel ?? false });
+  snapshot(
+    sessionId: string,
+    opts: { forModel?: boolean; viewportOnly?: boolean; maxElements?: number; filter?: string; roles?: string[] } = {},
+  ): Promise<unknown> {
+    return this.call('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/snapshot`, {
+      forModel: opts.forModel === true,
+      ...(opts.viewportOnly !== undefined ? { viewportOnly: opts.viewportOnly } : {}),
+      ...(opts.maxElements !== undefined ? { maxElements: opts.maxElements } : {}),
+      ...(opts.filter ? { filter: opts.filter } : {}),
+      ...(opts.roles && opts.roles.length > 0 ? { roles: opts.roles } : {}),
+    });
+  }
+
+  judgePage(sessionId: string, question: string): Promise<unknown> {
+    return this.call('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/judge`, { question });
   }
 
   getTask(taskId: string): Promise<{ envelope: TaskEnvelope }> {

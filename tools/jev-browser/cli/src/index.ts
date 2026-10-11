@@ -73,9 +73,13 @@ const HELP = `jev-browser-cli —— 浏览器控制（Playwright + Jev；方案
                                               创建会话（origin 默认不许可任何网站）
   pages --session <id>                        列出标签页
   select-page --session <id> --page <id>      选择标签页
-  snapshot --session <id> [--for-model]       只读页面快照（for-model 需 origin ∈ modelOrigins）
+  judge --session <id> --question <问题>        单问题语义判断（Jev 打分 0~1；需 origin ∈ modelOrigins）
+  snapshot --session <id> [--for-model] [--viewport-only] [--max-elements <n>]
+                        [--filter <子串>] [--roles <a,b>]
+                                              只读页面快照（for-model 只回紧凑文本行且需 origin ∈ modelOrigins）
   execute --file <flow.json> (--url <url> | --page <id>) --origin <origin> [...]
                                               执行确定性步骤（不调用规划模型）
+                                              --steps 支持一行式简写：'click:role/button/搜索 => url_contains:/search'
   run --goal <文本> --success <验收条件> (--url | --page) --origin ... [--model-origin ...]
                                               内部规划并执行（需 planner 与 Jev 配置）
   act --session <id> --step '<ActionStep JSON>' [--values '<json>']
@@ -287,17 +291,36 @@ async function main(): Promise<void> {
       return;
     }
 
+    case 'judge': {
+      const sessionId = str(args.flags, 'session');
+      const question = str(args.flags, 'question');
+      if (!sessionId || !question) fail('judge 需要 --session 与 --question');
+      const result = api ? await api.judgePage(sessionId, question) : await (await runtimeOf()).judgePage(sessionId, question);
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
     case 'snapshot': {
       const sessionId = str(args.flags, 'session');
+      const maxElements = str(args.flags, 'max-elements');
+      const filter = str(args.flags, 'filter');
+      const roles = str(args.flags, 'roles');
+      const snapOpts = {
+        forModel: args.flags['for-model'] === true,
+        viewportOnly: args.flags['viewport-only'] === true,
+        ...(maxElements !== undefined && Number.isFinite(Number(maxElements)) ? { maxElements: Number(maxElements) } : {}),
+        ...(filter ? { filter } : {}),
+        ...(roles ? { roles: roles.split(',').map((r) => r.trim()).filter(Boolean) } : {}),
+      };
       if (api) {
         if (!sessionId) fail('--api 模式需要 --session');
-        const obs = await api.snapshot(sessionId, args.flags['for-model'] === true);
+        const obs = await api.snapshot(sessionId, snapOpts);
         console.log(JSON.stringify(obs, null, 2));
         return;
       }
       const rt = await runtimeOf();
       const sid = sessionId ?? (await ensureOneShotSession(rt));
-      const obs = await rt.snapshot(sid, { forModel: args.flags['for-model'] === true });
+      const obs = await rt.snapshot(sid, snapOpts);
       console.log(JSON.stringify(obs, null, 2));
       if (!sessionId) await rt.disconnect(sid).catch(() => undefined);
       await rt.close();

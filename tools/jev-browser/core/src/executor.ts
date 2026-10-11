@@ -78,6 +78,8 @@ export interface PerformContext {
   ledger: LedgerHook;
   actionRevision: number;
   actionTimeoutMs: number;
+  /** 页面状态类断言的重试窗口（毫秒，0 = 单发）；见 verifyExpects。 */
+  expectRetryMs?: number;
   /** 上传授权目录（DESIGN §10；空 = 拒绝一切上传）。 */
   allowedUploadDirs?: string[];
   /** 单文件上传大小上限（已知长度时预检，DESIGN §10）。 */
@@ -134,7 +136,9 @@ export async function performAction(
     let extraEvidence: Record<string, unknown> = {};
     switch (step.action) {
       case 'navigate': {
-        await page.goto(String(value ?? ''), { timeout, waitUntil: 'load' });
+        // domcontentloaded 而非 load：load 要等所有子资源（图片/广告/埋点），实测同一页
+        // 在 1.2s ~ 7.7s 之间剧烈波动。DOM 就绪即可，剩下的交给后置条件（断言会重试）。
+        await page.goto(String(value ?? ''), { timeout, waitUntil: 'domcontentloaded' });
         break;
       }
       case 'click': {
@@ -148,7 +152,8 @@ export async function performAction(
         break;
       }
       case 'press': {
-        const key = step.key ?? 'Enter';
+        // key 优先；兼容只写 value 的写法（此前 value 被静默忽略、永远按 Enter）
+        const key = step.key ?? (value !== undefined && value !== null ? String(value) : 'Enter');
         if (step.target) {
           await resolveLocator(page, step.target).first().press(key, { timeout });
         } else {
@@ -229,7 +234,7 @@ export async function performAction(
       ctx.vars['lastArtifact'] = artifactId;
     }
 
-    const verdict = await verifyExpects(page, step.expect ?? [], { vars: ctx.vars, lastDownload: { artifactId } }, timeout);
+    const verdict = await verifyExpects(page, step.expect ?? [], { vars: ctx.vars, lastDownload: { artifactId }, retryMs: ctx.expectRetryMs }, timeout);
     if (!verdict.ok) {
       ctx.ledger.finished(step, ctx.actionRevision, 'failed', { reason: 'postcondition', failures: verdict.failures });
       throw err('ACTION_FAILED', `后置条件未通过: ${verdict.failures.map((f) => f.reason).join('; ')}`.slice(0, 300), {
@@ -247,7 +252,7 @@ export async function performAction(
     if (isTimeout) {
       // 超时 ≠ 未执行：先核实后置状态（DESIGN §6.4）
       try {
-        const verdict = await verifyExpects(page, step.expect ?? [], { vars: ctx.vars }, Math.min(timeout, 5000));
+        const verdict = await verifyExpects(page, step.expect ?? [], { vars: ctx.vars, retryMs: ctx.expectRetryMs }, Math.min(timeout, 5000));
         if (verdict.ok) {
           ctx.ledger.finished(step, ctx.actionRevision, 'verified', { url: page.url(), verifiedAfterTimeout: true });
           return { evidence: { url: evidenceUrl(page.url()), verifiedAfterTimeout: true } };

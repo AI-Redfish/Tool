@@ -183,6 +183,32 @@ node cli/dist/index.js execute --file examples/read-page.flow.json --url "https:
 
 **`--steps <json>`** —— 直接给 FlowStep 数组。
 
+数组里每一项可以是 FlowStep 对象，也可以是一行**简写字符串**（更省 token，id 可省略，自动补 `s1/s2/…`）：
+
+```text
+<verb>:<参数>[ => <expect>[; <expect>]...]
+
+定位器：role/<role>[/<name>]   label/<name>   testid/<id>   text/<文本>   css/<选择器>
+末尾加 "!" = 精确匹配（如 "click:text/播放!"）；列表页同名元素多时用它，否则会点到不可点的容器上
+值分隔符是参数里最后一个 "="（CSS 选择器常含 "="）；值写成 $name 表示引用 values
+```
+
+```powershell
+# 同上那串 JSON 的简写等价写法
+node cli/dist/index.js execute --session sXX --values '{"kw":"redfish"}' --steps '[
+  "navigate:https://example.com/search => url_contains:/search",
+  "fill:role/textbox/关键词=$kw => value_equals:role/textbox/关键词=redfish",
+  "click:role/button/搜索 => text_present:条结果",
+  "screenshot"
+]'
+```
+
+`=>` 后可写多个后置条件（用 `;` 分隔）：`url_contains` / `text_present` / `visible` / `hidden` / `not_visible` / `count_gte` / `value_equals` / `value_contains` / `var_equals` / `download_completed`。
+
+其中 `value_equals` / `value_contains` 读的是表单元素当前值——`fill` 之前没有任何办法验证输入是否真的写进去了（受控组件会静默失败），这两个断言补上了这个缺口。`not_visible` 用于验证删除/关闭类操作已生效。
+
+**导航与写操作仍必须带后置条件**，简写只是让它写起来更短。
+
 ```powershell
 node cli/dist/index.js execute  --url "https://example.com"  --origin "https://example.com"  --steps '[{\"id\":\"s1\",\"kind\":\"action\",\"action\":\"navigate\",\"value\":\"https://example.com/search\",\"expect\":[{\"kind\":\"url_contains\",\"value\":\"/search\"}]},{\"id\":\"s2\",\"kind\":\"action\",\"action\":\"fill\",\"target\":{\"by\":\"role\",\"role\":\"textbox\",\"name\":\"关键词\"},\"valuesRef\":\"kw\",\"expect\":[{\"kind\":\"visible\",\"target\":{\"by\":\"role\",\"role\":\"textbox\",\"name\":\"关键词\"}}]},{\"id\":\"s3\",\"kind\":\"action\",\"action\":\"click\",\"target\":{\"by\":\"role\",\"role\":\"button\",\"name\":\"搜索\"},\"expect\":[{\"kind\":\"text_present\",\"value\":\"条结果\"}]},{\"id\":\"s4\",\"kind\":\"extract\",\"target\":{\"by\":\"css\",\"selector\":\".result-list\"},\"fields\":[\"count\"],\"saveAs\":\"resultCount\"},{\"id\":\"s5\",\"kind\":\"assert\",\"expect\":[{\"kind\":\"count_gte\",\"target\":{\"by\":\"css\",\"selector\":\".result-item\"},\"value\":1}]}]'  --values '{\"kw\": \"redfish\"}'  --json
 ```
@@ -278,6 +304,18 @@ node cli/dist/index.js execute --file search.flow.json --url "https://www.bilibi
 
 
 
+### judge
+
+单问题语义判断：把「当前页是否满足某条件」交给 Jev 打分（0~1）。用一句话代替读一整屏元素。
+
+```powershell
+node cli/dist/index.js judge --session sXX --question "页面上是否出现了订单号？"
+```
+
+**`--session <id>` / `--question <文本>`** —— 均必填；origin 必须在 `modelOrigins` 内（页面候选会发给 Jev）。
+
+
+
 ### snapshot 
 
 功能和execute的区别如下：
@@ -285,12 +323,24 @@ node cli/dist/index.js execute --file search.flow.json --url "https://www.bilibi
 | 对比项       | `snapshot`                                                   | `execute`                                               |
 | ------------ | ------------------------------------------------------------ | ------------------------------------------------------- |
 | 本质         | 只读观察当前页面（风险级 `readonly`）                        | 执行确定性步骤序列（含写操作）                          |
-| 输入         | 只有目标页参数 + `--for-model`                               | 必须给 `steps`（`--file` /`--steps`）+ `--values`       |
+| 输入         | 只有目标页参数 + `--for-model` / `--viewport-only` / `--max-elements` | 必须给 `steps`（`--file` /`--steps`）+ `--values`       |
 | 对页面的影响 | 零副作用：不点击、不导航、不填表                             | 会改变页面状态：navigate / click / fill / upload…       |
-| 输出         | `PageObservation`：snapshotId、url、title、元素清单（role/name，脱敏，上限 400 个，超出标 `truncated`） | `TaskEnvelope`：status、stepResults、artifacts、metrics |
-| 是否调模型   | 不调；`--for-model` 只是把快照按模型友好格式输出（需 origin ∈ `modelOrigins`） | 全程不调模型（区别于 `run`）                            |
+| 输出         | `PageObservation`：snapshotId、url、title、元素清单（role/name，脱敏，默认上限 400，超出标 `truncated`） | `TaskEnvelope`：status、stepResults、artifacts、metrics |
+| 是否调模型   | 不调；`--for-model` 只回 `rendered` 紧凑文本行（需 origin ∈ `modelOrigins`） | 全程不调模型（区别于 `run`）                            |
 | 失败语义     | 采集失败一次性报错（如 `CAPABILITY_UNSUPPORTED`）            | 逐步执行，可暂停（审批 / needs_input）再 resume         |
 | 退出码       | 正常输出后直接 0                                             | 0 done / 2 参数错 / 3 paused / 4 failed                 |
+
+**`--viewport-only`** —— 只采集与视口相交的元素。长页面里页脚、导航、相关推荐往往占掉大半元素，按视口过滤能显著减小返回体积。MCP 侧默认开启，CLI 默认关闭（保持脚本行为不变）。
+
+**`--max-elements <n>`** —— 元素上限（默认 400，硬上限 2000）。
+
+**`--filter <子串>`** —— 只保留 name 含该子串的元素（大小写不敏感）。「我要找那个东西」时用它，比拉整页小一个量级。
+
+**`--roles <a,b>`** —— 只保留这些 role 的元素，例如 `--roles button,textbox`。
+
+**`--for-model`** —— 只返回 `rendered` 紧凑文本行（`[i] role "name"`），不回元素对象数组；同时要求 origin ∈ `modelOrigins`。
+
+元素清单**不含冗余字段**：`text` 与 `name` 同源，序列化时会被剥离；每步证据里的超长 URL（带跟踪参数）也会收敛为 `origin+path`。
 
 案例：
 
