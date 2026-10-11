@@ -9,7 +9,7 @@ import * as nodeFs from 'node:fs';
 export class FakeLocator implements LocatorPort {
   calls: string[] = [];
   constructor(
-    private readonly state: { count: number; text: string; visible: boolean; clickError?: Error; fillError?: Error; log?: string[] },
+    private readonly state: { count: number; text: string; visible: boolean; clickError?: Error; fillError?: Error; log?: string[]; value?: string },
   ) {}
 
   private record(entry: string): void {
@@ -33,6 +33,8 @@ export class FakeLocator implements LocatorPort {
 
   async fill(value: string): Promise<void> {
     this.record(`fill:${value}`);
+    // 模拟受控输入：写入立即生效（真实页面上 Vue 受控组件可能不生效，正是 value_equals 要抓的失败）
+    this.state.value = value;
     if (this.state.fillError) throw this.state.fillError;
   }
 
@@ -55,6 +57,11 @@ export class FakeLocator implements LocatorPort {
   async innerText(): Promise<string> {
     this.calls.push('innerText');
     return this.state.text;
+  }
+
+  async inputValue(): Promise<string> {
+    this.calls.push('inputValue');
+    return this.state.value ?? '';
   }
 
   async waitFor(): Promise<void> {

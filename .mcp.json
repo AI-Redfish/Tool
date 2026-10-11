@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "jev-browser": {
+      "command": "node",
+      "args": [
+        "D:/develop/GitNote/Redfish-AI/Tool/bin/tool-launcher.js",
+        "jev-browser"
+      ]
+    }
+  }
+}

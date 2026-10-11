@@ -22,6 +22,20 @@ export function resolveLocator(page: PagePort, spec: LocatorSpec): LocatorPort {
   }
 }
 
+/**
+ * 证据/报错里的 URL 收敛：超长（活动追踪参数可达数百字符）时只留 origin+path。
+ * 一次多步任务里同一个 URL 会重复出现在每步证据与失败原因中，收敛后省下大量无关字符。
+ */
+export function evidenceUrl(url: string): string {
+  if (url.length <= 120) return url;
+  try {
+    const u = new URL(url);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return url.slice(0, 120);
+  }
+}
+
 export interface ExpectContext {
   vars: Record<string, unknown>;
   lastDownload?: { artifactId?: string };
@@ -51,7 +65,7 @@ export async function verifyExpects(
       switch (e.kind) {
         case 'url_contains': {
           if (!page.url().includes(String(e.value ?? ''))) {
-            failures.push({ kind: e.kind, reason: `当前 URL ${page.url()} 不含 "${e.value}"` });
+            failures.push({ kind: e.kind, reason: `当前 URL ${evidenceUrl(page.url())} 不含 "${e.value}"` });
           }
           break;
         }
@@ -71,6 +85,29 @@ export async function verifyExpects(
           if (!e.target) throw err('INVALID_INPUT', 'hidden 断言需要 target');
           const loc = resolveLocator(page, e.target).first();
           await loc.waitFor('hidden', { timeout: timeoutMs });
+          break;
+        }
+        case 'not_visible': {
+          // 「元素已消失」：不等待、直接判定（用于验证删除/关闭类操作已生效）。
+          if (!e.target) throw err('INVALID_INPUT', 'not_visible 断言需要 target');
+          const loc = resolveLocator(page, e.target).first();
+          if (await loc.isVisible()) {
+            failures.push({ kind: e.kind, reason: `目标仍然可见: ${JSON.stringify(e.target)}` });
+          }
+          break;
+        }
+        case 'value_equals':
+        case 'value_contains': {
+          // 表单值断言（fill/select 唯一可用的真后置条件；Playwright 输入后 value 才可读）。
+          if (!e.target) throw err('INVALID_INPUT', `${e.kind} 断言需要 target`);
+          const actual = await resolveLocator(page, e.target).first().inputValue({ timeout: timeoutMs });
+          const want = String(e.value ?? '');
+          if (e.kind === 'value_equals' && actual !== want) {
+            failures.push({ kind: e.kind, reason: `输入值 ${JSON.stringify(actual)} ≠ ${JSON.stringify(want)}` });
+          }
+          if (e.kind === 'value_contains' && !actual.includes(want)) {
+            failures.push({ kind: e.kind, reason: `输入值 ${JSON.stringify(actual)} 不含 ${JSON.stringify(want)}` });
+          }
           break;
         }
         case 'count_gte': {

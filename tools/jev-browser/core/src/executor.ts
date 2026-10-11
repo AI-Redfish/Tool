@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { ActionStep, ArtifactMeta, ExpectSpec, LocatorSpec } from './types.js';
 import { ActionOutcomeUnknownError, JevError, err } from './errors.js';
-import { resolveLocator, verifyExpects } from './locator.js';
+import { evidenceUrl, resolveLocator, verifyExpects } from './locator.js';
 import type { DialogManager } from './connectors.js';
 import type { Clock, Logger, PagePort } from './ports.js';
 
@@ -167,8 +167,12 @@ export async function performAction(
         break;
       }
       case 'wait': {
+        // 带 target：等它可见，value 作为等待上限（缺省用 actionTimeoutMs）。
+        // 不带 target：固定休眠 min(value ?? 1000, 5000)。两条分支 value 都生效。
         if (step.target) {
-          await resolveLocator(page, step.target).first().waitFor('visible', { timeout });
+          const budget = Number(value);
+          const limit = Number.isFinite(budget) && budget > 0 ? Math.min(budget, timeout) : timeout;
+          await resolveLocator(page, step.target).first().waitFor('visible', { timeout: limit });
         } else {
           await page.waitForTimeout(Math.min(Number(value ?? 1000), 5000));
         }
@@ -234,7 +238,7 @@ export async function performAction(
     }
     // 结果落账：verified/failed/unknown 三态必须收口（DESIGN §9.1）
     ctx.ledger.finished(step, ctx.actionRevision, 'verified', { url: page.url(), ...extraEvidence });
-    return { evidence: { url: page.url(), ...extraEvidence }, artifactId };
+    return { evidence: { url: evidenceUrl(page.url()), ...extraEvidence }, artifactId };
   } catch (e) {
     if (e instanceof JevError && e.code === 'ACTION_FAILED' && (e.details as { failures?: unknown } | undefined)?.failures !== undefined) {
       throw e; // 后置条件失败已在上方落账，直接上抛
@@ -246,7 +250,7 @@ export async function performAction(
         const verdict = await verifyExpects(page, step.expect ?? [], { vars: ctx.vars }, Math.min(timeout, 5000));
         if (verdict.ok) {
           ctx.ledger.finished(step, ctx.actionRevision, 'verified', { url: page.url(), verifiedAfterTimeout: true });
-          return { evidence: { url: page.url(), verifiedAfterTimeout: true } };
+          return { evidence: { url: evidenceUrl(page.url()), verifiedAfterTimeout: true } };
         }
       } catch {
         // 核实本身失败：保持 unknown

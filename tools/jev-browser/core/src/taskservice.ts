@@ -25,7 +25,7 @@ import { credentialPresent } from './config.js';
 import { TaskStore, type TaskRow } from './store.js';
 import { assertTransition, recoverStale, resolveCancelling } from './statemachine.js';
 import { PolicyGate, originOf } from './policy.js';
-import { observePage } from './observe.js';
+import { observePage, slimObservation } from './observe.js';
 import { verifyGrant } from './grants.js';
 import { WRITE_ACTIONS, validatePlannedSteps } from './planner.js';
 import type { JudgePort } from './judge.js';
@@ -108,6 +108,8 @@ export class Runtime {
     this.heartbeatTimer = setInterval(() => {
       try {
         this.store.kvSet(`lock:${this.profileKey()}`, JSON.stringify({ pid: process.pid, at: Date.now() }));
+        // 同时回收过期暂停任务并自愈陈旧标记：过期任务留下的 reserve/isolation 不会永久封死浏览器
+        this.reapExpired();
       } catch {
         /* 存储不可用时静默；下一次操作会暴露 */
       }
@@ -389,6 +391,7 @@ export class Runtime {
     if (isTerminalStatus(row.status as TaskStatus)) return;
 
     const pk = this.profileKey();
+    this.reapStaleLocks(); // 先自愈：持有者已终态的 reserve/isolation 不该继续拦新任务
     // 隔离检查：存在未知在途动作时拒绝新的写任务（只读请求放行，DESIGN §8.2）
     const isolationRaw = this.store.kvGet(`isolation:${pk}`);
     if (isolationRaw && JSON.parse(isolationRaw).taskId !== taskId && !isReadOnlyRequest(row)) {
@@ -781,7 +784,10 @@ export class Runtime {
    * 只读快照（browser_snapshot）：不建任务、受 origin/modelOrigins 约束。
    * 经 profile 队列串行执行——不能绕开已暂停/运行任务窃读页面（DESIGN §8.3）。
    */
-  async snapshot(sessionId: string, opts: { forModel?: boolean } = {}): Promise<unknown> {
+  async snapshot(
+    sessionId: string,
+    opts: { forModel?: boolean; viewportOnly?: boolean; maxElements?: number } = {},
+  ): Promise<unknown> {
     const s = this.requireSession(sessionId);
     const page = this.sessionPages.get(sessionId);
     if (!page) throw err('SESSION_NOT_READY', '会话没有可用页面');
@@ -794,6 +800,7 @@ export class Runtime {
     const pk = this.profileKey();
     const prev = this.queues.get(pk) ?? Promise.resolve();
     const run = prev.then(async () => {
+      this.reapStaleLocks(); // 陈旧标记不该继续挡住只读观察
       // 暂停任务预约整个 profile：预约期间拒绝其他会话的快照窃读（DESIGN §8.2）
       const raw = this.store.kvGet(`reserve:${pk}`);
       if (raw) {
@@ -807,7 +814,18 @@ export class Runtime {
           if ((e as JevError).code) throw e;
         }
       }
-      return observePage(page, { allowedOrigins: allowed });
+      const obs = await observePage(page, {
+        allowedOrigins: allowed,
+        viewportOnly: opts.viewportOnly,
+        maxElements: opts.maxElements,
+        forModel: opts.forModel,
+      });
+      if (opts.forModel) {
+        // forModel：只回紧凑文本 + 元信息，不回元素对象数组（这才是「模型友好」的实质）
+        const { snapshotId, url, title, counts, truncated, rendered } = obs;
+        return { snapshotId, url, title, counts, truncated, rendered };
+      }
+      return slimObservation(obs);
     });
     this.queues.set(pk, run.then(() => undefined, () => undefined));
     return run;
@@ -957,6 +975,8 @@ export class Runtime {
   recoverOnStartup(): { recovered: number; expired: number; isolated: boolean } {
     this.store.pruneIdempotency(RETENTION_MS);
     this.pruneArtifacts();
+    // 先清掉指向终态任务的陈旧预约/隔离，再进行崩溃恢复与隔离播种
+    this.reapStaleLocks();
     const unresolved = this.store.unresolvedActions();
     for (const a of new Set(unresolved.map((u) => u.taskId))) {
       const t = this.store.getTask(a);
@@ -1038,6 +1058,38 @@ export class Runtime {
     }
   }
 
+  /**
+   * 自愈：清理指向「已终态或已不存在任务」的 reserve / isolation 标记。
+   *
+   * 实测缺陷：ACTION_OUTCOME_UNKNOWN 暂停会同时写下 reserve + isolation；任务随后被
+   * pauseTtl 判过期变成 expired 后，没有任何官方路径能释放它们（resume 只接受 paused，
+   * cancel 对终态任务直接返回），整个浏览器 profile 从此永久 SESSION_BUSY，只能手工改库。
+   * 判据很简单：持有者已不需要这个标记，标记就该消失。
+   */
+  reapStaleLocks(): number {
+    const pk = this.profileKey();
+    let n = 0;
+    for (const kind of ['reserve', 'isolation']) {
+      const key = `${kind}:${pk}`;
+      const raw = this.store.kvGet(key);
+      if (!raw) continue;
+      let owner: string | undefined;
+      try {
+        owner = (JSON.parse(raw) as { taskId?: string }).taskId;
+      } catch {
+        this.store.kvDel(key); // 解析不了的垃圾标记直接清
+        n += 1;
+        continue;
+      }
+      const t = owner ? this.store.getTask(owner) : undefined;
+      if (!t || isTerminalStatus(t.status as TaskStatus)) {
+        this.store.kvDel(key);
+        n += 1;
+      }
+    }
+    return n;
+  }
+
   /** paused 超过 pauseTtl（或绝对 deadline）→ expired；预约一并释放（DESIGN §6.4）。 */
   reapExpired(): number {
     const now = this.clock.now();
@@ -1061,6 +1113,8 @@ export class Runtime {
       this.resolveWaiter(row.taskId);
       n += 1;
     }
+    // 过期任务的 isolation 不会随 reserve 一起消失，这里一并自愈
+    this.reapStaleLocks();
     return n;
   }
 

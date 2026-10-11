@@ -70,6 +70,10 @@ class PwLocatorAdapter implements LocatorPort {
     return this.loc.innerText(opts);
   }
 
+  inputValue(opts?: { timeout?: number }): Promise<string> {
+    return this.loc.inputValue(opts);
+  }
+
   waitFor(state: 'visible' | 'hidden' | 'attached', opts?: { timeout?: number }): Promise<void> {
     // Playwright 的 waitFor 是单 options 对象：{ state, timeout }
     return this.loc.waitFor({ state, timeout: opts?.timeout });

@@ -30,6 +30,8 @@ export interface LocatorPort {
   setInputFiles(files: string[], opts?: { timeout?: number }): Promise<void>;
   isVisible(): Promise<boolean>;
   innerText(opts?: { timeout?: number }): Promise<string>;
+  /** 读取表单元素当前值（value_equals / value_contains 用；fill 后置条件因此可验证）。 */
+  inputValue(opts?: { timeout?: number }): Promise<string>;
   waitFor(state: 'visible' | 'hidden' | 'attached', opts?: { timeout?: number }): Promise<void>;
 }
 

@@ -57,7 +57,7 @@ const ACTION_NAMES = new Set(['navigate', 'click', 'fill', 'press', 'select', 's
 /** 导航与写操作必须提供后置条件；纯观察动作可由返回证据验证（DESIGN §8.1）。 */
 export const WRITE_ACTIONS = new Set(['navigate', 'click', 'fill', 'press', 'select', 'upload']);
 const LOCATOR_BY = new Set(['role', 'label', 'testId', 'text', 'css']);
-const EXPECT_KINDS = new Set(['url_contains', 'text_present', 'visible', 'hidden', 'count_gte', 'download_completed', 'var_equals']);
+const EXPECT_KINDS = new Set(['url_contains', 'text_present', 'visible', 'hidden', 'not_visible', 'count_gte', 'value_equals', 'value_contains', 'download_completed', 'var_equals']);
 
 function validateLocator(raw: unknown, where: string): void {
   if (typeof raw !== 'object' || raw === null) throw err('PLANNER_INVALID_OUTPUT', `${where} 必须是对象`);

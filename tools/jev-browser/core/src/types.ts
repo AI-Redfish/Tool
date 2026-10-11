@@ -91,7 +91,10 @@ export type ExpectKind =
   | 'text_present'
   | 'visible'
   | 'hidden'
+  | 'not_visible'
   | 'count_gte'
+  | 'value_equals'
+  | 'value_contains'
   | 'download_completed'
   | 'var_equals';
 

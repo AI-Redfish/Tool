@@ -37,8 +37,13 @@ export {
   autoLaunchDebugChromeEnabled, DEFAULT_CHROME_DEBUG_PORT,
   type ChromeDebugOptions, type ChromeDebugResult, type CdpProbe,
 } from './chromedebug.js';
-export { observePage, diffObservation, waitForSettle, type PageObservation, type ObservedElement } from './observe.js';
-export { resolveLocator, verifyExpects } from './locator.js';
+export {
+  observePage, diffObservation, waitForSettle, slimObservation, renderObservation,
+  MAX_ELEMENTS_DEFAULT, MAX_ELEMENTS_CAP,
+  type PageObservation, type ObservedElement, type ObserveOptions,
+} from './observe.js';
+export { resolveLocator, verifyExpects, evidenceUrl } from './locator.js';
+export { expandShorthandSteps } from './shorthand.js';
 export { TypeSafeJudge, GOAL_ACTIONS, scopeCandidates, type JudgePort, type RoundDecision, type GoalAction } from './judge.js';
 export { OpenAICompatibleProvider, WRITE_ACTIONS, validatePlannedSteps, type PlannerProvider, type PlannerInput } from './planner.js';
 export { performAction, FsArtifactSink, type ArtifactSink, type LedgerHook, type PerformContext } from './executor.js';

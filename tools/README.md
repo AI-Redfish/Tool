@@ -16,6 +16,8 @@
 
 阅读顺序（两者同构）：[方案总览](jev-browser/README.md) → [技术设计](jev-browser/DESIGN.md) → [开发计划](jev-browser/DEVELOPMENT_PLAN.md) → [兼容性验证](jev-browser/docs/compatibility.md)；事实依据见 [RESEARCH](jev-browser/RESEARCH.md) / [jev-desktop RESEARCH](jev-desktop/RESEARCH.md)。
 
+jev-browser 的各入口使用文档单独成篇：[CLI 命令行参考](jev-browser/docs/cli.md) · [MCP 使用](jev-browser/docs/mcp.md) · [长驻 HTTP API 使用](jev-browser/docs/api.md)。
+
 ## TypeScript 工具的目录结构（以 server-a 为例）
 
 ```

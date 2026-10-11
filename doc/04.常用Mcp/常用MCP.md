@@ -30,7 +30,37 @@ claude mcp add context7 --scope project -- cmd /c npx -y @upstash/context7-mcp
 
 官方地址：https://github.com/morluto/rea/blob/main/README_zh.md
 
-通过这个MCP对现有软件进行复刻。
+一个让 AI 智能体做逆向工程的工具集。没有源码时，智能体可以用它分析原生二进制、Electron/JS 应用、.NET程序集和网站，解释功能
+
+如何工作，然后帮你复刻。
+
+
+
+例如你自己需要开发一个Agent工具，用来让AI分期其他Agent工具然后复刻部分功能非常有用。
+
+
+
+**使用步骤**
+
+1，安装（需要 Node.js 22.19+ / 24.11+ / 26）
+
+```
+npm install --global rea-agents
+rea setup
+```
+
+setup 会引导你：选择要连接的智能体（Claude Code、Cursor、Codex 等）→ 自动写入 MCP 配置 → 可选连接已安装Ghidra/Hopper。
+
+
+
+2，重启智能体后直接提问
+
+```
+逆向工程"备忘录"应用，找到离线搜索功能的工作方式，
+解释其控制流，并为我的项目实现一个版本。
+```
+
+  智能体会自动调用 REA 的 MCP 工具（open_binary、search_strings、procedure_pseudo_code 等）完成调查。
 
 
 
