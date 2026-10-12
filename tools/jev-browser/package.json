@@ -16,7 +16,7 @@
   "scripts": {
     "build": "tsc -b",
     "clean": "tsc -b --clean",
-    "test": "tsc -b core/test && node --test \"core/test/test-dist/test/*.test.js\"",
+    "test": "tsc -b core/test mcp && node --test \"core/test/test-dist/test/*.test.js\" \"mcp/test/*.test.cjs\"",
     "smoke": "node scripts/smoke.mjs",
     "start:mcp": "node mcp/dist/index.js",
     "start:cli": "node cli/dist/index.js",

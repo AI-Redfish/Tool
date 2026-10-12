@@ -37,9 +37,9 @@ MCP 进程内直接跑 Runtime；路径必须绝对且指向构建产物：
 | `browser_pages` | **`sessionId`** | 列标签页【readonly】 |
 | `browser_select_page` | **`sessionId`** **`pageId`** | 切页【control】 |
 | `browser_snapshot` | **`sessionId`**、`forModel?`、`viewportOnly?`、`maxElements?`、`filter?`、`roles?` | 快照【readonly】。默认只采集**视口内**元素、上限 200；`filter` 按 name 子串收窄、`roles` 按角色收窄；`forModel` 只回 `rendered` 紧凑文本行 |
-| `browser_execute` | **`sessionId`** **`steps`**（FlowStep[] 或简写字符串[]）、`values?`、`includeObservation?`、`followNewTab?` | 确定性步骤【write】。默认附 `afterObservation`，并跟踪/跟随新开标签页 |
+| `browser_execute` | **`sessionId`** **`steps`**（FlowStep[] 或简写字符串[]）、`values?`、`includeObservation?`、`followNewTab?`、`detectNewTabs?`、`observationOptions?` | 批量步骤【write】。普通模式默认观察并跟页；快速模式按需开启 |
 | `browser_run` | **`sessionId`** **`goal`** **`successCriteria`**、`values?` | 自主任务【write】 |
-| `browser_act` | **`sessionId`** **`step`**（对象或简写字符串）、`values?`、`includeObservation?`、`followNewTab?` | 单步动作【write】。默认附 `afterObservation` |
+| `browser_act` | **`sessionId`** **`step`**（对象或简写字符串）、`values?`、`includeObservation?`、`followNewTab?`、`detectNewTabs?`、`observationOptions?` | 单步动作【write】。后置处理选项同 execute |
 | `browser_task_get` | **`taskId`** | 查询【readonly】 |
 | `browser_task_cancel` | **`taskId`** **`requestId`**、`expectedRevision?` | 取消【control】 |
 | `browser_task_resume` | **`taskId`** **`requestId`**、`expectedRevision?`、`rerunConfirmed?`、`allowReplan?` | 恢复【control】 |
@@ -74,9 +74,60 @@ MCP 进程内直接跑 Runtime；路径必须绝对且指向构建产物：
 
 **导航与写操作仍必须带后置条件**（这条约束没放松，只是写起来更短了）。
 
+# 批量执行与快速模式
+
+连接一次，后续任务复用同一 `sessionId`。已知步骤在一次 `browser_execute` 中批量执行；仅在需要重新判断页面或切换新页时结束当前批次。自动跟页发生在整个批次结束后，不在每个步骤之间，不能把「点开新页 + 操作新页」盲目塞进同一批。
+
+普通模式保留原默认行为。固定流程可给 MCP 进程设置：
+
+```json
+{
+  "env": { "JEV_BROWSER_MCP_FAST_MODE": "true" }
+}
+```
+
+重启 MCP 后生效。快速模式下 execute/act 默认 `includeObservation:false`、`detectNewTabs:false`、`followNewTab:false`；跳过附加快照、前后标签页查询及新页轮询，但仍执行所有授权、审批、预算及后置条件检查。任务 envelope、错误、暂停原因仍完整返回。
+
+无需修改进程配置，也可逐次使用快速路径：
+
+```json
+{
+  "sessionId": "sXX",
+  "steps": [
+    "fill:css/#kw=redfish => value_equals:css/#kw=redfish",
+    "click:role/button/搜索 => text_present:搜索结果"
+  ],
+  "includeObservation": false,
+  "detectNewTabs": false
+}
+```
+
+不知道页面结果或可能需要继续操作新页时，不应关闭相应功能。快速模式可以按次恢复 `includeObservation:true` 和 `followNewTab:true`（后者也恢复探测）；显式 `detectNewTabs:false` 始终优先，既不探测也不跟随。
+
+execute/act 结果新增 `mcpMetrics`：`taskWaitMs`（提交至落定）、`pageTrackingMs`（前后查询、轮询及切页）、`observationMs`、`totalMs`。它是本次 MCP 调用的附加计时，不写进持久化任务 envelope；不包含 Agent 思考、MCP 进程启动和最终传输耗时。用它区分浏览器任务和适配器附加成本，不把模拟测试当真实网站提速倍数。
+
+API 转发的短任务状态检查由固定 500ms 改为 100→200→400→500ms 退避，长任务保持最多每秒 2 次查询。首个状态请求立即发出；提交已返回终态／暂停时不再查询。嵌入模式仍使用进程内等待，不增加轮询。
+
 # 自动后置观察（afterObservation）
 
-`browser_execute` / `browser_act` 默认在任务落定后自动附一份 `afterObservation`（视口内、上限 150 的紧凑观察），所以「点一下 → 看变成什么样」是**一次**调用而不是两次。不需要就传 `includeObservation: false`。
+`browser_execute` / `browser_act` 在普通模式默认附一份 `afterObservation`（视口内、上限 150）；快速模式默认不附。需要观察时传 `includeObservation:true`，并用 `observationOptions` 一次返回相关内容，无需再发一个 snapshot：
+
+```json
+{
+  "sessionId": "sXX",
+  "steps": ["click:role/button/搜索 => text_present:搜索结果"],
+  "includeObservation": true,
+  "detectNewTabs": false,
+  "observationOptions": {
+    "filter": "结果",
+    "roles": ["link", "button"],
+    "maxElements": 30,
+    "viewportOnly": true
+  }
+}
+```
+
+`observationOptions` 支持 `forModel`、`viewportOnly`、`maxElements`（1–2000）、`filter`、`roles`。`forModel:true` 仍须 origin ∈ modelOrigins，不能借自动观察绕过外发许可。不需要观察时传 `includeObservation:false`；此时忽略观察选项，不采集页面。观察失败保持原语义：不覆盖任务结果，必要时单独 snapshot 排查。
 
 ```text
 browser_execute { sessionId, steps: ["click:role/button/搜索 => url_contains:/search"] }
@@ -93,13 +144,13 @@ browser_execute { sessionId, steps: ["click:role/button/登录"] }
       afterObservation: {...} }   ← 观察已经是在新页上取的
 ```
 
-`followNewTab` 默认 **true**（自动切到最新那个新页，并在结果里以 `followedPageId` 明示，不是静默换页）。
-要「在原页面继续操作」就传 `followNewTab: false`，此时 `openedPages` 仍会告诉你有哪些新页，省掉一次 `browser_pages`。
+`followNewTab` 在普通模式默认 **true**（自动切到最新新页，并以 `followedPageId` 明示）。
+传 `followNewTab:false` 仍做前后两次页列表查询，但只做一次结束探测、不轮询、不切页；晚出现的新页可能漏报。
+传 `detectNewTabs:false` 才完全跳过页列表查询和新页跟随，适合确定在原页完成的批处理。快速模式默认关闭这三项，按次显式开启即可。
 
 检测细节：浏览器处理 `target=_blank` 是**异步的**，新页出现晚于任务落定——实测点击 resolve 之后还要
-**276~440ms** 才能在标签页列表里看到它，所以「任务一结束就查一次」必然漏报。现在只在**步骤里含 `click`** 时
-在最多 700ms 的窗口内轮询（见到新页立即返回，实测通常 300~500ms 就返回）。不含 click 的任务不付这份等待；
-`followNewTab: false` 也会跳过等待（只查一次），适合「连续开多个结果页」这类不需要跟随的场景。
+**276~440ms** 才能在标签页列表里看到它，所以「任务一结束就查一次」可能漏报。启用跟页时，含 `click`、`press`、`evaluate`、`goal`（含 branch/forEach 内的步骤）的任务在最多 700ms 窗口内轮询，发现新页即返回；其他任务只查一次。
+`followNewTab:false` 跳过等待但仍查一次；`detectNewTabs:false` 则连前后查询也省掉。前置查询失败时不跟页，避免把已有页误报为新页；附加探测失败不会改掉任务结果。
 
 # Jev 优先：把「点哪」交给 Jev，而不是每次都让大模型看页面
 
@@ -201,7 +252,7 @@ browser_disconnect { sessionId }                           → 收尾（暂停�
 
 # MCP 进程环境变量
 
-所有 `JEV_BROWSER_*` 覆盖均生效；转发模式加 `JEV_BROWSER_API_URL/TOKEN`。
+所有 `JEV_BROWSER_*` 覆盖均生效；转发模式加 `JEV_BROWSER_API_URL/TOKEN`。`JEV_BROWSER_MCP_FAST_MODE=true`（或 `1`）开启 MCP 的按需后置处理，未设置／false 保持兼容；只影响 execute/act，不跳过 run 的内部规划或验证。
 
 # 仓库启动器（统一 MCP 入口）
 

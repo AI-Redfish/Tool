@@ -441,7 +441,8 @@ code / message / retryable
  - MCP 侧结果用**紧凑 JSON**（不带缩进）。缩进对模型没有任何价值，实测同一份快照 21,450 → 13,122 字符
  - 快照元素**不重复下发** `text` 字段（它与 `name` 同源）；每步证据里的超长 URL 收敛为 `origin+path`
  - 快照支持 `viewportOnly` 与 `maxElements`：长页面的页脚、导航、相关推荐往往占掉大半元素，按视口取即可
- - `execute`/`act` 落定后自动附一份紧凑观察，省掉「做完再喊一次 snapshot」的往返
+ - MCP `execute`/`act` 普通模式自动附观察；`observationOptions` 可按关键词／角色收窄。固定流程可用 `JEV_BROWSER_MCP_FAST_MODE=true`，或逐次传 `includeObservation:false`、`detectNewTabs:false`，省掉附加快照、页列表查询和新页等待（见 [MCP 快速模式](docs/mcp.md#批量执行与快速模式)）
+ - MCP 返回 `mcpMetrics` 分段计时；API 转发短任务按 100→200→400→500ms 退避查询，嵌入模式仍复用连接和进程内等待
  - **失败步骤同样进入 `stepResults`**（状态 `failed`/`paused` 并带 `error`）。早期实现里出错的那一步会从结果中消失，
    调用方只看到前面成功的步骤，看着像什么都没做
 
@@ -469,7 +470,7 @@ code / message / retryable
 cd tools/jev-browser
 pnpm install && pnpm build         # 首选 pnpm（托管 pnpm-lock.yaml，安装可复现）
 node cli/dist/index.js help        # 打印命令帮助 → 构建成功
-pnpm test                          # 91 个离线测试，无需浏览器/key
+pnpm test                          # core + MCP 离线回归测试，无需浏览器/key
 ```
 
 > 未装 pnpm 时可用 npm 回退：`npm install && npm run build`。但 npm 与 pnpm 的
@@ -561,6 +562,6 @@ CLI、MCP、HTTP API 只是三种协议翻译层，共用同一套 Runtime（cor
 | 入口 | 文档 | 内容 |
 |---|---|---|
 | **CLI** | [docs/cli.md](docs/cli.md) | 全局参数、`execute`/`snapshot`/`run`/`connect` 等子命令逐参数说明、任务治理、审批签发、退出码与错误码排查 |
-| **MCP** | [docs/mcp.md](docs/mcp.md) | Agent 宿主注册、14 个工具与参数全表、典型调用序列、仓库启动器（统一 MCP 入口） |
+| **MCP** | [docs/mcp.md](docs/mcp.md) | Agent 注册、15 个工具、批量执行／快速模式、后置观察筛选、计时与启动器 |
 | **HTTP API** | [docs/api.md](docs/api.md) | 长驻服务（loopback + bearer token）启动、路由总表、curl 最小闭环、MCP 转发模式 |
 
