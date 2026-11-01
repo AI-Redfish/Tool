@@ -64,6 +64,14 @@ setup 会引导你：选择要连接的智能体（Claude Code、Cursor、Codex 
 
 
 
+# BLA
+
+针对REA的软件保护措施。
+
+**官方地址**
+
+https://github.com/qybaihe/bla/blob/main/docs/readme/README_zh.md
+
 
 
 # Fetch MCP
